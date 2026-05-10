@@ -188,7 +188,7 @@ start_publisher() {
   local project="${PUB_PROJECT:-$ROOT_DIR}"
   log "Starting ffmpeg + publisher (connecting to $RELAY_URL)..."
   pub_ssh "cd $project && \
-    nohup bash scripts/ffmpeg.sh --url https://${RELAY_HOST_IP}:${RELAY_PORT} \
+    nohup bash scripts/ffmpeg.sh --url https://${RELAY_HOST_IP}:${RELAY_PORT} --release \
       > $PUB_LOG 2>&1 & \
     echo \$! > $PUB_PID_FILE && \
     echo 'publisher PID' \$(cat $PUB_PID_FILE)"

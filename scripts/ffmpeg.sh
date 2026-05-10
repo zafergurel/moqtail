@@ -5,6 +5,7 @@ URL="https://localhost:4433"
 NAME="test"
 DEV_MODE=true
 SINGLE_TRACK=false
+RELEASE=false
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -23,6 +24,11 @@ while [[ $# -gt 0 ]]; do
 		--single)
 			# Encode a single 720p track (useful for debugging)
 			SINGLE_TRACK=true
+			shift
+			;;
+		--release)
+			# Use target/release/moqtail-pub instead of cargo run
+			RELEASE=true
 			shift
 			;;
 		--prod)
@@ -57,12 +63,15 @@ echo "INPUT:        $INPUT"
 echo "URL:          $URL"
 echo "DEV_MODE:     $DEV_MODE"
 echo "SINGLE_TRACK: $SINGLE_TRACK"
+echo "RELEASE:      $RELEASE"
 
 export RUST_LOG=info
-if [ "$DEV_MODE" = true ]; then
-	PIPE_CMD="cargo run --bin moqtail-pub -- --url $URL --name $NAME"
-else
+if [ "$DEV_MODE" = false ]; then
 	PIPE_CMD="/root/su/bin/moqtail-pub --url $URL --name $NAME"
+elif [ "$RELEASE" = true ]; then
+	PIPE_CMD="./target/release/moqtail-pub --url $URL --name $NAME"
+else
+	PIPE_CMD="cargo run --bin moqtail-pub -- --url $URL --name $NAME"
 fi
 
 TEXT="Media Time\:     %{pts\:gmtime\:0\:%T}.%{eif\\:1000*mod(t\\,1)\\:d\\:3}
@@ -73,32 +82,37 @@ DRAW_TEXT_FILTER="drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansM
 # -g 25 -keyint_min 25 -force_key_frames: 1-second GOPs at 25 fps, synchronized across all tracks.
 # -sc_threshold:v 0: disable scene-change keyframes so group boundaries stay aligned.
 # -preset:v veryfast: fast enough for real-time encoding of 4 parallel streams.
-COMMON_ENC="-c:v libx264
+# Stored as arrays so values with special characters (*, [, ]) are never glob-expanded.
+COMMON_ENC=(
+	-c:v libx264
 	-x264-params:v nal-hrd=cbr
 	-preset:v veryfast
 	-profile:v baseline -level:v 3.1
-	-g 25 -keyint_min 25 -force_key_frames expr:gte(t,n_forced*1)
+	-g 25 -keyint_min 25 -force_key_frames "expr:gte(t,n_forced*1)"
 	-sc_threshold:v 0 -tune:v zerolatency
 	-r 25
 	-write_prft wallclock
 	-video_track_timescale 90000
-	-utc_timing_url https://time.akamai.com/?iso"
+	-utc_timing_url https://time.akamai.com/?iso
+)
 
-CMAF_OUT="-f mp4
+CMAF_OUT=(
+	-f mp4
 	-movflags cmaf+separate_moof+delay_moov+skip_trailer
 	-frag_type duration -frag_duration 1
 	-fflags nobuffer
 	-streaming 1
-	-abort_on 1"
+	-abort_on 1
+)
 
 if [ "$SINGLE_TRACK" = true ]; then
 	# Single 720p track — original behaviour, kept for debugging
 	# Track layout: 1=video(720p), 2=audio
 	ffmpeg -hide_banner -loglevel quiet -probesize 10M -stream_loop -1 -re -i "$INPUT" \
-		$COMMON_ENC \
+		"${COMMON_ENC[@]}" \
 		-b:v 2500k -maxrate:v 2500k -bufsize:v 1250k -minrate:v 2500k \
 		-c:a aac -b:a 128k \
-		$CMAF_OUT - | eval $PIPE_CMD
+		"${CMAF_OUT[@]}" - | eval $PIPE_CMD
 else
 	# Multi-track ABR ladder
 	#
@@ -126,11 +140,11 @@ else
 		-map "[s480]"  \
 		-map "[s360]"  \
 		-map 0:a \
-		$COMMON_ENC \
+		"${COMMON_ENC[@]}" \
 		-b:v:0 4000k -maxrate:v:0 4000k -bufsize:v:0 2000k -minrate:v:0 4000k \
 		-b:v:1 2500k -maxrate:v:1 2500k -bufsize:v:1 1250k -minrate:v:1 2500k \
 		-b:v:2 1000k -maxrate:v:2 1000k -bufsize:v:2  500k -minrate:v:2 1000k \
 		-b:v:3  500k -maxrate:v:3  500k -bufsize:v:3  250k -minrate:v:3  500k \
 		-c:a aac -b:a 128k \
-		$CMAF_OUT - | eval $PIPE_CMD
+		"${CMAF_OUT[@]}" - | eval $PIPE_CMD
 fi

@@ -23,7 +23,7 @@ MARK="$6"    # eg. 10
 MARK_HEX=$(printf '%x' "$MARK") # converting to hex values since tc having problems with big decimal values
 # FLOW_ID is always 1:MARK
 
-CEIL=$(echo "$RATE*1.1" | bc) # bps
+CEIL=$(echo "$RATE*1.1" | bc | cut -d. -f1) # bps; truncate to integer (tc rejects decimals)
 
 if [ -z $INTERFACE_1 ] || [ -z $DEST_ADDRESS ] || [ -z $PORT ] || [ -z $RATE ] || [ -z $CEIL ]; then
   echo "Usage: ./tc_qdisc.sh <rate (bps)> <interface name> <dest address> <port> <protocol> <mark>"
