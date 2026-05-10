@@ -1,61 +1,58 @@
 # Traffic Control Scripts
 
-## Scripts used by cockpit-server
-
-- set_bandwidth.sh
-- delete_iptable_rule.sh
-
-### Setting up bandwidth limit on an interface for moq mode
-
-The name of the interface is hard-coded in the script. Mode can be moq or dash.
+All scripts shape outbound QUIC (UDP port 4433) traffic toward a specific client IP.
+The network interface is read from `scripts/tc/.env`:
 
 ```bash
-./set_bandwidth.sh <mode> <bw_limit_bps> <client_ip_address> <session_id>
+echo 'INTERFACE=eth0' > scripts/tc/.env   # replace eth0 with your NIC
+```
+
+## Setting a bandwidth limit
+
+```bash
+./set_bandwidth.sh <rate_bps> <client_ip> <mark>
+```
+
+Example — limit to 2 Mbps toward 192.168.1.100, mark 1:
+
+```bash
+./set_bandwidth.sh 2000000 192.168.1.100 1
+```
+
+NOTE: `<mark>` is an arbitrary integer (1–255) used as a flow identifier.
+Use a consistent value per client across set/del calls.
+
+## Removing a bandwidth limit
+
+```bash
+./set_bandwidth.sh 0 <client_ip> <mark> del
 ```
 
 Example:
 
 ```bash
-./set_bandwidth.sh moq 1000000 172.0.0.2 3
+./set_bandwidth.sh 0 192.168.1.100 1 del
 ```
 
-NOTE: <session_id> value is not important when setting manuel bandwidth limits. You can pick 1 for convenience.
-
-### Deleting bandwidth limit for moq mode
+## Clearing all rules on an interface
 
 ```bash
-./set_bandwidth.sh <mode> 0 <client_ip_address> <session_id> del
+./clear_all.sh eth0
 ```
 
-Example:
+If no interface is given, it falls back to `INTERFACE` from `.env`.
+
+## Useful diagnostic commands
 
 ```bash
-./set_bandwidth.sh moq 0 172.0.0.2 3 del
-```
+# Watch per-class traffic in real time
+watch /sbin/tc -s -d class show dev eth0
 
-NOTE: Use the <session_id> value that you used when setting the bandwidth limit.
-
-### Clear all rules on interface wlo1
-
-```bash
-./clear_all.sh wlo1
-```
-
-## Some useful commands
-
-### Watching class traffic on interface wlo1
-
-```bash
-watch /sbin/tc -s -d class show dev wlo1
-```
-
-### Checking qdisc, class, filter, and iptables rules
-
-```bash
-tc filter show dev wlo1
-tc class show dev wlo1
-tc qdisc show dev wlo1
+# Inspect active rules
+tc filter show dev eth0
+tc class show dev eth0
+tc qdisc show dev eth0
 iptables -L OUTPUT -t mangle -n -v
 ```
 
-To analyze the traffic on interfaces, `iptraf` can be used.
+To analyse traffic on interfaces, `iptraf` can be used.

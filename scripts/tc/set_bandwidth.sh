@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 usage() {
-  echo "Usage: ./set_bandwidth.sh <mode> <rate (bps)> <client_ip> <mark> <op>"
-  echo "mode can be dash or moq"
-  echo "op can be set or del"
+  echo "Usage: ./set_bandwidth.sh <rate (bps)> <client_ip> <mark> [op]"
+  echo "  rate: bandwidth in bps (e.g. 2000000 for 2 Mbps)"
+  echo "  op:   set (default) or del"
   exit 1
 }
 
@@ -25,35 +25,24 @@ fi
 TC="/sbin/tc"
 IPTABLES="/usr/sbin/iptables"
 
-MODE="$1"
-RATE="$2" # Bps
-DEST_ADDRESS="$3"
-MARK="$4"
-OP=${5:-"set"}
+PORT="4433"
+PROTO="udp"
 
-if [ -z "$MODE" ] || [ -z "$RATE" ] || [ -z "$MARK" ]; then
-  usage
-fi
+RATE="$1"
+DEST_ADDRESS="$2"
+MARK="$3"
+OP=${4:-"set"}
 
-if [[ $MODE == "dash" ]]; then
-  INTERFACE_1=$INTERFACE # change this according to your interface used for dash streaming
-  PORT="8080"
-  PROTO="tcp"
-elif [[ $MODE == "moq" ]]; then
-  INTERFACE_1=$INTERFACE # change this according to your interface used for moq streaming
-  PORT="4443"
-  PROTO="udp"
-else
+if [ -z "$RATE" ] || [ -z "$DEST_ADDRESS" ] || [ -z "$MARK" ]; then
   usage
 fi
 
 if [[ $OP == "set" ]]; then
   echo "Setting bandwidth limit"
-  # call tc_qdisc.sh with the given rate and ceiling
-  $CURRENT_DIR/tc_qdisc.sh $RATE $INTERFACE_1 $DEST_ADDRESS $PORT $PROTO $MARK
+  $CURRENT_DIR/tc_qdisc.sh $RATE $INTERFACE $DEST_ADDRESS $PORT $PROTO $MARK
 elif [[ $OP == "del" ]]; then
   echo "Deleting bandwidth limit"
-  $CURRENT_DIR/delete_iptable_rule.sh $DEST_ADDRESS $PORT $PROTO $MARK
+  $CURRENT_DIR/delete_iptable_rule.sh $DEST_ADDRESS $MARK
 else
   usage
 fi

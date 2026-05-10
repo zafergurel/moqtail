@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 
-# This script deletes the iptables rule for given protocol, port, and mark.
+# Deletes the iptables MARK rule for the given client IP and mark.
 
 IPTABLES="/usr/sbin/iptables"
 
-DEST_ADDRESS="$1"
-PORT="$2"
-PROTO="$3" # udp or tcp
-MARK="$4"  # eg. 10
-MARK_HEX=$(printf '%x' "$4") # converting to hex values since tc having problems with big decimal values
+PORT="4433"
+PROTO="udp"
 
-if [ -z $PORT ] || [ -z $PROTO ] || [ -z $MARK ]; then
-  echo "Usage: ./delete_iptable_rule.sh <destination address> <port> <protocol> <mark>"
+DEST_ADDRESS="$1"
+MARK="$2"
+MARK_HEX=$(printf '%x' "$MARK")
+
+if [ -z "$DEST_ADDRESS" ] || [ -z "$MARK" ]; then
+  echo "Usage: ./delete_iptable_rule.sh <destination_address> <mark>"
   exit 1
 fi
 
-# just remove the iptables rule
-# -n for numeric output, -L for list, -t for table, -p for protocol,
-#-sport for source port, -j for jump, -A for append, -D for delete
 if $IPTABLES -n -L OUTPUT -t mangle | grep -q -E "MARK.+$DEST_ADDRESS.+$PROTO.+$PORT.+MARK set 0x$MARK_HEX"; then
   $IPTABLES -D OUTPUT -t mangle -p $PROTO --sport $PORT -d $DEST_ADDRESS -j MARK --set-mark $MARK
-  echo "iptables rule deleted for $PROTO on destination $DEST_ADDRESS and port $PORT"
+  echo "iptables rule deleted for $PROTO on destination $DEST_ADDRESS port $PORT"
+else
+  echo "No matching iptables rule found (already deleted?)"
 fi
