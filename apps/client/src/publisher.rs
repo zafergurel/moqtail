@@ -36,6 +36,61 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
+// ─── publish-multi types ──────────────────────────────────────────────────────
+
+/// One entry in the multi-track spec: track name + per-object payload size + GOP shape.
+#[derive(Clone, Debug)]
+pub struct TrackSpec {
+  pub name: String,
+  /// Average payload size in bytes per object.  Controls the overall bitrate:
+  ///   bitrate ≈ payload_size × objects_per_group × (1000 / interval_ms) × 8  bps
+  pub payload_size: usize,
+  /// P-frame size as a fraction of the I-frame size (0 < p_ratio ≤ 1.0).
+  /// 0.25 means each P-frame is ¼ the size of the I-frame (I-frame is 4× larger).
+  /// 1.0 means all objects are the same size (flat, no GOP structure).
+  /// The average bitrate is preserved regardless of this value.
+  pub p_ratio: f64,
+}
+
+impl TrackSpec {
+  pub fn new(name: impl Into<String>, payload_size: usize) -> Self {
+    Self {
+      name: name.into(),
+      payload_size,
+      p_ratio: 0.25,
+    }
+  }
+
+  /// Compute (i_frame_bytes, p_frame_bytes) that honour both the average
+  /// payload size and the P/I ratio for a GOP of `n` objects.
+  ///
+  /// Derivation:
+  ///   avg = (I + (n-1)·r·I) / n  →  I = avg·n / (1 + (n-1)·r)
+  ///                                   P = r·I
+  pub fn gop_sizes(&self, n: u64) -> (usize, usize) {
+    let r = self.p_ratio.clamp(f64::EPSILON, 1.0);
+    if (r - 1.0).abs() < f64::EPSILON || n <= 1 {
+      return (self.payload_size, self.payload_size);
+    }
+    let i = (self.payload_size as f64 * n as f64 / (1.0 + (n as f64 - 1.0) * r)).round() as usize;
+    let p = (r * i as f64).round() as usize;
+    (i.max(1), p.max(1))
+  }
+}
+
+/// Config for the `publish-multi` command.
+pub struct PublishMultiConfig {
+  pub namespace: String,
+  pub tracks: Vec<TrackSpec>,
+  /// Objects emitted per group (group = 1-second GOP at 25fps → 25 objects).
+  pub objects_per_group: u64,
+  /// Inter-object interval in milliseconds (40 ms = 25 fps).
+  pub interval_ms: u64,
+  /// Total groups to publish (each group ≈ 1 second at default settings).
+  pub group_count: u64,
+  pub publisher_priority: u8,
+}
+
 pub struct PublishConfig {
   pub namespace: String,
   pub track_name: String,
@@ -437,4 +492,224 @@ fn generate_payload(size: usize) -> Vec<u8> {
       (seed & 0xFF) as u8
     })
     .collect()
+}
+
+// ─── publish-multi ────────────────────────────────────────────────────────────
+
+/// Publish multiple tracks simultaneously in push (PUBLISH) mode with
+/// synchronized timing so that all tracks stay at the same group counter.
+///
+/// This is the correct publisher mode for the `switch-test --method switch-message`
+/// experiment: the relay caches objects for every track from the start, so when a
+/// SWITCH message fires, the relay can immediately find the target track's latest
+/// object at the current group.
+pub async fn run_multi(moq: MoqConnection, config: PublishMultiConfig) -> Result<()> {
+  let MoqConnection {
+    connection,
+    mut control_stream,
+  } = moq;
+
+  let ns = Tuple::from_utf8_path(&config.namespace);
+
+  if config.tracks.is_empty() {
+    anyhow::bail!("publish-multi: --tracks must specify at least one track");
+  }
+
+  // Send PUBLISH + wait PublishOk for each track sequentially.
+  // Aliases are assigned 1-based (1, 2, 3, …).
+  let mut aliases: Vec<u64> = Vec::with_capacity(config.tracks.len());
+  for (i, spec) in config.tracks.iter().enumerate() {
+    let alias = (i as u64) + 1;
+    send_publish_header(
+      &mut control_stream,
+      &ns,
+      &spec.name,
+      alias,
+      GroupOrder::Ascending,
+      config.publisher_priority,
+    )
+    .await?;
+    aliases.push(alias);
+    info!(
+      "publish-multi: PUBLISH accepted for track='{}' alias={} payload={}B",
+      spec.name, alias, spec.payload_size
+    );
+  }
+
+  // All data tasks anchor to the same start instant so their group/object
+  // counters stay in sync regardless of task scheduling jitter.
+  let start = tokio::time::Instant::now();
+
+  let mut tasks = Vec::with_capacity(config.tracks.len());
+  for (spec, &alias) in config.tracks.iter().zip(aliases.iter()) {
+    let conn = connection.clone();
+    let spec = spec.clone();
+    let priority = config.publisher_priority;
+    let group_count = config.group_count;
+    let objects_per_group = config.objects_per_group;
+    let interval_ms = config.interval_ms;
+    let track_name = spec.name.clone();
+
+    tasks.push(tokio::spawn(async move {
+      send_multi_track(
+        &conn,
+        alias,
+        &track_name,
+        group_count,
+        interval_ms,
+        objects_per_group,
+        spec,
+        priority,
+        start,
+      )
+      .await
+    }));
+  }
+
+  for task in tasks {
+    if let Err(e) = task.await {
+      error!("publish-multi: data task error: {:?}", e);
+    }
+  }
+
+  tokio::time::sleep(Duration::from_secs(2)).await;
+  info!("publish-multi: all tracks done, closing connection");
+  connection.close(0u32.into(), b"Done");
+  Ok(())
+}
+
+/// Send PUBLISH and wait for PublishOk; does NOT send any data.
+async fn send_publish_header(
+  control_stream: &mut ControlStreamHandler,
+  namespace: &Tuple,
+  track_name: &str,
+  track_alias: u64,
+  group_order: GroupOrder,
+  publisher_priority: u8,
+) -> Result<()> {
+  let _ = publisher_priority; // priority is set per-stream in SubgroupHeader, not in PUBLISH
+  let publish = Publish::new(
+    track_alias - 1, // request_id = alias - 1 (0-based)
+    namespace.clone(),
+    TupleField::from_utf8(track_name),
+    track_alias,
+    vec![
+      MessageParameter::new_group_order(group_order),
+      MessageParameter::new_largest_object(Location::new(0, 0)),
+      MessageParameter::Forward { forward: true },
+    ],
+    vec![],
+  );
+  control_stream
+    .send(&ControlMessage::Publish(Box::new(publish)))
+    .await?;
+
+  match control_stream.next_message().await {
+    Ok(ControlMessage::PublishOk(m)) => {
+      info!(
+        "PublishOk: request_id={} track='{}' alias={}",
+        m.request_id, track_name, track_alias
+      );
+      Ok(())
+    }
+    Ok(m) => anyhow::bail!("Expected PublishOk for '{}', got {:?}", track_name, m),
+    Err(e) => anyhow::bail!("Failed waiting for PublishOk for '{}': {:?}", track_name, e),
+  }
+}
+
+/// Synchronized per-track data sender.
+///
+/// Each object is scheduled to depart at:
+///   `start + interval * (group * objects_per_group + object)`
+///
+/// All tracks share the same `start` instant, so they advance their group
+/// counters in lock-step.
+async fn send_multi_track(
+  connection: &Arc<wtransport::Connection>,
+  track_alias: u64,
+  track_name: &str,
+  group_count: u64,
+  interval_ms: u64,
+  objects_per_group: u64,
+  spec: TrackSpec,
+  publisher_priority: u8,
+  start: tokio::time::Instant,
+) -> Result<()> {
+  let interval = Duration::from_millis(interval_ms);
+  let (i_size, p_size) = spec.gop_sizes(objects_per_group);
+  info!(
+    "publish-multi track='{}' alias={}: {} groups × {} objects, \
+     I={}B P={}B avg={}B p_ratio={:.2} {}ms interval",
+    track_name,
+    track_alias,
+    group_count,
+    objects_per_group,
+    i_size,
+    p_size,
+    spec.payload_size,
+    spec.p_ratio,
+    interval_ms,
+  );
+
+  for group_id in 0..group_count {
+    let stream = connection.open_uni().await?.await?;
+    let sub_header = SubgroupHeader::new_with_explicit_id(
+      track_alias,
+      group_id,
+      1u64,
+      Some(publisher_priority),
+      true,
+      true,
+    );
+    let header_info = HeaderInfo::Subgroup { header: sub_header };
+    let stream = Arc::new(Mutex::new(stream));
+    let mut handler = SendDataStream::new(stream, header_info).await?;
+
+    let mut prev_object_id = None;
+    for object_id in 0..objects_per_group {
+      // Wait until this object's scheduled slot.
+      let seq = group_id * objects_per_group + object_id;
+      let due = start + interval.mul_f64(seq as f64);
+      tokio::time::sleep_until(due).await;
+
+      // Object 0 of every group is the I-frame; all others are P-frames.
+      let frame_size = if object_id == 0 { i_size } else { p_size };
+      let payload = generate_payload(frame_size);
+      let subgroup_obj = SubgroupObject {
+        object_id,
+        extension_headers: Some(vec![]),
+        object_status: None,
+        payload: Some(Bytes::from(payload)),
+      };
+      let object =
+        Object::try_from_subgroup(subgroup_obj, track_alias, group_id, Some(group_id), Some(1))?;
+
+      match handler.send_object(&object, prev_object_id).await {
+        Ok(_) => {
+          if should_log(seq) {
+            let frame_type = if object_id == 0 { "I" } else { "P" };
+            info!(
+              "publish-multi track='{}': group={} object={} {}={}B",
+              track_name, group_id, object_id, frame_type, frame_size
+            );
+          } else {
+            debug!(
+              "publish-multi track='{}': group={} object={}",
+              track_name, group_id, object_id
+            );
+          }
+        }
+        Err(e) => error!(
+          "publish-multi track='{}': send_object failed g={} o={}: {:?}",
+          track_name, group_id, object_id, e
+        ),
+      }
+      prev_object_id = Some(object_id);
+    }
+
+    handler.flush().await?;
+  }
+
+  info!("publish-multi track='{}': all groups sent", track_name);
+  Ok(())
 }

@@ -15,6 +15,223 @@
 use std::time::Instant;
 use tracing::info;
 
+// ─── Per-switch record ───────────────────────────────────────────────────────
+
+pub struct SwitchRecord {
+  pub track_from: String,
+  pub track_to: String,
+  // Internal timing (used to compute derived fields, not serialised directly)
+  pub switch_decision_time: Option<Instant>,
+  pub last_a_object_time: Option<Instant>,
+  pub first_b_object_time: Option<Instant>,
+  // Byte-level bookkeeping
+  /// Joining-fetch warm-up bytes (B objects delivered before first live B object)
+  pub redundant_bytes: u64,
+  /// A-track bytes that arrived after the switch decision
+  pub trailing_a_bytes: u64,
+  /// B-track bytes delivered from the first live B object onward
+  pub useful_b_bytes: u64,
+  // Object counts
+  pub a_objects_post_decision: u64,
+  pub b_objects_pre_active: u64,
+  // Control-plane overhead
+  pub control_messages: u64,
+  // Quality flags
+  pub group_boundary_aligned: Option<bool>,
+  pub last_a_group: Option<u64>,
+  pub first_b_group: Option<u64>,
+}
+
+impl SwitchRecord {
+  pub fn new(track_from: &str, track_to: &str) -> Self {
+    Self {
+      track_from: track_from.to_string(),
+      track_to: track_to.to_string(),
+      switch_decision_time: None,
+      last_a_object_time: None,
+      first_b_object_time: None,
+      redundant_bytes: 0,
+      trailing_a_bytes: 0,
+      useful_b_bytes: 0,
+      a_objects_post_decision: 0,
+      b_objects_pre_active: 0,
+      control_messages: 0,
+      group_boundary_aligned: None,
+      last_a_group: None,
+      first_b_group: None,
+    }
+  }
+
+  /// Milliseconds between switch decision and first B object.
+  /// Negative means the first B object arrived before the decision (JoiningFetch pre-warm-up case).
+  pub fn switch_latency_ms(&self) -> Option<i128> {
+    let decision = self.switch_decision_time?;
+    let first_b = self.first_b_object_time?;
+    if first_b >= decision {
+      Some(first_b.duration_since(decision).as_millis() as i128)
+    } else {
+      Some(-(decision.duration_since(first_b).as_millis() as i128))
+    }
+  }
+
+  /// Milliseconds between the last A object and the first B object.
+  /// Negative = overlap (A and B overlapped in delivery).
+  pub fn stall_ms(&self) -> Option<i128> {
+    let last_a = self.last_a_object_time?;
+    let first_b = self.first_b_object_time?;
+    if first_b >= last_a {
+      Some(first_b.duration_since(last_a).as_millis() as i128)
+    } else {
+      Some(-(last_a.duration_since(first_b).as_millis() as i128))
+    }
+  }
+
+  /// Total excess bytes for this switch event (redundant warm-up + trailing A).
+  pub fn excess_bytes(&self) -> u64 {
+    self.redundant_bytes + self.trailing_a_bytes
+  }
+
+  /// Total bytes counted in the switch window = useful_b + excess.
+  pub fn total_bytes(&self) -> u64 {
+    self.useful_b_bytes + self.excess_bytes()
+  }
+
+  /// Average Excess Traffic Ratio for this single switch.
+  /// None when no bytes were observed.
+  pub fn aetr(&self) -> Option<f64> {
+    let total = self.total_bytes();
+    if total == 0 {
+      None
+    } else {
+      Some(self.excess_bytes() as f64 / total as f64)
+    }
+  }
+
+  fn opt_i128(v: Option<i128>) -> String {
+    match v {
+      Some(n) => n.to_string(),
+      None => "null".to_string(),
+    }
+  }
+
+  fn opt_u64(v: Option<u64>) -> String {
+    match v {
+      Some(n) => n.to_string(),
+      None => "null".to_string(),
+    }
+  }
+
+  fn opt_bool(v: Option<bool>) -> String {
+    match v {
+      Some(b) => b.to_string(),
+      None => "null".to_string(),
+    }
+  }
+
+  fn opt_f64(v: Option<f64>) -> String {
+    match v {
+      Some(f) => format!("{:.6}", f),
+      None => "null".to_string(),
+    }
+  }
+
+  pub fn to_json(&self) -> String {
+    format!(
+      concat!(
+        "{{\n",
+        "    \"track_from\": \"{}\",\n",
+        "    \"track_to\": \"{}\",\n",
+        "    \"switch_latency_ms\": {},\n",
+        "    \"stall_ms\": {},\n",
+        "    \"group_boundary_aligned\": {},\n",
+        "    \"control_messages\": {},\n",
+        "    \"redundant_bytes\": {},\n",
+        "    \"trailing_a_bytes\": {},\n",
+        "    \"useful_b_bytes\": {},\n",
+        "    \"excess_bytes\": {},\n",
+        "    \"total_bytes\": {},\n",
+        "    \"aetr\": {},\n",
+        "    \"a_objects_post_decision\": {},\n",
+        "    \"last_a_group\": {},\n",
+        "    \"first_b_group\": {}\n",
+        "  }}"
+      ),
+      self.track_from,
+      self.track_to,
+      Self::opt_i128(self.switch_latency_ms()),
+      Self::opt_i128(self.stall_ms()),
+      Self::opt_bool(self.group_boundary_aligned),
+      self.control_messages,
+      self.redundant_bytes,
+      self.trailing_a_bytes,
+      self.useful_b_bytes,
+      self.excess_bytes(),
+      self.total_bytes(),
+      Self::opt_f64(self.aetr()),
+      self.a_objects_post_decision,
+      Self::opt_u64(self.last_a_group),
+      Self::opt_u64(self.first_b_group),
+    )
+  }
+}
+
+// ─── Aggregate stats (one per run / JSON file) ────────────────────────────────
+
+pub struct SwitchStats {
+  pub method: String,
+  pub bandwidth_cap_bps: u64,
+  pub switches: Vec<SwitchRecord>,
+  /// Mean AETR across all switches; set by `finalize()`.
+  pub aetr: Option<f64>,
+}
+
+impl SwitchStats {
+  pub fn new(method: &str, bandwidth_cap_bps: u64) -> Self {
+    Self {
+      method: method.to_string(),
+      bandwidth_cap_bps,
+      switches: Vec::new(),
+      aetr: None,
+    }
+  }
+
+  /// Compute aggregate AETR from the recorded switch entries.
+  pub fn finalize(&mut self) {
+    let values: Vec<f64> = self.switches.iter().filter_map(|r| r.aetr()).collect();
+    if !values.is_empty() {
+      self.aetr = Some(values.iter().sum::<f64>() / values.len() as f64);
+    }
+  }
+
+  pub fn to_json(&self) -> String {
+    let switches_json: Vec<String> = self.switches.iter().map(|r| r.to_json()).collect();
+    let switches_str = if switches_json.is_empty() {
+      "[]".to_string()
+    } else {
+      format!("[\n  {}\n]", switches_json.join(",\n  "))
+    };
+
+    let aetr_str = match self.aetr {
+      Some(f) => format!("{:.6}", f),
+      None => "null".to_string(),
+    };
+
+    format!(
+      concat!(
+        "{{\n",
+        "  \"method\": \"{}\",\n",
+        "  \"bandwidth_cap_bps\": {},\n",
+        "  \"aetr\": {},\n",
+        "  \"switches\": {}\n",
+        "}}"
+      ),
+      self.method, self.bandwidth_cap_bps, aetr_str, switches_str,
+    )
+  }
+}
+
+// ─── Reception stats (used by subscribe command) ─────────────────────────────
+
 pub struct ReceptionStats {
   pub total_received: u64,
   pub parse_errors: u64,
