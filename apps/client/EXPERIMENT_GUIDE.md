@@ -350,7 +350,7 @@ Sample output:
 ── switch-message ──────────────────────
   n=9    lat=521ms  stall=145ms  AETR=6.23%  gba=89%
 ── sub-update-forward ──────────────────
-  n=9    lat=498ms  stall=498ms  AETR=0.00%  gba=100%
+  n=9    lat=12ms   stall=-38ms  AETR=1.20%  gba=100%
 ── joining-fetch ───────────────────────
   n=9    lat=847ms  stall=-12ms  AETR=16.70%  gba=100%
 ```
@@ -522,11 +522,11 @@ Secondary: `"3"→"4"` (downswitch), `"3"→"2"` (upswitch on recovery).
 
 ### Switch method summary
 
-| Method             | CLI value            | Control msgs | Expected stall               | Expected AETR       |
-| ------------------ | -------------------- | ------------ | ---------------------------- | ------------------- |
-| SWITCH message     | `switch-message`     | 1            | > 0 (waits for next group)   | Low                 |
-| Sub Update Forward | `sub-update-forward` | 3            | ≥ 0 (group-boundary aligned) | 0                   |
-| Joining Fetch      | `joining-fetch`      | 4            | ≤ 0 (overlap possible)       | > 0 (warm-up bytes) |
+| Method             | CLI value            | Control msgs | Expected stall             | Expected AETR                             |
+| ------------------ | -------------------- | ------------ | -------------------------- | ----------------------------------------- |
+| SWITCH message     | `switch-message`     | 1            | > 0 (waits for next group) | Low                                       |
+| Sub Update Forward | `sub-update-forward` | 3            | ≤ 0 (A/B overlap)          | Small (trailing A + pre-boundary B bytes) |
+| Joining Fetch      | `joining-fetch`      | 4            | ≤ 0 (overlap possible)     | > 0 (warm-up bytes)                       |
 
 ### `client switch-test` flags
 

@@ -486,28 +486,15 @@ async fn run_sub_update_forward_phase(
   let current_alias = state.current_alias;
   let current_req_id = state.current_req_id;
 
-  // Phase 1: receive A objects for switch_after_secs; wait for group boundary after timer.
+  // Phase 1: receive A objects for switch_after_secs.
   let deadline = tokio::time::Instant::now() + Duration::from_secs(config.switch_after_secs);
-  let boundary_deadline =
-    tokio::time::Instant::now() + Duration::from_secs(config.switch_after_secs + 3);
-  let mut timer_fired = false;
-
   loop {
     tokio::select! {
-      _ = tokio::time::sleep_until(deadline), if !timer_fired => {
-        timer_fired = true;
-      }
-      _ = tokio::time::sleep_until(boundary_deadline), if timer_fired => {
-        // Grace period expired without a group boundary — switch anyway.
-        break;
-      }
+      _ = tokio::time::sleep_until(deadline) => break,
       ev = rx.recv() => match ev {
         Some(ev) if ev.track_alias == current_alias => {
           record.last_a_object_time = Some(ev.received_at);
           record.last_a_group = Some(ev.group);
-          if timer_fired && ev.object == 0 {
-            break; // clean group boundary
-          }
         }
         Some(_) => {}
         None => break,
@@ -515,17 +502,7 @@ async fn run_sub_update_forward_phase(
     }
   }
 
-  // Phase 2: send REQUEST_UPDATE A (forward=false) then REQUEST_UPDATE B (forward=true).
-  let ru_req_a = state.take_req_id();
-  send_request_update(
-    cs,
-    ru_req_a,
-    current_req_id,
-    vec![MessageParameter::new_forward(false)],
-  )
-  .await?;
-  record.control_messages += 1;
-
+  // Phase 2: enable B immediately (no group boundary wait).
   let ru_req_b = state.take_req_id();
   send_request_update(
     cs,
@@ -537,12 +514,20 @@ async fn run_sub_update_forward_phase(
   record.switch_decision_time = Some(Instant::now());
   record.control_messages += 1;
 
-  // Phase 3: collect post-switch objects.
+  // Phase 3: drain A and B concurrently; tear down A on first live B group boundary.
   let post_deadline =
     tokio::time::Instant::now() + Duration::from_secs(config.switch_after_secs.max(10));
+  let mut first_b_seen = false;
+  let mut post_b_deadline: Option<tokio::time::Instant> = None;
+
   loop {
+    let maybe_post = post_b_deadline;
     tokio::select! {
       _ = tokio::time::sleep_until(post_deadline) => break,
+      _ = async {
+        if let Some(d) = maybe_post { tokio::time::sleep_until(d).await }
+        else { std::future::pending::<()>().await }
+      } => break,
       ev = rx.recv() => match ev {
         Some(ev) => {
           if ev.track_alias == current_alias {
@@ -550,13 +535,35 @@ async fn run_sub_update_forward_phase(
             record.trailing_a_bytes += ev.payload_size as u64;
             record.a_objects_post_decision += 1;
           } else if ev.track_alias == b_alias {
-            if record.first_b_object_time.is_none() {
-              record.first_b_object_time = Some(ev.received_at);
-              record.first_b_group = Some(ev.group);
-              record.group_boundary_aligned = Some(ev.object == 0);
-              info!("First B object (sub-update-forward): group={}, object={}", ev.group, ev.object);
+            if !first_b_seen {
+              if ev.object == 0 {
+                // Group boundary reached — B is now decodable.
+                record.first_b_object_time = Some(ev.received_at);
+                record.first_b_group = Some(ev.group);
+                record.group_boundary_aligned = Some(true);
+                first_b_seen = true;
+                info!("First B group boundary (sub-update-forward): group={}", ev.group);
+
+                // Tear down A now that B has an I-frame.
+                let ru_req_a = state.take_req_id();
+                if let Err(e) = send_request_update(
+                  cs, ru_req_a, current_req_id,
+                  vec![MessageParameter::new_forward(false)],
+                ).await {
+                  warn!("sub_update_forward: RequestUpdate A failed: {:?}", e);
+                  break;
+                }
+                record.control_messages += 1;
+                post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                record.useful_b_bytes += ev.payload_size as u64;
+              } else {
+                // Pre-boundary B object — decoder cannot use it without the I-frame.
+                record.b_objects_pre_active += 1;
+                record.redundant_bytes += ev.payload_size as u64;
+              }
+            } else {
+              record.useful_b_bytes += ev.payload_size as u64;
             }
-            record.useful_b_bytes += ev.payload_size as u64;
           }
         }
         None => break,

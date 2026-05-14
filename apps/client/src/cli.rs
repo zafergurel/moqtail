@@ -45,7 +45,7 @@ pub enum ForwardingPreference {
 pub enum CliSwitchMethod {
   /// Relay-executed atomic switch via SWITCH message (1 control message)
   SwitchMessage,
-  /// Subscriber toggles forward parameter on A and B (2–3 control messages)
+  /// Pre-subscribe B; enable B at timer fire, tear down A on first live B group boundary (3 control messages)
   SubUpdateForward,
   /// Joining Fetch warm-up then stop A on first live B object (4–5 control messages)
   JoiningFetch,
