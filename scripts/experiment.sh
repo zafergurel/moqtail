@@ -17,9 +17,10 @@
 #   --skip-start         Assume relay + publisher are already running
 #   --method  <name>     Only run this method  (repeatable; default: all three)
 #   --bandwidth <bps>    Only run at this bandwidth; 0 = no limit (repeatable; default: all)
-#   --track-from <n>     Source track name (default: 2 = 720p)
-#   --track-to   <n>     Target track name (default: 3 = 480p)
-#   --switch-after <s>   Seconds before triggering switch (default: 15)
+#   --track-sequence <s> Comma-separated track sequence, e.g. "2,3,4,3,2"
+#                        Default: "2,3,4,3,2" (up-up-down-down across 4 bitrates)
+#   --switch-after <s>   Seconds before triggering each switch (default: 15)
+#   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 100)
 #   --reps <n>           Repetitions per condition (default: 3)
 #   --output <dir>       Results directory (default: results/YYYYMMDD_HHMMSS)
 #   --help
@@ -60,9 +61,11 @@ NAMESPACE="${NAMESPACE:-moqtail-watch-party-live}"
 ALL_METHODS=("switch-message" "sub-update-forward" "joining-fetch")
 # Bandwidth ladder (bps). 0 = unlimited baseline (no tc rule applied).
 ALL_BANDWIDTHS=(0 5000000 3000000 2000000 1500000 1000000)
-TRACK_FROM="2"    # 720p
-TRACK_TO="3"      # 480p
-SWITCH_AFTER=15   # seconds before triggering the switch
+# Track sequence: lower index = lower bitrate (matches ffmpeg.sh ordering)
+#   track 1=360p/500kbps, 2=480p/1Mbps, 3=720p/2.5Mbps, 4=1080p/4Mbps
+TRACK_SEQUENCE="2,3,4,3,2"
+SWITCH_AFTER=15       # seconds before triggering each switch
+JITTER_BUFFER_MS=40   # ms; one frame at 25fps
 REPS=3
 TC_MARK=1         # iptables mark; use a consistent value per subscriber (1–255)
 
@@ -79,6 +82,7 @@ SKIP_START=false
 SELECTED_METHODS=()
 SELECTED_BANDWIDTHS=()
 OUTPUT_DIR=""
+JITTER_BUFFER_MS_OVERRIDE=""
 
 usage() {
   grep '^#' "$0" | sed 's/^# \{0,1\}//' | tail -n +2
@@ -87,22 +91,23 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --build)        BUILD=true;                        shift ;;
-    --skip-start)   SKIP_START=true;                   shift ;;
-    --method)       SELECTED_METHODS+=("$2");           shift 2 ;;
-    --bandwidth)    SELECTED_BANDWIDTHS+=("$2");        shift 2 ;;
-    --track-from)   TRACK_FROM="$2";                   shift 2 ;;
-    --track-to)     TRACK_TO="$2";                     shift 2 ;;
-    --switch-after) SWITCH_AFTER="$2";                 shift 2 ;;
-    --reps)         REPS="$2";                         shift 2 ;;
-    --output)       OUTPUT_DIR="$2";                   shift 2 ;;
-    --help|-h)      usage ;;
+    --build)              BUILD=true;                              shift ;;
+    --skip-start)         SKIP_START=true;                         shift ;;
+    --method)             SELECTED_METHODS+=("$2");                 shift 2 ;;
+    --bandwidth)          SELECTED_BANDWIDTHS+=("$2");              shift 2 ;;
+    --track-sequence)     TRACK_SEQUENCE="$2";                     shift 2 ;;
+    --switch-after)       SWITCH_AFTER="$2";                       shift 2 ;;
+    --jitter-buffer-ms)   JITTER_BUFFER_MS_OVERRIDE="$2";          shift 2 ;;
+    --reps)               REPS="$2";                               shift 2 ;;
+    --output)             OUTPUT_DIR="$2";                         shift 2 ;;
+    --help|-h)            usage ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
 
 [ ${#SELECTED_METHODS[@]}    -eq 0 ] && METHODS=("${ALL_METHODS[@]}")    || METHODS=("${SELECTED_METHODS[@]}")
 [ ${#SELECTED_BANDWIDTHS[@]} -eq 0 ] && BANDWIDTHS=("${ALL_BANDWIDTHS[@]}") || BANDWIDTHS=("${SELECTED_BANDWIDTHS[@]}")
+[ -n "$JITTER_BUFFER_MS_OVERRIDE" ] && JITTER_BUFFER_MS="$JITTER_BUFFER_MS_OVERRIDE"
 [ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$ROOT_DIR/results/$(date +%Y%m%d_%H%M%S)"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -237,10 +242,11 @@ run_one() {
     --namespace "$NAMESPACE" \
     --command switch-test \
     --no-cert-validation \
-    --track-a "$TRACK_FROM" \
-    --track-b "$TRACK_TO" \
+    --track-sequence "$TRACK_SEQUENCE" \
     --method "$method" \
     --switch-after "$SWITCH_AFTER" \
+    --jitter-buffer-ms "$JITTER_BUFFER_MS" \
+    --bandwidth-cap-bps 0 \
     --output-json "$outfile" \
     && log "Saved: $outfile" \
     || log "WARNING: subscriber exited with error for $label rep $rep"
@@ -258,12 +264,14 @@ main() {
   local subscriber_ip
   subscriber_ip=$(detect_subscriber_ip)
   log "Subscriber IP toward relay: $subscriber_ip"
-  log "Relay:      $RELAY_SSH  ($RELAY_HOST_IP:$RELAY_PORT)"
-  log "Publisher:  ${PUB_SSH:-local}"
-  log "Methods:    ${METHODS[*]}"
-  log "Bandwidths: ${BANDWIDTHS[*]} bps"
-  log "Reps:       $REPS"
-  log "Switch:     track $TRACK_FROM → $TRACK_TO after ${SWITCH_AFTER}s"
+  log "Relay:          $RELAY_SSH  ($RELAY_HOST_IP:$RELAY_PORT)"
+  log "Publisher:      ${PUB_SSH:-local}"
+  log "Methods:        ${METHODS[*]}"
+  log "Bandwidths:     ${BANDWIDTHS[*]} bps"
+  log "Track sequence: $TRACK_SEQUENCE"
+  log "Switch after:   ${SWITCH_AFTER}s"
+  log "Jitter buffer:  ${JITTER_BUFFER_MS}ms"
+  log "Reps:           $REPS"
 
   mkdir -p "$OUTPUT_DIR"
   log "Results:    $OUTPUT_DIR"

@@ -106,24 +106,23 @@ CMAF_OUT=(
 )
 
 if [ "$SINGLE_TRACK" = true ]; then
-	# Single 720p track — original behaviour, kept for debugging
-	# Track layout: 1=video(720p), 2=audio
+	# Single 720p track — kept for debugging (track 1=video, track 2=audio in this mode)
 	ffmpeg -hide_banner -loglevel quiet -probesize 10M -stream_loop -1 -re -i "$INPUT" \
 		"${COMMON_ENC[@]}" \
 		-b:v 2500k -maxrate:v 2500k -bufsize:v 1250k -minrate:v 2500k \
 		-c:a aac -b:a 128k \
 		"${CMAF_OUT[@]}" - | eval $PIPE_CMD
 else
-	# Multi-track ABR ladder
+	# Multi-track ABR ladder — lower track index = lower bitrate
 	#
 	# Track layout inside the CMAF stream (and therefore in moqtail-pub catalog):
-	#   Track 1 — video 1080p  @ 4 Mbps  (upscaled from 720p source)
-	#   Track 2 — video  720p  @ 2.5 Mbps (native source resolution)
-	#   Track 3 — video  480p  @ 1 Mbps
-	#   Track 4 — video  360p  @ 500 kbps
+	#   Track 1 — video  360p  @ 500 kbps (lowest)
+	#   Track 2 — video  480p  @ 1 Mbps
+	#   Track 3 — video  720p  @ 2.5 Mbps (native source resolution)
+	#   Track 4 — video 1080p  @ 4 Mbps   (upscaled from 720p source)
 	#   Track 5 — audio        @ 128 kbps
 	#
-	# Subscribers switch between track names "1", "2", "3", "4" for video quality changes.
+	# Sequence "2,3,4,3,2" = 480p→720p→1080p→720p→480p (up-up-down-down).
 	# The drawtext timestamp overlay is applied once before the split so all tracks carry it.
 
 	FILTER_COMPLEX="[0:v]${DRAW_TEXT_FILTER}[vtext];\
@@ -135,16 +134,16 @@ else
 
 	ffmpeg -hide_banner -loglevel quiet -probesize 10M -stream_loop -1 -re -i "$INPUT" \
 		-filter_complex "$FILTER_COMPLEX" \
-		-map "[s1080]" \
-		-map "[s720]"  \
-		-map "[s480]"  \
 		-map "[s360]"  \
+		-map "[s480]"  \
+		-map "[s720]"  \
+		-map "[s1080]" \
 		-map 0:a \
 		"${COMMON_ENC[@]}" \
-		-b:v:0 4000k -maxrate:v:0 4000k -bufsize:v:0 2000k -minrate:v:0 4000k \
-		-b:v:1 2500k -maxrate:v:1 2500k -bufsize:v:1 1250k -minrate:v:1 2500k \
-		-b:v:2 1000k -maxrate:v:2 1000k -bufsize:v:2  500k -minrate:v:2 1000k \
-		-b:v:3  500k -maxrate:v:3  500k -bufsize:v:3  250k -minrate:v:3  500k \
+		-b:v:0  500k -maxrate:v:0  500k -bufsize:v:0  250k -minrate:v:0  500k \
+		-b:v:1 1000k -maxrate:v:1 1000k -bufsize:v:1  500k -minrate:v:1 1000k \
+		-b:v:2 2500k -maxrate:v:2 2500k -bufsize:v:2 1250k -minrate:v:2 2500k \
+		-b:v:3 4000k -maxrate:v:3 4000k -bufsize:v:3 2000k -minrate:v:3 4000k \
 		-c:a aac -b:a 128k \
 		"${CMAF_OUT[@]}" - | eval $PIPE_CMD
 fi
