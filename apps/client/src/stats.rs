@@ -15,6 +15,35 @@
 use std::time::Instant;
 use tracing::info;
 
+// ─── Playout model ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+pub enum PlayoutMode {
+  Realtime,
+  Vod,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayoutConfig {
+  pub mode: PlayoutMode,
+  pub frame_interval_ms: u64,
+  pub objects_per_group: u64,
+  // realtime
+  pub jitter_buffer_ms: u64,
+  // vod
+  pub playout_buffer_groups: u64,
+  pub buffer_refill_ratio: f64,
+}
+
+impl PlayoutConfig {
+  pub fn gop_duration_ms(&self) -> u64 {
+    self.frame_interval_ms * self.objects_per_group
+  }
+  pub fn playout_buffer_ms(&self) -> u64 {
+    self.playout_buffer_groups * self.gop_duration_ms()
+  }
+}
+
 // ─── Per-switch record ───────────────────────────────────────────────────────
 
 pub struct SwitchRecord {
@@ -74,15 +103,48 @@ impl SwitchRecord {
     }
   }
 
-  /// Milliseconds between the last A object and the first B object.
-  /// Negative = overlap (A and B overlapped in delivery).
-  pub fn stall_ms(&self) -> Option<i128> {
+  /// Raw signed gap: t_first_b − (t_last_a + frame_interval_ms).
+  /// Positive = B arrived after next expected frame; negative = overlap.
+  pub fn delivery_gap_ms(&self, frame_interval_ms: u64) -> Option<i128> {
     let last_a = self.last_a_object_time?;
     let first_b = self.first_b_object_time?;
-    if first_b >= last_a {
-      Some(first_b.duration_since(last_a).as_millis() as i128)
+    let raw: i128 = if first_b >= last_a {
+      first_b.duration_since(last_a).as_millis() as i128
     } else {
-      Some(-(last_a.duration_since(first_b).as_millis() as i128))
+      -(last_a.duration_since(first_b).as_millis() as i128)
+    };
+    Some(raw - frame_interval_ms as i128)
+  }
+
+  /// Realtime metric: freeze duration in ms.
+  ///
+  /// I-frame missed jitter deadline. Per GoP impairment model: a dropped
+  /// I-frame freezes the decoder for at least one full GoP (all P-frames
+  /// depend on the I-frame). Clamped up to gop_duration_ms so that even a
+  /// marginally-late arrival is counted as a full GoP loss.
+  pub fn freeze_ms(&self, cfg: &PlayoutConfig) -> Option<u64> {
+    let gap = self.delivery_gap_ms(cfg.frame_interval_ms)?;
+    let past_budget = gap - cfg.jitter_buffer_ms as i128;
+    if past_budget <= 0 {
+      Some(0)
+    } else {
+      Some(past_budget.max(cfg.gop_duration_ms() as i128) as u64)
+    }
+  }
+
+  /// VoD metric: stall duration in ms.
+  ///
+  /// Playout buffer absorbs the first `buffer_ms*(1-refill_ratio)` ms of gap.
+  /// Stall starts when the buffer empties; playback resumes once the buffer
+  /// refills to refill_ratio * buffer_ms.
+  pub fn stall_vod_ms(&self, cfg: &PlayoutConfig) -> Option<u64> {
+    let gap = self.delivery_gap_ms(cfg.frame_interval_ms)?;
+    let gap = gap.max(0) as u64;
+    if gap == 0 {
+      Some(0)
+    } else {
+      let absorbed = (cfg.playout_buffer_ms() as f64 * (1.0 - cfg.buffer_refill_ratio)) as u64;
+      Some(gap.saturating_sub(absorbed))
     }
   }
 
@@ -135,13 +197,23 @@ impl SwitchRecord {
     }
   }
 
-  pub fn to_json(&self) -> String {
+  pub fn to_json(&self, cfg: &PlayoutConfig) -> String {
+    let freeze_str = match cfg.mode {
+      PlayoutMode::Realtime => Self::opt_u64(self.freeze_ms(cfg)),
+      PlayoutMode::Vod => "null".to_string(),
+    };
+    let stall_str = match cfg.mode {
+      PlayoutMode::Vod => Self::opt_u64(self.stall_vod_ms(cfg)),
+      PlayoutMode::Realtime => "null".to_string(),
+    };
     format!(
       concat!(
         "{{\n",
         "    \"track_from\": \"{}\",\n",
         "    \"track_to\": \"{}\",\n",
         "    \"switch_latency_ms\": {},\n",
+        "    \"delivery_gap_ms\": {},\n",
+        "    \"freeze_ms\": {},\n",
         "    \"stall_ms\": {},\n",
         "    \"group_boundary_aligned\": {},\n",
         "    \"control_messages\": {},\n",
@@ -159,7 +231,9 @@ impl SwitchRecord {
       self.track_from,
       self.track_to,
       Self::opt_i128(self.switch_latency_ms()),
-      Self::opt_i128(self.stall_ms()),
+      Self::opt_i128(self.delivery_gap_ms(cfg.frame_interval_ms)),
+      freeze_str,
+      stall_str,
       Self::opt_bool(self.group_boundary_aligned),
       self.control_messages,
       self.redundant_bytes,
@@ -180,16 +254,18 @@ impl SwitchRecord {
 pub struct SwitchStats {
   pub method: String,
   pub bandwidth_cap_bps: u64,
+  pub playout: PlayoutConfig,
   pub switches: Vec<SwitchRecord>,
   /// Mean AETR across all switches; set by `finalize()`.
   pub aetr: Option<f64>,
 }
 
 impl SwitchStats {
-  pub fn new(method: &str, bandwidth_cap_bps: u64) -> Self {
+  pub fn new(method: &str, bandwidth_cap_bps: u64, playout: PlayoutConfig) -> Self {
     Self {
       method: method.to_string(),
       bandwidth_cap_bps,
+      playout,
       switches: Vec::new(),
       aetr: None,
     }
@@ -204,7 +280,11 @@ impl SwitchStats {
   }
 
   pub fn to_json(&self) -> String {
-    let switches_json: Vec<String> = self.switches.iter().map(|r| r.to_json()).collect();
+    let switches_json: Vec<String> = self
+      .switches
+      .iter()
+      .map(|r| r.to_json(&self.playout))
+      .collect();
     let switches_str = if switches_json.is_empty() {
       "[]".to_string()
     } else {
@@ -216,16 +296,43 @@ impl SwitchStats {
       None => "null".to_string(),
     };
 
+    let mode_str = match self.playout.mode {
+      PlayoutMode::Realtime => "realtime",
+      PlayoutMode::Vod => "vod",
+    };
+
+    let playout_extra = match self.playout.mode {
+      PlayoutMode::Realtime => format!(
+        "  \"jitter_buffer_ms\": {},\n",
+        self.playout.jitter_buffer_ms
+      ),
+      PlayoutMode::Vod => format!(
+        "  \"playout_buffer_groups\": {},\n  \"buffer_refill_ratio\": {},\n",
+        self.playout.playout_buffer_groups, self.playout.buffer_refill_ratio
+      ),
+    };
+
     format!(
       concat!(
         "{{\n",
         "  \"method\": \"{}\",\n",
         "  \"bandwidth_cap_bps\": {},\n",
+        "  \"mode\": \"{}\",\n",
+        "  \"frame_interval_ms\": {},\n",
+        "  \"objects_per_group\": {},\n",
+        "{}",
         "  \"aetr\": {},\n",
         "  \"switches\": {}\n",
         "}}"
       ),
-      self.method, self.bandwidth_cap_bps, aetr_str, switches_str,
+      self.method,
+      self.bandwidth_cap_bps,
+      mode_str,
+      self.playout.frame_interval_ms,
+      self.playout.objects_per_group,
+      playout_extra,
+      aetr_str,
+      switches_str,
     )
   }
 }

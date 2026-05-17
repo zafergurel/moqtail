@@ -62,6 +62,14 @@ impl From<CliSwitchMethod> for SwitchMethod {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliPlayoutMode {
+  /// Real-time streaming: jitter buffer model; late I-frames cause GoP-length freezes
+  Realtime,
+  /// Video-on-demand: playout buffer model; buffer absorbs gaps before stalling
+  Vod,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Command {
   /// Publish objects to a track
   Publish,
@@ -217,4 +225,23 @@ pub struct Cli {
   /// Write SwitchStats as JSON to this file
   #[arg(long)]
   pub output_json: Option<String>,
+
+  /// Playout model: realtime (jitter buffer) or vod (playout buffer)
+  #[arg(long, value_enum, default_value = "realtime")]
+  pub mode: CliPlayoutMode,
+
+  /// Jitter buffer target in ms (realtime mode only). Frames arriving more than
+  /// this many ms past their expected playout time are dropped.
+  #[arg(long, default_value_t = 0)]
+  pub jitter_buffer_ms: u64,
+
+  /// Playout buffer size in GoPs (vod mode only). The buffer absorbs delivery
+  /// gaps up to playout_buffer_groups * gop_duration_ms before stalling.
+  #[arg(long, default_value_t = 1)]
+  pub playout_buffer_groups: u64,
+
+  /// Playout buffer refill ratio (vod mode only). Stalled playback resumes when
+  /// the buffer refills to this fraction of its target size (0.0 = resume immediately).
+  #[arg(long, default_value_t = 0.0)]
+  pub buffer_refill_ratio: f64,
 }

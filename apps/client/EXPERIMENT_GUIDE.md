@@ -325,34 +325,35 @@ jq -r '.switches[].switch_latency_ms' results/local_*/*.json
 jq -r '[.method, (.aetr | tostring)] | join("\t")' results/local_*/*.json
 ```
 
-### 5.3 Per-method summary (latency, stall, AETR)
+### 5.3 Per-method summary (latency, delivery gap, freeze/stall, AETR)
 
 ```bash
 for method in switch-message sub-update-forward joining-fetch; do
   echo "── $method ──────────────────────────"
   jq -r '.switches[] | [
       .switch_latency_ms,
-      .stall_ms,
+      .delivery_gap_ms,
+      (.freeze_ms // .stall_ms // "null"),
       (.aetr * 100),
       (.group_boundary_aligned | if . then 1 else 0 end)
     ] | map(tostring) | join("\t")' \
     results/local_*/${method}_*.json \
   | awk 'BEGIN{OFS="\t"}
-         {lat+=$1; stall+=$2; aetr+=$3; gba+=$4; n++}
-         END{printf "  n=%-3d  lat=%.0fms  stall=%.0fms  AETR=%.2f%%  gba=%.0f%%\n",
-             n, lat/n, stall/n, aetr/n, gba/n*100}'
+         {lat+=$1; gap+=$2; imp+=$3; aetr+=$4; gba+=$5; n++}
+         END{printf "  n=%-3d  lat=%.0fms  gap=%.0fms  impairment=%.0fms  AETR=%.2f%%  gba=%.0f%%\n",
+             n, lat/n, gap/n, imp/n, aetr/n, gba/n*100}'
 done
 ```
 
-Sample output:
+Sample output (realtime mode, jitter_buffer_ms=0):
 
 ```
 ── switch-message ──────────────────────
-  n=9    lat=521ms  stall=145ms  AETR=6.23%  gba=89%
+  n=9    lat=521ms  gap=145ms  impairment=1000ms  AETR=6.23%  gba=89%
 ── sub-update-forward ──────────────────
-  n=9    lat=12ms   stall=-38ms  AETR=1.20%  gba=100%
+  n=9    lat=498ms  gap=-2ms   impairment=0ms     AETR=0.00%  gba=100%
 ── joining-fetch ───────────────────────
-  n=9    lat=847ms  stall=-12ms  AETR=16.70%  gba=100%
+  n=9    lat=847ms  gap=-52ms  impairment=0ms     AETR=16.70% gba=100%
 ```
 
 ### 5.4 Control message count per method
@@ -381,10 +382,10 @@ for method in switch-message sub-update-forward joining-fetch; do
   echo "=== $method ==="
   for f in results/20260511_*/${method}_*bps*.json; do
     bw=$(basename "$f" | grep -oE '[0-9]+bps')
-    jq -r ".switches[] | \"$bw\t\(.switch_latency_ms)\t\(.stall_ms)\"" "$f"
+    jq -r ".switches[] | \"$bw\t\(.switch_latency_ms)\t\(.delivery_gap_ms)\"" "$f"
   done | sort | awk 'BEGIN{OFS="\t"}
-    {lat[$1]+=$2; stall[$1]+=$3; n[$1]++}
-    END{for(bw in lat) printf "%-15s lat=%dms stall=%dms\n", bw, lat[bw]/n[bw], stall[bw]/n[bw]}' | sort
+    {lat[$1]+=$2; gap[$1]+=$3; n[$1]++}
+    END{for(bw in lat) printf "%-15s lat=%dms gap=%dms\n", bw, lat[bw]/n[bw], gap[bw]/n[bw]}' | sort
 done
 ```
 
@@ -416,7 +417,7 @@ jq -r '[
 ### 5.8 Collecting all per-switch rows as TSV (for spreadsheet / R / Python)
 
 ```bash
-echo -e "method\tbandwidth_cap_bps\trep\ttrack_from\ttrack_to\tswitch_latency_ms\tstall_ms\taetr\tgroup_boundary_aligned\tcontrol_messages\tredundant_bytes\ttrailing_a_bytes"
+echo -e "method\tbandwidth_cap_bps\trep\ttrack_from\ttrack_to\tswitch_latency_ms\tdelivery_gap_ms\tfreeze_ms\tstall_ms\taetr\tgroup_boundary_aligned\tcontrol_messages\tredundant_bytes\ttrailing_a_bytes"
 
 for f in results/**/*.json; do
   method=$(jq -r '.method' "$f")
@@ -427,6 +428,8 @@ for f in results/**/*.json; do
     [$m, $b, $r,
      .track_from, .track_to,
      (.switch_latency_ms | tostring),
+     (.delivery_gap_ms | tostring),
+     (.freeze_ms | tostring),
      (.stall_ms | tostring),
      (.aetr | tostring),
      (.group_boundary_aligned | tostring),
@@ -455,21 +458,29 @@ for path in glob.glob("results/**/*.json", recursive=True):
     d = json.load(open(path))
     for sw in d["switches"]:
         rows[d["method"]].append({
-            "latency": sw["switch_latency_ms"],
-            "stall":   sw["stall_ms"],
-            "aetr":    sw["aetr"] * 100,
-            "aligned": sw["group_boundary_aligned"],
+            "latency":  sw["switch_latency_ms"],
+            "gap":      sw["delivery_gap_ms"],
+            "freeze":   sw.get("freeze_ms"),
+            "stall":    sw.get("stall_ms"),
+            "aetr":     sw["aetr"] * 100,
+            "aligned":  sw["group_boundary_aligned"],
         })
 
 for method, data in sorted(rows.items()):
-    lats   = [r["latency"] for r in data if r["latency"] is not None]
-    stalls = [r["stall"]   for r in data if r["stall"]   is not None]
-    aetrs  = [r["aetr"]    for r in data]
-    gba    = sum(1 for r in data if r["aligned"]) / len(data) * 100
+    lats    = [r["latency"] for r in data if r["latency"] is not None]
+    gaps    = [r["gap"]     for r in data if r["gap"]     is not None]
+    freezes = [r["freeze"]  for r in data if r["freeze"]  is not None]
+    stalls  = [r["stall"]   for r in data if r["stall"]   is not None]
+    aetrs   = [r["aetr"]    for r in data]
+    gba     = sum(1 for r in data if r["aligned"]) / len(data) * 100
     print(f"\n{method}  (n={len(data)})")
     print(f"  latency  : {statistics.mean(lats):.0f} ± {statistics.stdev(lats):.0f} ms"
           f"  [p50={statistics.median(lats):.0f}]")
-    print(f"  stall    : {statistics.mean(stalls):.0f} ± {statistics.stdev(stalls):.0f} ms")
+    print(f"  gap      : {statistics.mean(gaps):.0f} ± {statistics.stdev(gaps):.0f} ms")
+    if freezes:
+        print(f"  freeze   : {statistics.mean(freezes):.0f} ± {statistics.stdev(freezes):.0f} ms")
+    if stalls:
+        print(f"  stall    : {statistics.mean(stalls):.0f} ± {statistics.stdev(stalls):.0f} ms")
     print(f"  AETR     : {statistics.mean(aetrs):.2f} ± {statistics.stdev(aetrs):.2f} %")
     print(f"  boundary : {gba:.0f}%")
 EOF
@@ -506,27 +517,29 @@ Secondary: `"3"→"4"` (downswitch), `"3"→"2"` (upswitch on recovery).
 
 ### Metrics
 
-| Field                    | Description                                                                   |
-| ------------------------ | ----------------------------------------------------------------------------- |
-| `switch_latency_ms`      | `t_first_b_object − t_switch_decision` (negative = B arrived before decision) |
-| `stall_ms`               | `t_first_b_object − t_last_a_object` (negative = overlap)                     |
-| `group_boundary_aligned` | First B object had `object_id == 0`                                           |
-| `control_messages`       | Switch-specific control messages sent                                         |
-| `redundant_bytes`        | Joining-fetch warm-up bytes (B objects before first live B)                   |
-| `trailing_a_bytes`       | A bytes received after the switch decision                                    |
-| `useful_b_bytes`         | B bytes from first live B object onward                                       |
-| `excess_bytes`           | `redundant_bytes + trailing_a_bytes`                                          |
-| `total_bytes`            | `useful_b_bytes + excess_bytes`                                               |
-| `aetr`                   | `excess_bytes / total_bytes` — per-switch Average Excess Traffic Ratio        |
-| `aetr` (top-level)       | Mean AETR across all switches in the run                                      |
+| Field                    | Description                                                                                                                                                                                         |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `switch_latency_ms`      | `t_first_b − t_switch_decision`; negative = B warm-up arrived before decision                                                                                                                       |
+| `delivery_gap_ms`        | `t_first_b − (t_last_a + frame_interval_ms)`; signed gap between last A frame and first live B frame; negative = overlap                                                                            |
+| `freeze_ms`              | **Realtime mode only.** `max(delivery_gap − jitter_buffer, GoP_duration)` when gap exceeds jitter budget, else 0. A late I-frame freezes the decoder for at least one full GoP. `null` in VoD mode. |
+| `stall_ms`               | **VoD mode only.** Gap absorbed by the playout buffer; stall starts when the buffer empties. `null` in realtime mode.                                                                               |
+| `group_boundary_aligned` | First B object had `object_id == 0` (I-frame)                                                                                                                                                       |
+| `control_messages`       | Switch-specific control messages sent                                                                                                                                                               |
+| `redundant_bytes`        | Joining-fetch warm-up bytes (B objects delivered before first live B group)                                                                                                                         |
+| `trailing_a_bytes`       | A bytes received after the switch decision                                                                                                                                                          |
+| `useful_b_bytes`         | B bytes from first live B object onward                                                                                                                                                             |
+| `excess_bytes`           | `redundant_bytes + trailing_a_bytes`                                                                                                                                                                |
+| `total_bytes`            | `useful_b_bytes + excess_bytes`                                                                                                                                                                     |
+| `aetr`                   | `excess_bytes / total_bytes` — per-switch Average Excess Traffic Ratio                                                                                                                              |
+| `aetr` (top-level)       | Mean AETR across all switches in the run                                                                                                                                                            |
 
 ### Switch method summary
 
-| Method             | CLI value            | Control msgs | Expected stall             | Expected AETR                             |
-| ------------------ | -------------------- | ------------ | -------------------------- | ----------------------------------------- |
-| SWITCH message     | `switch-message`     | 1            | > 0 (waits for next group) | Low                                       |
-| Sub Update Forward | `sub-update-forward` | 3            | ≤ 0 (A/B overlap)          | Small (trailing A + pre-boundary B bytes) |
-| Joining Fetch      | `joining-fetch`      | 4            | ≤ 0 (overlap possible)     | > 0 (warm-up bytes)                       |
+| Method             | CLI value            | Control msgs | Expected delivery gap            | Expected AETR                             |
+| ------------------ | -------------------- | ------------ | -------------------------------- | ----------------------------------------- |
+| SWITCH message     | `switch-message`     | 1            | > 0 (waits for next group start) | Low                                       |
+| Sub Update Forward | `sub-update-forward` | 3            | ≤ 0 (A/B overlap)                | Small (trailing A + pre-boundary B bytes) |
+| Joining Fetch      | `joining-fetch`      | 4            | ≤ 0 (overlap possible)           | > 0 (warm-up bytes)                       |
 
 ### `client switch-test` flags
 
@@ -538,6 +551,10 @@ Secondary: `"3"→"4"` (downswitch), `"3"→"2"` (upswitch on recovery).
 --joining-groups-offset <n> Groups to prefetch in joining-fetch warm-up          [2]
 --bandwidth-cap-bps <bps>   Recorded in JSON only; does not apply tc             [0]
 --output-json <path>        Write result JSON to this path
+--mode                      realtime | vod                                        [realtime]
+--jitter-buffer-ms <ms>     Jitter budget before freeze is counted (realtime)    [0]
+--playout-buffer-groups <n> Buffer size in GoPs before stall is counted (vod)    [1]
+--buffer-refill-ratio <f>   Buffer fill fraction required to resume after stall  [0.0]
 ```
 
 ### `client publish-multi` flags

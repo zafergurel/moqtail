@@ -119,6 +119,8 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     Command::SwitchTest => {
+      use crate::stats::{PlayoutConfig, PlayoutMode};
+
       // Parse optional --track-sequence "2,3,4" into a Vec<String>.
       let track_sequence: Vec<String> = if cli.track_sequence.is_empty() {
         vec![]
@@ -131,6 +133,18 @@ async fn main() -> Result<(), anyhow::Error> {
           .collect()
       };
 
+      let playout = PlayoutConfig {
+        mode: match cli.mode {
+          crate::cli::CliPlayoutMode::Realtime => PlayoutMode::Realtime,
+          crate::cli::CliPlayoutMode::Vod => PlayoutMode::Vod,
+        },
+        frame_interval_ms: cli.interval,
+        objects_per_group: cli.objects_per_group,
+        jitter_buffer_ms: cli.jitter_buffer_ms,
+        playout_buffer_groups: cli.playout_buffer_groups,
+        buffer_refill_ratio: cli.buffer_refill_ratio,
+      };
+
       let config = switcher::SwitchTestConfig {
         namespace: cli.namespace,
         track_sequence,
@@ -141,6 +155,7 @@ async fn main() -> Result<(), anyhow::Error> {
         joining_groups_offset: cli.joining_groups_offset,
         bandwidth_cap_bps: cli.bandwidth_cap_bps,
         output_json: cli.output_json,
+        playout,
       };
       switcher::run(moq_conn, config).await
     }

@@ -46,6 +46,7 @@ pub struct SwitchTestConfig {
   pub joining_groups_offset: u64,
   pub bandwidth_cap_bps: u64,
   pub output_json: Option<String>,
+  pub playout: crate::stats::PlayoutConfig,
 }
 
 impl SwitchTestConfig {
@@ -245,7 +246,11 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
   tokio::spawn(async move { receiver_task(conn_clone, pf_clone, tx).await });
 
   let mut state = SwitchState::new(initial_alias);
-  let mut stats = SwitchStats::new(config.method.as_str(), config.bandwidth_cap_bps);
+  let mut stats = SwitchStats::new(
+    config.method.as_str(),
+    config.bandwidth_cap_bps,
+    config.playout.clone(),
+  );
 
   // ── Multi-switch loop ──────────────────────────────────────────────────────
   for switch_idx in 0..(sequence.len() - 1) {
@@ -514,7 +519,7 @@ async fn run_sub_update_forward_phase(
   record.switch_decision_time = Some(Instant::now());
   record.control_messages += 1;
 
-  // Phase 3: drain A and B concurrently; tear down A on first live B group boundary.
+  // Phase 3: drain A and B concurrently; tear down A on first live B object.
   let post_deadline =
     tokio::time::Instant::now() + Duration::from_secs(config.switch_after_secs.max(10));
   let mut first_b_seen = false;
@@ -550,7 +555,7 @@ async fn run_sub_update_forward_phase(
                   cs, ru_req_a, current_req_id,
                   vec![MessageParameter::new_forward(false)],
                 ).await {
-                  warn!("sub_update_forward: RequestUpdate A failed: {:?}", e);
+                  warn!("sub_update_forward_2: RequestUpdate A failed: {:?}", e);
                   break;
                 }
                 record.control_messages += 1;
