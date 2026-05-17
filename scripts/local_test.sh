@@ -16,6 +16,7 @@
 #                          When given, each run performs M switches (M = len-1).
 #                          Default: "2,3" (single switch, 720p → 480p)
 #   --switch-after <secs>  Seconds per track before triggering next switch (default: 15)
+#   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 0)
 #   --reps <n>             Repetitions per method (default: 3)
 #   --tracks <spec>        Track specs for publish-multi, e.g. "1:20000,2:12500,3:5000"
 #                          Default: full 5-track ladder matching ffmpeg.sh bitrates
@@ -47,6 +48,7 @@ ALL_METHODS=("switch-message" "sub-update-forward" "joining-fetch")
 # Default track sequence: single upswitch 480p→720p (lower number = lower bitrate)
 TRACK_SEQUENCE="2,3"
 SWITCH_AFTER=15
+JITTER_BUFFER_MS=0
 REPS=3
 RELAY_PORT=4433
 RELAY_URL="https://127.0.0.1:${RELAY_PORT}"
@@ -90,6 +92,7 @@ while [[ $# -gt 0 ]]; do
     --method)              SELECTED_METHODS+=("$2");             shift 2 ;;
     --track-sequence)      TRACK_SEQUENCE="$2";                 shift 2 ;;
     --switch-after)        SWITCH_AFTER="$2";                   shift 2 ;;
+    --jitter-buffer-ms)    JITTER_BUFFER_MS="$2";               shift 2 ;;
     --reps)                REPS="$2";                           shift 2 ;;
     --tracks)              PUB_TRACKS="$2";                     shift 2 ;;
     --objects-per-group)   PUB_OBJECTS_PER_GROUP="$2";          shift 2 ;;
@@ -202,6 +205,7 @@ run_one() {
     --track-sequence "$TRACK_SEQUENCE" \
     --method "$method" \
     --switch-after "$SWITCH_AFTER" \
+    --jitter-buffer-ms "$JITTER_BUFFER_MS" \
     --bandwidth-cap-bps 0 \
     --output-json "$outfile" \
     && log "Saved: $outfile" \
@@ -226,6 +230,7 @@ main() {
   log "Methods:        ${METHODS[*]}"
   log "Track sequence: $TRACK_SEQUENCE"
   log "Switch after:   ${SWITCH_AFTER}s"
+  log "Jitter buffer:  ${JITTER_BUFFER_MS}ms"
   log "Reps:           $REPS"
   log "Publisher:      local (publish-multi)"
   log "Relay:          local ($RELAY_URL)"
