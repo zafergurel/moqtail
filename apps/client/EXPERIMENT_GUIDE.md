@@ -67,7 +67,7 @@ Three terminal windows, all from the workspace root:
   --namespace moqtail-experiment \
   --command publish-multi \
   --no-cert-validation \
-  --tracks "2:12500,3:5000,4:2500"
+  --tracks "2:5000,3:12500,4:20000"
 ```
 
 **Terminal 3 — one switch test**
@@ -128,22 +128,23 @@ the P-frame size as a fraction of the I-frame (default **0.25**, i.e. I-frame is
 
 ```bash
 # Default p_ratio=0.25 for all tracks
---tracks "2:12500,3:5000,4:2500"
+--tracks "2:5000,3:12500,4:20000"
 
 # Flat objects (no GOP structure)
---tracks "2:12500:1.0,3:5000:1.0"
+--tracks "2:5000:1.0,3:12500:1.0"
 
 # Custom ratio
---tracks "2:12500:0.33,3:5000:0.33"    # I-frame ≈ 3× P-frame
+--tracks "2:5000:0.33,3:12500:0.33"    # I-frame ≈ 3× P-frame
 ```
 
 With `N=25` objects/group and `p_ratio=0.25`, the sizes work out as:
 
 | Track | avg B/obj | I-frame | P-frame |
 | ----- | --------- | ------- | ------- |
-| 2     | 12 500    | 44 643  | 11 161  |
-| 3     | 5 000     | 17 857  | 4 464   |
-| 4     | 2 500     | 8 929   | 2 232   |
+| 1     | 2 500     | 8 929   | 2 232   |
+| 2     | 5 000     | 17 857  | 4 464   |
+| 3     | 12 500    | 44 643  | 11 161  |
+| 4     | 20 000    | 71 429  | 17 857  |
 
 ---
 
@@ -492,28 +493,29 @@ EOF
 
 ### Track layout
 
+Track numbering: **lower number = lower bitrate** (video-only, no audio track).
+
 | MOQ track | Resolution | Avg bitrate | avg B/obj (25fps) | I-frame  | P-frame  |
 | --------- | ---------- | ----------- | ----------------- | -------- | -------- |
-| `"1"`     | 1920×1080  | 4 Mbps      | 20 000 B          | 71 429 B | 17 857 B |
-| `"2"`     | 1280×720   | 2.5 Mbps    | 12 500 B          | 44 643 B | 11 161 B |
-| `"3"`     | 854×480    | 1 Mbps      | 5 000 B           | 17 857 B | 4 464 B  |
-| `"4"`     | 640×360    | 500 kbps    | 2 500 B           | 8 929 B  | 2 232 B  |
-| `"5"`     | audio      | 128 kbps    | 640 B             | 640 B    | 640 B    |
+| `"1"`     | 640×360    | 500 kbps    | 2 500 B           | 8 929 B  | 2 232 B  |
+| `"2"`     | 854×480    | 1 Mbps      | 5 000 B           | 17 857 B | 4 464 B  |
+| `"3"`     | 1280×720   | 2.5 Mbps    | 12 500 B          | 44 643 B | 11 161 B |
+| `"4"`     | 1920×1080  | 4 Mbps      | 20 000 B          | 71 429 B | 17 857 B |
 
 I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.  
-Primary test pair: **`"2"→"3"`** (downswitch).  
-Secondary: `"3"→"4"` (downswitch), `"3"→"2"` (upswitch on recovery).
+Primary test pair: **`"2"→"3"`** (480p→720p).  
+Secondary: `"3"→"4"` (upswitch), `"3"→"2"` (downswitch).
 
 ### Bandwidth conditions (experiment.sh)
 
 | Label     | Rate      | Notes                        |
 | --------- | --------- | ---------------------------- |
 | Baseline  | 0 (no tc) | Reference                    |
-| High      | 5 Mbps    | Comfortable for track 2      |
+| High      | 5 Mbps    | Comfortable for track 3      |
 | Tight     | 3 Mbps    | Slight pressure              |
 | Squeeze   | 2 Mbps    | At the limit                 |
-| Low       | 1.5 Mbps  | Below track 2, above track 3 |
-| Congested | 1 Mbps    | Below track 3                |
+| Low       | 1.5 Mbps  | Below track 3, above track 2 |
+| Congested | 1 Mbps    | Below track 2                |
 
 ### Metrics
 

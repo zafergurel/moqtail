@@ -183,10 +183,10 @@ pub struct Cli {
   /// avg_bytes — average payload per object (controls bitrate).
   /// p_ratio   — P-frame size as a fraction of I-frame size; default 0.25
   ///             (I-frame is 4× a P-frame).  Use 1.0 for flat objects.
-  /// Defaults to the standard 5-track layout matching ffmpeg.sh bitrates:
-  ///   1:20000,2:12500,3:5000,4:2500,5:640
-  /// Example: --tracks "2:12500:0.25,3:5000:0.25"
-  #[arg(long, default_value = "1:20000,2:12500,3:5000,4:2500,5:640")]
+  /// Track numbering: lower number = lower bitrate (track 1 is lowest quality).
+  ///   1:2500,2:5000,3:12500,4:20000
+  /// Example: --tracks "2:5000:0.25,3:12500:0.25"
+  #[arg(long, default_value = "1:2500,2:5000,3:12500,4:20000")]
   pub tracks: String,
 
   // ── switch-test args ──────────────────────────────────────────────────────

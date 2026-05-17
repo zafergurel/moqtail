@@ -58,15 +58,17 @@ SWITCH (subscription_request_id=A, new_track=B)  →  t_switch_decision
 
 ## Metrics collected
 
-| Metric                    | Meaning                                                   |
-| ------------------------- | --------------------------------------------------------- |
-| `switch_latency_ms`       | `t_first_b_object − t_switch_decision`                    |
-| `stall_ms`                | `t_first_b_object − t_last_a_object` (negative = overlap) |
-| `group_boundary_aligned`  | Whether the first B object had `object_id == 0`           |
-| `control_messages`        | Number of switch-specific control messages sent           |
-| `redundant_bytes`         | Bytes from the joining-fetch warm-up window               |
-| `trailing_a_bytes`        | Bytes from A received after the switch decision           |
-| `a_objects_post_decision` | A objects that arrived after the switch decision          |
+| Metric                    | Meaning                                                                     |
+| ------------------------- | --------------------------------------------------------------------------- |
+| `switch_latency_ms`       | `t_first_b_object − t_switch_decision`                                      |
+| `delivery_gap_ms`         | `t_first_b − (t_last_a + frame_interval_ms)`; negative = overlap            |
+| `freeze_ms`               | Realtime mode: freeze duration; `null` in VoD mode                          |
+| `stall_ms`                | VoD mode: stall duration absorbed beyond playout buffer; `null` in realtime |
+| `group_boundary_aligned`  | Whether the first B object had `object_id == 0`                             |
+| `control_messages`        | Number of switch-specific control messages sent                             |
+| `redundant_bytes`         | Bytes from the joining-fetch warm-up window                                 |
+| `trailing_a_bytes`        | Bytes from A received after the switch decision                             |
+| `a_objects_post_decision` | A objects that arrived after the switch decision                            |
 
 ---
 
@@ -134,22 +136,37 @@ The file `/tmp/result.json` will contain:
 ```json
 {
   "method": "switch-message",
-  "track_from": "2",
-  "track_to": "3",
   "bandwidth_cap_bps": 0,
-  "switch_latency_ms": 47,
-  "stall_ms": -12,
-  "group_boundary_aligned": true,
-  "control_messages": 1,
-  "redundant_bytes": 0,
-  "trailing_a_bytes": 3840,
-  "a_objects_post_decision": 2,
-  "last_a_group": 42,
-  "first_b_group": 43
+  "mode": "realtime",
+  "frame_interval_ms": 40,
+  "objects_per_group": 25,
+  "jitter_buffer_ms": 0,
+  "aetr": 0.18,
+  "switches": [
+    {
+      "track_from": "2",
+      "track_to": "3",
+      "switch_latency_ms": 882,
+      "delivery_gap_ms": 1,
+      "freeze_ms": 1000,
+      "stall_ms": null,
+      "group_boundary_aligned": true,
+      "control_messages": 1,
+      "redundant_bytes": 0,
+      "trailing_a_bytes": 245542,
+      "useful_b_bytes": 1151722,
+      "excess_bytes": 245542,
+      "total_bytes": 1397264,
+      "aetr": 0.18,
+      "a_objects_post_decision": 22,
+      "last_a_group": 32,
+      "first_b_group": 33
+    }
+  ]
 }
 ```
 
-A negative `stall_ms` means overlap (both tracks delivering simultaneously) — expected for Joining Fetch.
+A positive `delivery_gap_ms` with `freeze_ms=1000` (one full GoP) is expected for SWITCH message (waits for the next group boundary). A negative `delivery_gap_ms` means overlap.
 
 ---
 
@@ -190,11 +207,11 @@ results/
 | Label     | Rate      | Notes                                                  |
 | --------- | --------- | ------------------------------------------------------ |
 | Baseline  | 0 (no tc) | Reference; all methods should perform identically      |
-| High      | 5 Mbps    | Plenty for track 2 (2.5 Mbps)                          |
-| Tight     | 3 Mbps    | Slight pressure on track 2                             |
+| High      | 5 Mbps    | Plenty for track 3 (2.5 Mbps)                          |
+| Tight     | 3 Mbps    | Slight pressure on track 3                             |
 | Squeeze   | 2 Mbps    | At the limit; switch likely triggered by congestion    |
-| Low       | 1.5 Mbps  | Below track 2, above track 3                           |
-| Congested | 1 Mbps    | Below track 3; tests behaviour under severe congestion |
+| Low       | 1.5 Mbps  | Below track 3, above track 2                           |
+| Congested | 1 Mbps    | Below track 2; tests behaviour under severe congestion |
 
 Bandwidth shaping is applied on the relay host toward the subscriber IP using `tc htb` + `iptables MARK`. See `scripts/tc/README.md` for manual `tc` commands.
 
@@ -225,15 +242,16 @@ ssh zafer@<relay-ip> 'tail -f /tmp/moqtail-relay.log /tmp/moqtail-pub.log'
 
 ## Track layout (published by `scripts/ffmpeg.sh`)
 
-| MOQ track name | Resolution           | Bitrate  |
-| -------------- | -------------------- | -------- |
-| `"1"`          | 1920×1080 (upscaled) | 4 Mbps   |
-| `"2"`          | 1280×720 (native)    | 2.5 Mbps |
-| `"3"`          | 854×480              | 1 Mbps   |
-| `"4"`          | 640×360              | 500 kbps |
-| `"5"`          | audio                | 128 kbps |
+Track numbering: **lower number = lower bitrate** (video-only, no audio track).
 
-Primary test pair: **`"2"` → `"3"`** (720p → 480p, 2.5× bitrate drop).
-Secondary pairs: `"3"→"4"` (downswitch) and `"3"→"2"` (upswitch on recovery).
+| MOQ track name | Resolution | Bitrate  |
+| -------------- | ---------- | -------- |
+| `"1"`          | 640×360    | 500 kbps |
+| `"2"`          | 854×480    | 1 Mbps   |
+| `"3"`          | 1280×720   | 2.5 Mbps |
+| `"4"`          | 1920×1080  | 4 Mbps   |
+
+Primary test pair: **`"2"` → `"3"`** (480p → 720p, 2.5× bitrate increase).
+Secondary pairs: `"3"→"4"` (upswitch) and `"3"→"2"` (downswitch).
 
 All tracks use 1-second GOPs (`-g 25`) synchronised across streams so group boundaries are aligned — a clean group-boundary switch on one track corresponds to a clean boundary on any other.

@@ -44,7 +44,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ── Defaults ───────────────────────────────────────────────────────────────────
 
 ALL_METHODS=("switch-message" "sub-update-forward" "joining-fetch")
-# Default track sequence: single downswitch 720p→480p
+# Default track sequence: single upswitch 480p→720p (lower number = lower bitrate)
 TRACK_SEQUENCE="2,3"
 SWITCH_AFTER=15
 REPS=3
@@ -52,13 +52,12 @@ RELAY_PORT=4433
 RELAY_URL="https://127.0.0.1:${RELAY_PORT}"
 NAMESPACE="moqtail-experiment"
 
-# publish-multi defaults — match the ffmpeg.sh bitrate ladder:
-#   track 1: 4 Mbps  (1920×1080)  → 20000 B/obj at 25fps
-#   track 2: 2.5 Mbps (1280×720)  → 12500 B/obj
-#   track 3: 1 Mbps  (854×480)    → 5000 B/obj
-#   track 4: 500 kbps (640×360)   → 2500 B/obj
-#   track 5: 128 kbps audio       → 640 B/obj
-PUB_TRACKS="1:20000,2:12500,3:5000,4:2500,5:640"
+# publish-multi defaults — video-only bitrate ladder (lower track = lower bitrate):
+#   track 1: 500 kbps (640×360)   → 2500 B/obj at 25fps
+#   track 2: 1 Mbps   (854×480)   → 5000 B/obj
+#   track 3: 2.5 Mbps (1280×720)  → 12500 B/obj
+#   track 4: 4 Mbps   (1920×1080) → 20000 B/obj
+PUB_TRACKS="1:2500,2:5000,3:12500,4:20000"
 PUB_OBJECTS_PER_GROUP=25
 PUB_INTERVAL_MS=40
 PUB_GROUP_COUNT=1000
