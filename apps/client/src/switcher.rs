@@ -132,27 +132,31 @@ async fn receiver_task(
   loop {
     match conn.accept_uni().await {
       Ok(stream) => {
-        let stream_handler = RecvDataStream::new(stream, pending_fetches.clone());
-        let mut handler = &stream_handler;
-        loop {
-          let (next_handler, object) = handler.next_object().await;
-          match object {
-            Some(obj) => {
-              let event = ObjectEvent {
-                track_alias: obj.track_alias,
-                group: obj.location.group,
-                object: obj.location.object,
-                payload_size: obj.payload.as_ref().map_or(0, |p| p.len()),
-                received_at: Instant::now(),
-              };
-              if tx.send(event).await.is_err() {
-                return;
+        let tx_clone = tx.clone();
+        let pf_clone = pending_fetches.clone();
+        tokio::spawn(async move {
+          let stream_handler = RecvDataStream::new(stream, pf_clone);
+          let mut handler = &stream_handler;
+          loop {
+            let (next_handler, object) = handler.next_object().await;
+            match object {
+              Some(obj) => {
+                let event = ObjectEvent {
+                  track_alias: obj.track_alias,
+                  group: obj.location.group,
+                  object: obj.location.object,
+                  payload_size: obj.payload.as_ref().map_or(0, |p| p.len()),
+                  received_at: Instant::now(),
+                };
+                if tx_clone.send(event).await.is_err() {
+                  return;
+                }
+                handler = next_handler;
               }
-              handler = next_handler;
+              None => break,
             }
-            None => break,
           }
-        }
+        });
       }
       Err(e) => {
         info!("receiver_task: stream accept ended: {:?}", e);
@@ -654,37 +658,45 @@ async fn run_joining_fetch_phase(
             }
           } else if ev.track_alias == b_alias {
             if !first_b_seen {
-              record.first_b_object_time = Some(ev.received_at);
-              record.first_b_group = Some(ev.group);
-              record.group_boundary_aligned = Some(ev.object == 0);
-              first_b_seen = true;
-              info!("First live B object (joining-fetch): group={}, object={}", ev.group, ev.object);
+              if ev.object != 0 {
+                // Pre-boundary live object — not yet decodable.
+                record.b_objects_pre_active += 1;
+                record.redundant_bytes += ev.payload_size as u64;
+              } else {
+                record.first_b_object_time = Some(ev.received_at);
+                record.first_b_group = Some(ev.group);
+                record.group_boundary_aligned = Some(true);
+                first_b_seen = true;
+                info!("First live B group boundary (joining-fetch): group={}", ev.group);
 
-              // Stop A (forward=false), raise B priority.
-              let ru_a_req = state.take_req_id();
-              if let Err(e) = send_request_update(
-                cs, ru_a_req, current_req_id,
-                vec![MessageParameter::new_forward(false)],
-              ).await {
-                warn!("joining_fetch: RequestUpdate A failed: {:?}", e);
-                break;
+                // Stop A (forward=false), raise B priority.
+                let ru_a_req = state.take_req_id();
+                if let Err(e) = send_request_update(
+                  cs, ru_a_req, current_req_id,
+                  vec![MessageParameter::new_forward(false)],
+                ).await {
+                  warn!("joining_fetch: RequestUpdate A failed: {:?}", e);
+                  break;
+                }
+                record.control_messages += 1;
+
+                let ru_b_req = state.take_req_id();
+                if let Err(e) = send_request_update(
+                  cs, ru_b_req, b_req_id,
+                  vec![MessageParameter::new_subscriber_priority(128)],
+                ).await {
+                  warn!("joining_fetch: RequestUpdate B failed: {:?}", e);
+                  break;
+                }
+                record.control_messages += 1;
+
+                // Collect trailing A for 5 more seconds then stop.
+                post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                record.useful_b_bytes += ev.payload_size as u64;
               }
-              record.control_messages += 1;
-
-              let ru_b_req = state.take_req_id();
-              if let Err(e) = send_request_update(
-                cs, ru_b_req, b_req_id,
-                vec![MessageParameter::new_subscriber_priority(128)],
-              ).await {
-                warn!("joining_fetch: RequestUpdate B failed: {:?}", e);
-                break;
-              }
-              record.control_messages += 1;
-
-              // Collect trailing A for 5 more seconds then stop.
-              post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+            } else {
+              record.useful_b_bytes += ev.payload_size as u64;
             }
-            record.useful_b_bytes += ev.payload_size as u64;
           }
         }
         None => break,

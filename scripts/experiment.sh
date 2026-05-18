@@ -58,6 +58,17 @@ RELAY_HOST_IP="${RELAY_SSH##*@}"
 RELAY_URL="https://${RELAY_HOST_IP}:${RELAY_PORT}"
 NAMESPACE="${NAMESPACE:-moqtail-experiment}"
 
+# Optional: run publisher on a remote host instead of locally.
+# If PUB_SSH is unset, publisher runs on this machine.
+PUB_SSH="${PUB_SSH:-}"
+PUB_PROJECT="${PUB_PROJECT:-$ROOT_DIR}"
+# If publisher is on the relay host, it connects via loopback.
+if [ -n "$PUB_SSH" ] && [ "$PUB_SSH" = "$RELAY_SSH" ]; then
+  PUB_RELAY_URL="https://127.0.0.1:${RELAY_PORT}"
+else
+  PUB_RELAY_URL="$RELAY_URL"
+fi
+
 # ── Experiment defaults ────────────────────────────────────────────────────────
 
 ALL_METHODS=("switch-message" "sub-update-forward" "joining-fetch")
@@ -79,7 +90,7 @@ TC_MARK=1
 PUB_TRACKS="1:2500,2:5000,3:12500,4:20000"
 PUB_OBJECTS_PER_GROUP=25
 PUB_INTERVAL_MS=40
-PUB_GROUP_COUNT=1000
+PUB_GROUP_COUNT=5000
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
@@ -124,12 +135,47 @@ done
 [ ${#SELECTED_BANDWIDTHS[@]} -eq 0 ] && BANDWIDTHS=("${ALL_BANDWIDTHS[@]}") || BANDWIDTHS=("${SELECTED_BANDWIDTHS[@]}")
 [ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$ROOT_DIR/results/$(date +%Y%m%d_%H%M%S)"
 
+# ── Resume / fresh prompt ──────────────────────────────────────────────────────
+# If the output directory already has results, ask whether to resume or start fresh.
+
+if [ -d "$OUTPUT_DIR" ]; then
+  existing=$(find "$OUTPUT_DIR" -maxdepth 1 -name '*.json' | wc -l)
+  total=$(( ${#METHODS[@]} * ${#BANDWIDTHS[@]} * REPS ))
+  if [ "$existing" -gt 0 ] && [ "$existing" -lt "$total" ]; then
+    echo ""
+    echo "  Incomplete run: $existing / $total results in $OUTPUT_DIR"
+    echo ""
+    read -rp "  Resume (r) or start fresh (f)? [r/f]: " _choice
+    case "${_choice,,}" in
+      r) echo "" ;;
+      f) OUTPUT_DIR="$ROOT_DIR/results/$(date +%Y%m%d_%H%M%S)"
+         echo "  Starting fresh → $OUTPUT_DIR"
+         echo "" ;;
+      *) echo "ERROR: enter 'r' to resume or 'f' for fresh run." >&2; exit 1 ;;
+    esac
+    unset _choice
+  elif [ "$existing" -ge "$total" ]; then
+    echo ""
+    echo "  Run already complete ($existing / $total results in $OUTPUT_DIR)."
+    echo "  Starting fresh → use a different --output dir or omit it for a new timestamp."
+    echo ""
+    OUTPUT_DIR="$ROOT_DIR/results/$(date +%Y%m%d_%H%M%S)"
+  fi
+fi
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 relay_ssh() { ssh -o ConnectTimeout=10 "$RELAY_SSH" "$@"; }
+pub_ssh()   {
+  if [ -n "$PUB_SSH" ]; then
+    ssh -o ConnectTimeout=10 "$PUB_SSH" "$@"
+  else
+    eval "$@"
+  fi
+}
 
 detect_subscriber_ip() {
   if [[ "$(uname)" == "Darwin" ]]; then
@@ -147,10 +193,19 @@ detect_subscriber_ip() {
 # ── Build ──────────────────────────────────────────────────────────────────────
 
 do_build() {
-  log "Building relay binary on relay host..."
-  relay_ssh "source ~/.cargo/env && cd $RELAY_PROJECT && cargo build --release --bin relay 2>&1 | tail -5"
+  if [ -n "$PUB_SSH" ] && [ "$PUB_SSH" = "$RELAY_SSH" ]; then
+    log "Building relay + client binaries on relay host..."
+    relay_ssh "source ~/.cargo/env && cd $RELAY_PROJECT && cargo build --release --bin relay --bin client 2>&1 | tail -5"
+  else
+    log "Building relay binary on relay host..."
+    relay_ssh "source ~/.cargo/env && cd $RELAY_PROJECT && cargo build --release --bin relay 2>&1 | tail -5"
+    if [ -n "$PUB_SSH" ]; then
+      log "Building client binary on publisher host..."
+      pub_ssh "source ~/.cargo/env && cd $PUB_PROJECT && cargo build --release --bin client 2>&1 | tail -5"
+    fi
+  fi
 
-  log "Building client locally..."
+  log "Building client locally (for subscriber)..."
   cargo build --release --bin client --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
 }
 
@@ -162,10 +217,15 @@ start_relay() {
   sleep 2
 
   log "Starting relay on relay host (port $RELAY_PORT)..."
-  relay_ssh "cd $RELAY_PROJECT && \
-    nohup target/release/relay --port $RELAY_PORT > /tmp/moqtail-relay.log 2>&1 & \
-    echo \$! > /tmp/moqtail-relay.pid && \
-    echo 'relay PID' \$(cat /tmp/moqtail-relay.pid)"
+  relay_ssh "cd $RELAY_PROJECT && python3 - <<'PYEOF'
+import subprocess, sys
+p = subprocess.Popen(
+    ['target/release/relay', '--port', '$RELAY_PORT'],
+    stdin=open('/dev/null'), stdout=open('/tmp/moqtail-relay.log','w'),
+    stderr=subprocess.STDOUT, close_fds=True, start_new_session=True)
+open('/tmp/moqtail-relay.pid','w').write(str(p.pid))
+print('relay PID', p.pid, flush=True)
+PYEOF"
   sleep 4
 }
 
@@ -180,37 +240,71 @@ stop_relay() {
 # ── Publisher ──────────────────────────────────────────────────────────────────
 
 start_publisher() {
-  if [ ! -x "$CLIENT_BIN" ]; then
-    die "Client binary not found at $CLIENT_BIN — run with --build first"
+  local pub_bin="$PUB_PROJECT/target/release/client"
+
+  if [ -n "$PUB_SSH" ]; then
+    if ! pub_ssh "test -x $pub_bin" 2>/dev/null; then
+      die "Client binary not found on publisher host at $pub_bin — run with --build first"
+    fi
+    log "Stopping any lingering publisher on $PUB_SSH..."
+    pub_ssh "pkill -f '[c]lient.*publish-multi' 2>/dev/null; true"
+    sleep 1
+
+    log "Starting publish-multi on $PUB_SSH (tracks=$PUB_TRACKS, groups=$PUB_GROUP_COUNT)..."
+    pub_ssh "cd $PUB_PROJECT && python3 - <<'PYEOF'
+import subprocess
+p = subprocess.Popen(
+    ['target/release/client',
+     '--server', '$PUB_RELAY_URL',
+     '--namespace', '$NAMESPACE',
+     '--command', 'publish-multi',
+     '--no-cert-validation',
+     '--tracks', '$PUB_TRACKS',
+     '--objects-per-group', '$PUB_OBJECTS_PER_GROUP',
+     '--interval', '$PUB_INTERVAL_MS',
+     '--group-count', '$PUB_GROUP_COUNT'],
+    stdin=open('/dev/null'), stdout=open('$PUB_LOG','w'),
+    stderr=subprocess.STDOUT, close_fds=True, start_new_session=True)
+open('$PUB_PID_FILE','w').write(str(p.pid))
+print('publisher PID', p.pid, flush=True)
+PYEOF"
+  else
+    if [ ! -x "$pub_bin" ]; then
+      die "Client binary not found at $pub_bin — run with --build first"
+    fi
+    log "Stopping any lingering local publisher..."
+    pkill -f "[c]lient.*publish-multi" 2>/dev/null || true
+    sleep 1
+
+    log "Starting publish-multi locally (tracks=$PUB_TRACKS, groups=$PUB_GROUP_COUNT) → $PUB_LOG"
+    "$pub_bin" \
+      --server "$PUB_RELAY_URL" \
+      --namespace "$NAMESPACE" \
+      --command publish-multi \
+      --no-cert-validation \
+      --tracks "$PUB_TRACKS" \
+      --objects-per-group "$PUB_OBJECTS_PER_GROUP" \
+      --interval "$PUB_INTERVAL_MS" \
+      --group-count "$PUB_GROUP_COUNT" \
+      >"$PUB_LOG" 2>&1 &
+    echo $! >"$PUB_PID_FILE"
+    log "Publisher PID $(cat "$PUB_PID_FILE")"
   fi
 
-  log "Stopping any lingering local publisher..."
-  pkill -f "client.*publish-multi" 2>/dev/null || true
-  sleep 1
-
-  log "Starting publish-multi (tracks=$PUB_TRACKS, groups=$PUB_GROUP_COUNT) → $PUB_LOG"
-  "$CLIENT_BIN" \
-    --server "$RELAY_URL" \
-    --namespace "$NAMESPACE" \
-    --command publish-multi \
-    --no-cert-validation \
-    --tracks "$PUB_TRACKS" \
-    --objects-per-group "$PUB_OBJECTS_PER_GROUP" \
-    --interval "$PUB_INTERVAL_MS" \
-    --group-count "$PUB_GROUP_COUNT" \
-    >"$PUB_LOG" 2>&1 &
-  echo $! >"$PUB_PID_FILE"
-
   local warmup=$(( SWITCH_AFTER > 5 ? 5 : SWITCH_AFTER ))
-  log "Publisher PID $(cat "$PUB_PID_FILE") — waiting ${warmup}s for initial cache warm-up..."
+  log "Waiting ${warmup}s for initial cache warm-up..."
   sleep "$warmup"
 }
 
 stop_publisher() {
-  if [ -f "$PUB_PID_FILE" ]; then
-    log "Stopping publisher (PID $(cat "$PUB_PID_FILE"))..."
-    kill "$(cat "$PUB_PID_FILE")" 2>/dev/null || true
-    rm -f "$PUB_PID_FILE"
+  log "Stopping publisher..."
+  if [ -n "$PUB_SSH" ]; then
+    pub_ssh "[ -f $PUB_PID_FILE ] && kill \$(cat $PUB_PID_FILE) 2>/dev/null; rm -f $PUB_PID_FILE; true"
+  else
+    if [ -f "$PUB_PID_FILE" ]; then
+      kill "$(cat "$PUB_PID_FILE")" 2>/dev/null || true
+      rm -f "$PUB_PID_FILE"
+    fi
   fi
 }
 
@@ -219,7 +313,10 @@ stop_publisher() {
 apply_tc() {
   local bw=$1 subscriber_ip=$2
   log "tc: ${bw} bps toward $subscriber_ip (mark=$TC_MARK)"
-  relay_ssh "sudo bash $RELAY_PROJECT/scripts/tc/set_bandwidth.sh $bw $subscriber_ip $TC_MARK"
+  if ! relay_ssh "sudo bash $RELAY_PROJECT/scripts/tc/set_bandwidth.sh $bw $subscriber_ip $TC_MARK" 2>/dev/null; then
+    log "WARNING: tc failed (sudo not configured?) — running without bandwidth shaping"
+    return 0
+  fi
   sleep 3
 }
 
@@ -230,12 +327,64 @@ clear_tc() {
   sleep 1
 }
 
+# ── Health check + auto-restart ────────────────────────────────────────────────
+
+ensure_healthy() {
+  # Check relay: try to reach the UDP port on the relay host.
+  local relay_up=false
+  if ssh -o ConnectTimeout=5 "$RELAY_SSH" \
+      "ss -ulnp 2>/dev/null | grep -q ':$RELAY_PORT'" 2>/dev/null; then
+    relay_up=true
+  fi
+
+  if ! $relay_up; then
+    log "Relay is down — restarting relay and publisher..."
+    start_relay
+    stop_publisher
+    start_publisher
+    return
+  fi
+
+  # Check publisher process.
+  local pub_alive=false
+  if [ -n "$PUB_SSH" ]; then
+    pub_ssh "[ -f $PUB_PID_FILE ] && kill -0 \$(cat $PUB_PID_FILE) 2>/dev/null" 2>/dev/null && pub_alive=true || true
+  else
+    { [ -f "$PUB_PID_FILE" ] && kill -0 "$(cat "$PUB_PID_FILE")" 2>/dev/null && pub_alive=true; } || true
+  fi
+  if ! $pub_alive; then
+    log "Publisher is down — restarting publisher..."
+    start_publisher
+  fi
+}
+
 # ── Single experiment run ──────────────────────────────────────────────────────
+
+print_result() {
+  local outfile=$1
+  python3 - "$outfile" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+parts = []
+for i, s in enumerate(d.get('switches', [])):
+    lat = s['switch_latency_ms']
+    frz = s['freeze_ms']
+    stall = s.get('stall_ms')
+    metric = f"stall={stall}ms" if stall is not None else f"freeze={frz}ms"
+    parts.append(f"sw{i+1}: {lat}ms ({metric})")
+print("  " + "  |  ".join(parts))
+PYEOF
+}
 
 run_one() {
   local method=$1 bw=$2 rep=$3 subscriber_ip=$4
   local label="${method}_${bw}bps"
   local outfile="$OUTPUT_DIR/${label}_rep${rep}.json"
+
+  if [ -s "$outfile" ]; then
+    log "SKIP: $label rep $rep (already done)"
+    return 0
+  fi
 
   log "--- $label rep $rep ---"
 
@@ -243,7 +392,7 @@ run_one() {
     apply_tc "$bw" "$subscriber_ip"
   fi
 
-  "$CLIENT_BIN" \
+  if "$CLIENT_BIN" \
     --server "$RELAY_URL" \
     --namespace "$NAMESPACE" \
     --command switch-test \
@@ -253,9 +402,12 @@ run_one() {
     --switch-after "$SWITCH_AFTER" \
     --jitter-buffer-ms "$JITTER_BUFFER_MS" \
     --bandwidth-cap-bps 0 \
-    --output-json "$outfile" \
-    && log "Saved: $outfile" \
-    || log "WARNING: subscriber exited with error for $label rep $rep"
+    --output-json "$outfile"; then
+    log "Saved: $outfile"
+    print_result "$outfile"
+  else
+    log "WARNING: subscriber exited with error for $label rep $rep"
+  fi
 
   if [ "$bw" -gt 0 ]; then
     clear_tc "$subscriber_ip"
@@ -272,7 +424,7 @@ main() {
 
   log "=== experiment.sh ==="
   log "Relay:          $RELAY_SSH  ($RELAY_HOST_IP:$RELAY_PORT)"
-  log "Publisher:      local (publish-multi)"
+  log "Publisher:      ${PUB_SSH:-local} (publish-multi → $PUB_RELAY_URL)"
   log "Methods:        ${METHODS[*]}"
   log "Bandwidths:     ${BANDWIDTHS[*]} bps"
   log "Track sequence: $TRACK_SEQUENCE"
@@ -302,6 +454,7 @@ main() {
   for method in "${METHODS[@]}"; do
     for bw in "${BANDWIDTHS[@]}"; do
       for rep in $(seq 1 "$REPS"); do
+        ensure_healthy
         run_one "$method" "$bw" "$rep" "$subscriber_ip"
         (( done_count++ )) || true
         log "Progress: $done_count / $total"

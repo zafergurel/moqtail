@@ -171,7 +171,7 @@ start_relay() {
 
   log "Starting relay on relay host (port $RELAY_PORT)..."
   relay_ssh "cd $RELAY_PROJECT && \
-    nohup target/release/relay > /tmp/moqtail-relay.log 2>&1 & \
+    nohup target/release/relay </dev/null > /tmp/moqtail-relay.log 2>&1 & \
     echo \$! > /tmp/moqtail-relay.pid && \
     echo 'relay PID' \$(cat /tmp/moqtail-relay.pid)"
   sleep 4
