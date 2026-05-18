@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# experiment.sh — Track switching experiment (remote relay, local publish-multi publisher)
+# experiment.sh — Track switching experiment orchestrator
 #
-# Runs on the subscriber machine. Starts the relay on a remote SSH host and a
-# local publish-multi publisher (artificial bytes, same as local_test.sh), then
-# iterates over a method × bandwidth matrix, saving one JSON file per run.
+# Runs on the subscriber machine. Starts the relay (always remote) and the
+# publisher (local by default, or remote if PUB_SSH is set) then iterates
+# over a method × bandwidth matrix, saving one JSON file per run.
 #
 # Configuration is read from scripts/.env (gitignored). Copy
 # scripts/.env.example to scripts/.env and fill in your values.
@@ -12,28 +12,18 @@
 #   bash scripts/experiment.sh [options]
 #
 # Options:
-#   --build              Build release binaries on relay and client locally
+#   --build              Build release binaries on relay (and publisher if remote)
+#                        and the client binary locally, before running
 #   --skip-start         Assume relay + publisher are already running
-#   --method  <name>     Only run this method (repeatable; default: all three)
+#   --method  <name>     Only run this method  (repeatable; default: all three)
 #   --bandwidth <bps>    Only run at this bandwidth; 0 = no limit (repeatable; default: all)
 #   --track-sequence <s> Comma-separated track sequence, e.g. "2,3,4,3,2"
 #                        Default: "2,3,4,3,2" (up-up-down-down across 4 bitrates)
-#   --switch-after <s>   Seconds per track before triggering next switch (default: 15)
-#   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 40)
+#   --switch-after <s>   Seconds before triggering each switch (default: 15)
+#   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 100)
 #   --reps <n>           Repetitions per condition (default: 3)
-#   --tracks <spec>      Track specs for publish-multi, e.g. "1:2500,2:5000,3:12500,4:20000"
-#   --objects-per-group <n>  Objects per group (default: 25, i.e. 1s GOP at 25fps)
-#   --interval <ms>      Inter-object interval in ms (default: 40, i.e. 25fps)
-#   --group-count <n>    Total groups to publish (default: 1000 ≈ ~17 minutes)
 #   --output <dir>       Results directory (default: results/YYYYMMDD_HHMMSS)
 #   --help
-#
-# Examples:
-#   # Baseline only (no bandwidth shaping), 3 reps per method
-#   bash scripts/experiment.sh --bandwidth 0
-#
-#   # Full matrix: all bandwidths × all methods × 3 reps
-#   bash scripts/experiment.sh --build
 
 set -euo pipefail
 
@@ -50,36 +40,34 @@ fi
 # shellcheck source=/dev/null
 source "$ENV_FILE"
 
+# Required variables (must be set in .env)
 : "${RELAY_SSH:?RELAY_SSH must be set in scripts/.env}"
 : "${RELAY_PROJECT:?RELAY_PROJECT must be set in scripts/.env}"
 
+# Optional variables with defaults
 RELAY_PORT="${RELAY_PORT:-4433}"
+PUB_SSH="${PUB_SSH:-}"           # empty = publisher runs locally (same machine as subscriber)
+PUB_PROJECT="${PUB_PROJECT:-}"   # only needed when PUB_SSH is set
+
+# Derive relay host IP from RELAY_SSH (strips "user@" prefix)
 RELAY_HOST_IP="${RELAY_SSH##*@}"
 RELAY_URL="https://${RELAY_HOST_IP}:${RELAY_PORT}"
-NAMESPACE="${NAMESPACE:-moqtail-experiment}"
+
+# Namespace published by moqtail-pub
+NAMESPACE="${NAMESPACE:-moqtail-watch-party-live}"
 
 # ── Experiment defaults ────────────────────────────────────────────────────────
 
 ALL_METHODS=("switch-message" "sub-update-forward" "joining-fetch")
 # Bandwidth ladder (bps). 0 = unlimited baseline (no tc rule applied).
 ALL_BANDWIDTHS=(0 5000000 3000000 2000000 1500000 1000000)
-# Track sequence: lower index = lower bitrate
-#   track 1=500kbps, 2=1Mbps, 3=2.5Mbps, 4=4Mbps
+# Track sequence: lower index = lower bitrate (matches ffmpeg.sh ordering)
+#   track 1=360p/500kbps, 2=480p/1Mbps, 3=720p/2.5Mbps, 4=1080p/4Mbps
 TRACK_SEQUENCE="2,3,4,3,2"
-SWITCH_AFTER=15
-JITTER_BUFFER_MS=40
+SWITCH_AFTER=15       # seconds before triggering each switch
+JITTER_BUFFER_MS=40   # ms; one frame at 25fps
 REPS=3
-TC_MARK=1
-
-# publish-multi defaults — video-only bitrate ladder (lower track = lower bitrate):
-#   track 1: 500 kbps (640×360)   → 2500 B/obj at 25fps
-#   track 2: 1 Mbps   (854×480)   → 5000 B/obj
-#   track 3: 2.5 Mbps (1280×720)  → 12500 B/obj
-#   track 4: 4 Mbps   (1920×1080) → 20000 B/obj
-PUB_TRACKS="1:2500,2:5000,3:12500,4:20000"
-PUB_OBJECTS_PER_GROUP=25
-PUB_INTERVAL_MS=40
-PUB_GROUP_COUNT=1000
+TC_MARK=1         # iptables mark; use a consistent value per subscriber (1–255)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
@@ -94,6 +82,7 @@ SKIP_START=false
 SELECTED_METHODS=()
 SELECTED_BANDWIDTHS=()
 OUTPUT_DIR=""
+JITTER_BUFFER_MS_OVERRIDE=""
 
 usage() {
   grep '^#' "$0" | sed 's/^# \{0,1\}//' | tail -n +2
@@ -102,26 +91,23 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --build)             BUILD=true;                          shift ;;
-    --skip-start)        SKIP_START=true;                     shift ;;
-    --method)            SELECTED_METHODS+=("$2");             shift 2 ;;
-    --bandwidth)         SELECTED_BANDWIDTHS+=("$2");          shift 2 ;;
-    --track-sequence)    TRACK_SEQUENCE="$2";                  shift 2 ;;
-    --switch-after)      SWITCH_AFTER="$2";                   shift 2 ;;
-    --jitter-buffer-ms)  JITTER_BUFFER_MS="$2";               shift 2 ;;
-    --reps)              REPS="$2";                           shift 2 ;;
-    --tracks)            PUB_TRACKS="$2";                     shift 2 ;;
-    --objects-per-group) PUB_OBJECTS_PER_GROUP="$2";          shift 2 ;;
-    --interval)          PUB_INTERVAL_MS="$2";                shift 2 ;;
-    --group-count)       PUB_GROUP_COUNT="$2";                shift 2 ;;
-    --output)            OUTPUT_DIR="$2";                     shift 2 ;;
-    --help|-h)           usage ;;
+    --build)              BUILD=true;                              shift ;;
+    --skip-start)         SKIP_START=true;                         shift ;;
+    --method)             SELECTED_METHODS+=("$2");                 shift 2 ;;
+    --bandwidth)          SELECTED_BANDWIDTHS+=("$2");              shift 2 ;;
+    --track-sequence)     TRACK_SEQUENCE="$2";                     shift 2 ;;
+    --switch-after)       SWITCH_AFTER="$2";                       shift 2 ;;
+    --jitter-buffer-ms)   JITTER_BUFFER_MS_OVERRIDE="$2";          shift 2 ;;
+    --reps)               REPS="$2";                               shift 2 ;;
+    --output)             OUTPUT_DIR="$2";                         shift 2 ;;
+    --help|-h)            usage ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
 
 [ ${#SELECTED_METHODS[@]}    -eq 0 ] && METHODS=("${ALL_METHODS[@]}")    || METHODS=("${SELECTED_METHODS[@]}")
 [ ${#SELECTED_BANDWIDTHS[@]} -eq 0 ] && BANDWIDTHS=("${ALL_BANDWIDTHS[@]}") || BANDWIDTHS=("${SELECTED_BANDWIDTHS[@]}")
+[ -n "$JITTER_BUFFER_MS_OVERRIDE" ] && JITTER_BUFFER_MS="$JITTER_BUFFER_MS_OVERRIDE"
 [ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$ROOT_DIR/results/$(date +%Y%m%d_%H%M%S)"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -131,6 +117,16 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 relay_ssh() { ssh -o ConnectTimeout=10 "$RELAY_SSH" "$@"; }
 
+pub_ssh() {
+  if [ -n "$PUB_SSH" ]; then
+    ssh -o ConnectTimeout=10 "$PUB_SSH" "$@"
+  else
+    bash -c "$*"
+  fi
+}
+
+# Detect the subscriber's IP on the interface that routes toward the relay.
+# Works on both macOS and Linux.
 detect_subscriber_ip() {
   if [[ "$(uname)" == "Darwin" ]]; then
     local iface
@@ -146,15 +142,27 @@ detect_subscriber_ip() {
 
 # ── Build ──────────────────────────────────────────────────────────────────────
 
-do_build() {
+build_relay() {
   log "Building relay binary on relay host..."
   relay_ssh "source ~/.cargo/env && cd $RELAY_PROJECT && cargo build --release --bin relay 2>&1 | tail -5"
+}
 
-  log "Building client locally..."
+build_publisher() {
+  log "Building publisher binary..."
+  if [ -n "$PUB_SSH" ]; then
+    ssh -o ConnectTimeout=10 "$PUB_SSH" \
+      "cd $PUB_PROJECT && cargo build --release --bin moqtail-pub 2>&1 | tail -5"
+  else
+    cargo build --release --bin moqtail-pub --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
+  fi
+}
+
+build_subscriber() {
+  log "Building subscriber client locally..."
   cargo build --release --bin client --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
 }
 
-# ── Relay ──────────────────────────────────────────────────────────────────────
+# ── Relay process management ───────────────────────────────────────────────────
 
 start_relay() {
   log "Stopping any lingering relay on relay host..."
@@ -163,7 +171,7 @@ start_relay() {
 
   log "Starting relay on relay host (port $RELAY_PORT)..."
   relay_ssh "cd $RELAY_PROJECT && \
-    nohup target/release/relay --port $RELAY_PORT > /tmp/moqtail-relay.log 2>&1 & \
+    nohup target/release/relay > /tmp/moqtail-relay.log 2>&1 & \
     echo \$! > /tmp/moqtail-relay.pid && \
     echo 'relay PID' \$(cat /tmp/moqtail-relay.pid)"
   sleep 4
@@ -172,55 +180,41 @@ start_relay() {
 stop_relay() {
   log "Stopping relay on relay host..."
   relay_ssh "[ -f /tmp/moqtail-relay.pid ] && \
-    kill \$(cat /tmp/moqtail-relay.pid) 2>/dev/null; \
-    rm -f /tmp/moqtail-relay.pid; \
-    true"
+    kill \$(cat /tmp/moqtail-relay.pid) 2>/dev/null; true"
 }
 
-# ── Publisher ──────────────────────────────────────────────────────────────────
+# ── Publisher process management ───────────────────────────────────────────────
 
 start_publisher() {
-  if [ ! -x "$CLIENT_BIN" ]; then
-    die "Client binary not found at $CLIENT_BIN — run with --build first"
-  fi
-
-  log "Stopping any lingering local publisher..."
-  pkill -f "client.*publish-multi" 2>/dev/null || true
+  log "Stopping any lingering publisher and ffmpeg..."
+  pub_ssh "pkill -f 'target/release/moqtail-pub' 2>/dev/null; pkill -f ffmpeg 2>/dev/null; true"
   sleep 1
 
-  log "Starting publish-multi (tracks=$PUB_TRACKS, groups=$PUB_GROUP_COUNT) → $PUB_LOG"
-  "$CLIENT_BIN" \
-    --server "$RELAY_URL" \
-    --namespace "$NAMESPACE" \
-    --command publish-multi \
-    --no-cert-validation \
-    --tracks "$PUB_TRACKS" \
-    --objects-per-group "$PUB_OBJECTS_PER_GROUP" \
-    --interval "$PUB_INTERVAL_MS" \
-    --group-count "$PUB_GROUP_COUNT" \
-    >"$PUB_LOG" 2>&1 &
-  echo $! >"$PUB_PID_FILE"
-
-  local warmup=$(( SWITCH_AFTER > 5 ? 5 : SWITCH_AFTER ))
-  log "Publisher PID $(cat "$PUB_PID_FILE") — waiting ${warmup}s for initial cache warm-up..."
-  sleep "$warmup"
+  local project="${PUB_PROJECT:-$ROOT_DIR}"
+  log "Starting ffmpeg + publisher (connecting to $RELAY_URL)..."
+  pub_ssh "cd $project && \
+    nohup bash scripts/ffmpeg.sh --url https://${RELAY_HOST_IP}:${RELAY_PORT} --release \
+      > $PUB_LOG 2>&1 & \
+    echo \$! > $PUB_PID_FILE && \
+    echo 'publisher PID' \$(cat $PUB_PID_FILE)"
+  sleep 6  # allow ffmpeg + publisher to connect and start pushing objects
 }
 
 stop_publisher() {
-  if [ -f "$PUB_PID_FILE" ]; then
-    log "Stopping publisher (PID $(cat "$PUB_PID_FILE"))..."
-    kill "$(cat "$PUB_PID_FILE")" 2>/dev/null || true
-    rm -f "$PUB_PID_FILE"
-  fi
+  log "Stopping publisher and ffmpeg..."
+  pub_ssh "[ -f $PUB_PID_FILE ] && kill \$(cat $PUB_PID_FILE) 2>/dev/null; \
+           pkill -f ffmpeg 2>/dev/null; \
+           rm -f $PUB_PID_FILE; \
+           true"
 }
 
-# ── tc bandwidth shaping (on relay host, toward subscriber) ────────────────────
+# ── tc bandwidth shaping (always on relay host, toward subscriber) ─────────────
 
 apply_tc() {
   local bw=$1 subscriber_ip=$2
   log "tc: ${bw} bps toward $subscriber_ip (mark=$TC_MARK)"
   relay_ssh "sudo bash $RELAY_PROJECT/scripts/tc/set_bandwidth.sh $bw $subscriber_ip $TC_MARK"
-  sleep 3
+  sleep 3  # let QUIC probe the new rate
 }
 
 clear_tc() {
@@ -261,7 +255,7 @@ run_one() {
     clear_tc "$subscriber_ip"
   fi
 
-  sleep 2
+  sleep 2  # let the QUIC connection settle before the next run
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -269,23 +263,23 @@ run_one() {
 main() {
   local subscriber_ip
   subscriber_ip=$(detect_subscriber_ip)
-
-  log "=== experiment.sh ==="
+  log "Subscriber IP toward relay: $subscriber_ip"
   log "Relay:          $RELAY_SSH  ($RELAY_HOST_IP:$RELAY_PORT)"
-  log "Publisher:      local (publish-multi)"
+  log "Publisher:      ${PUB_SSH:-local}"
   log "Methods:        ${METHODS[*]}"
   log "Bandwidths:     ${BANDWIDTHS[*]} bps"
   log "Track sequence: $TRACK_SEQUENCE"
   log "Switch after:   ${SWITCH_AFTER}s"
   log "Jitter buffer:  ${JITTER_BUFFER_MS}ms"
   log "Reps:           $REPS"
-  log "Subscriber IP:  $subscriber_ip"
 
   mkdir -p "$OUTPUT_DIR"
-  log "Results:        $OUTPUT_DIR"
+  log "Results:    $OUTPUT_DIR"
 
   if "$BUILD"; then
-    do_build
+    build_relay
+    build_publisher
+    build_subscriber
   fi
 
   if ! "$SKIP_START"; then
@@ -296,15 +290,15 @@ main() {
   trap 'log "Interrupted — cleaning up..."; clear_tc "$subscriber_ip" 2>/dev/null; stop_publisher; stop_relay' EXIT INT TERM
 
   local total=$(( ${#METHODS[@]} * ${#BANDWIDTHS[@]} * REPS ))
-  local done_count=0
+  local done=0
   log "Running $total experiment runs..."
 
   for method in "${METHODS[@]}"; do
     for bw in "${BANDWIDTHS[@]}"; do
       for rep in $(seq 1 "$REPS"); do
         run_one "$method" "$bw" "$rep" "$subscriber_ip"
-        (( done_count++ )) || true
-        log "Progress: $done_count / $total"
+        (( done++ )) || true
+        log "Progress: $done / $total"
       done
     done
   done
