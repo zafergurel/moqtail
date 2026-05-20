@@ -146,7 +146,7 @@ if [ -d "$OUTPUT_DIR" ]; then
     echo "  Incomplete run: $existing / $total results in $OUTPUT_DIR"
     echo ""
     read -rp "  Resume (r) or start fresh (f)? [r/f]: " _choice
-    case "${_choice,,}" in
+    case "$(echo "${_choice}" | tr '[:upper:]' '[:lower:]')" in
       r) echo "" ;;
       f) OUTPUT_DIR="$ROOT_DIR/results/$(date +%Y%m%d_%H%M%S)"
          echo "  Starting fresh → $OUTPUT_DIR"
