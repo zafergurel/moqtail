@@ -416,11 +416,11 @@ t=0ms        t=140ms                          t=682ms
 
 ### 6.4 Metrics per method (expected behavior)
 
-| Method             | delivery_gap                            | stall                          | AETR   | Notes                                                      |
-| ------------------ | --------------------------------------- | ------------------------------ | ------ | ---------------------------------------------------------- |
-| SWITCH message     | positive (waits for next boundary)      | 0 if gap ≤ JB; GoP if gap > JB | Low    | Gap = time from last A to B's first boundary               |
-| Sub Update Forward | ≤ 0 (slight overlap)                    | 0                              | Medium | Pre-subscribed B starts at its next boundary; A overlaps   |
-| Joining Fetch      | ≤ 0 (I-frame via fetch before A drains) | 0                              | High   | Fetch fills the partial group from relay cache; stall is 0 |
+| Method             | delivery_gap                                                             | stall                               | AETR        | Notes                                                                                                                                    |
+| ------------------ | ------------------------------------------------------------------------ | ----------------------------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| SWITCH message     | positive (waits for next boundary)                                       | 0 if gap ≤ JB; gap − JB if gap > JB | Low         | Gap = time from last A to B's first boundary                                                                                             |
+| Sub Update Forward | ≤ 0 (slight overlap)                                                     | 0                                   | Medium–High | Pre-subscribed B starts at its next boundary; A overlaps; AETR varies with group phase at switch time                                    |
+| Joining Fetch      | null when fetch is instant (no trailing A before I-frame); ≤ 0 otherwise | null / 0                            | Low–Medium  | Fetch covers partial group from relay cache; delivery_gap and stall are null when the fetch I-frame arrives before any trailing A object |
 
 ---
 
@@ -474,14 +474,14 @@ delay_A=500ms, delay_B=0 (B ahead scenario, "rp_a2b_b500"):
 
 ### 7.3 How delay affects each method
 
-| Scenario  | Method             | Expected behavior                                                          |
-| --------- | ------------------ | -------------------------------------------------------------------------- |
-| A ahead δ | SWITCH message     | Waits δ ms for B's boundary → gap ≈ δ; stall occurs when δ > JB            |
-| A ahead δ | Sub Update Forward | Waits for B's next boundary regardless of δ; gap always ≤ 0 (pre-buffered) |
-| A ahead δ | Joining Fetch      | Fetch fills the partial group; gap = null; switch_delay ≈ 1 GoP            |
-| B ahead δ | SWITCH message     | B's boundary just passed → B data cached → gap ≈ −δ (negative, no stall)   |
-| B ahead δ | Sub Update Forward | Same as above: gap ≤ 0                                                     |
-| B ahead δ | Joining Fetch      | Fetch fills partial group; gap = null                                      |
+| Scenario  | Method             | Expected behavior                                                                               |
+| --------- | ------------------ | ----------------------------------------------------------------------------------------------- |
+| A ahead δ | SWITCH message     | Waits δ ms for B's boundary → gap ≈ δ; stall occurs when δ > JB                                 |
+| A ahead δ | Sub Update Forward | Waits for B's next boundary regardless of δ; gap always ≤ 0 (pre-buffered)                      |
+| A ahead δ | Joining Fetch      | Fetch fills the partial group; gap = null; switch_delay ≈ 0ms (I-frame served from relay cache) |
+| B ahead δ | SWITCH message     | B's boundary just passed → B data cached → gap ≈ −δ (negative, no stall)                        |
+| B ahead δ | Sub Update Forward | Same as above: gap ≤ 0                                                                          |
+| B ahead δ | Joining Fetch      | Fetch fills partial group; gap = null                                                           |
 
 ---
 
