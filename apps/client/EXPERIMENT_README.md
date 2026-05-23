@@ -374,17 +374,22 @@ receives:   ──A──A──A──A──A──A─┼─A─A─A─A─�
 ### 6.2 Stall formula
 
 ```
-stall_ms = 0                              if delivery_gap ≤ jitter_buffer
-         = max(delivery_gap − JB, GoP)    if delivery_gap > jitter_buffer
-
-GoP = frame_interval_ms × objects_per_group = 40 × 25 = 1000 ms
+stall_ms = 0                    if delivery_gap ≤ jitter_buffer
+         = delivery_gap − JB    if delivery_gap > jitter_buffer
 ```
 
-The clamping to `GoP` is the critical behavior: **missing an I-frame by even 1 ms causes a full GoP freeze**. All 24 P-frames in the GoP depend on the I-frame, so the decoder cannot decode any of them until the next I-frame arrives (1 s later).
+If the I-frame arrived within the jitter budget the player absorbs it silently (no freeze). If it arrived late, the player was frozen for exactly `delivery_gap − JB` ms waiting for the I-frame — no more, no less. The P-frames of the GoP all follow the I-frame in order, so the decoder resumes decoding as soon as the I-frame arrives.
 
-### 6.3 Why switch_delay < stall is valid
+### 6.3 Relationship between switch_delay and stall
 
-This is the most counter-intuitive aspect of the metrics. Consider the `a_ahead_500` scenario with `switch-message` and `jitter_buffer=500ms`:
+These two metrics measure different things and can differ significantly:
+
+- `switch_delay` = `t_first_b − t_decision` — wall-clock time from decision to first B object
+- `stall` = `max(0, delivery_gap − JB)` — how long the player actually froze
+
+`stall` is typically **smaller** than `switch_delay` because trailing A objects advance `t_last_a` (shrinking the delivery gap relative to the decision time) and the jitter budget absorbs part of the remaining gap.
+
+Example — `a_ahead_500` scenario, `switch-message`, `JB=500ms`:
 
 ```
 t=0ms        t=140ms                          t=682ms
@@ -400,15 +405,9 @@ t=0ms        t=140ms                          t=682ms
 
 - `switch_delay` = 682ms — "B arrived 682ms after the decision."
 - `delivery_gap` = 502ms — "B arrived 502ms after the expected next-frame slot."
-- `stall` = max(502−500, 1000) = **1000ms** — "the I-frame was 2ms late, so the decoder freezes for 1 full GoP."
+- `stall` = 502 − 500 = **2ms** — "the I-frame was 2ms late; the player froze for 2ms."
 
-The stall (1000ms) exceeds the switch delay (682ms) because:
-
-1. A kept flowing for ~140ms after the decision (trailing objects), so the playout cursor advanced.
-2. The gap is measured from the _last A received_ (t=140ms), not from the decision (t=0).
-3. The gap (502ms) barely exceeded the jitter buffer (500ms by only 2ms), but the GoP-floor clamps the stall to 1000ms.
-
-**In summary**: `switch_delay` answers "how long did the switch take?" `stall` answers "how badly would the viewer's player freeze?" They measure fundamentally different things and can have any ordering.
+**In summary**: `switch_delay` answers "how long did the switch take?" `stall` answers "how long did the viewer's player actually freeze?"
 
 ### 6.4 Metrics per method (expected behavior)
 
@@ -639,20 +638,20 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 
 ### Metrics reference
 
-| Field                     | Description                                                                                                                           |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `switch_delay_ms`         | `t_first_b − t_decision` (ms). Negative = B pre-buffered, arrived before decision.                                                    |
-| `delivery_gap_ms`         | `t_first_b − (t_last_a + 40ms)`. Signed playout gap. Negative = B arrived before A's slot ended.                                      |
-| `stall_ms`                | `0` if gap ≤ JB; `max(gap−JB, GoP)` if gap > JB. Estimated viewer freeze (GoP = 1 s). `null` for Joining Fetch (gap filled by fetch). |
-| `group_boundary_aligned`  | First B object had `object_id == 0` (I-frame).                                                                                        |
-| `control_messages`        | Switch-specific control messages sent.                                                                                                |
-| `redundant_bytes`         | Joining-Fetch warm-up bytes + pre-boundary B objects.                                                                                 |
-| `trailing_a_bytes`        | A bytes received after switch decision.                                                                                               |
-| `useful_b_bytes`          | B bytes from first live group boundary onward.                                                                                        |
-| `excess_bytes`            | `redundant_bytes + trailing_a_bytes`.                                                                                                 |
-| `total_bytes`             | `useful_b_bytes + excess_bytes`.                                                                                                      |
-| `aetr`                    | `excess_bytes / total_bytes` per switch. Top-level `aetr` is mean across all switches.                                                |
-| `a_objects_post_decision` | A objects that arrived after the decision.                                                                                            |
+| Field                     | Description                                                                                                                                                                         |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `switch_delay_ms`         | `t_first_b − t_decision` (ms). Negative = B pre-buffered, arrived before decision.                                                                                                  |
+| `delivery_gap_ms`         | `t_first_b − (t_last_a + 40ms)`. Signed playout gap. Negative = B arrived before A's slot ended.                                                                                    |
+| `stall_ms`                | `0` if gap ≤ JB; `gap − JB` if gap > JB. Measured freeze time: how long the player waited for the I-frame beyond the jitter budget. `null` for Joining Fetch (gap filled by fetch). |
+| `group_boundary_aligned`  | First B object had `object_id == 0` (I-frame).                                                                                                                                      |
+| `control_messages`        | Switch-specific control messages sent.                                                                                                                                              |
+| `redundant_bytes`         | Joining-Fetch warm-up bytes + pre-boundary B objects.                                                                                                                               |
+| `trailing_a_bytes`        | A bytes received after switch decision.                                                                                                                                             |
+| `useful_b_bytes`          | B bytes from first live group boundary onward.                                                                                                                                      |
+| `excess_bytes`            | `redundant_bytes + trailing_a_bytes`.                                                                                                                                               |
+| `total_bytes`             | `useful_b_bytes + excess_bytes`.                                                                                                                                                    |
+| `aetr`                    | `excess_bytes / total_bytes` per switch. Top-level `aetr` is mean across all switches.                                                                                              |
+| `a_objects_post_decision` | A objects that arrived after the decision.                                                                                                                                          |
 
 ### Switch method summary
 

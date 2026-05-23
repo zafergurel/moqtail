@@ -24,11 +24,7 @@ pub struct PlayoutConfig {
   pub jitter_buffer_ms: u64,
 }
 
-impl PlayoutConfig {
-  pub fn gop_duration_ms(&self) -> u64 {
-    self.frame_interval_ms * self.objects_per_group
-  }
-}
+impl PlayoutConfig {}
 
 // ─── Per-switch record ───────────────────────────────────────────────────────
 
@@ -104,17 +100,16 @@ impl SwitchRecord {
 
   /// Stall duration in ms (jitter-buffer model).
   ///
-  /// If the delivery gap exceeds the jitter buffer budget, the I-frame missed
-  /// its deadline and the decoder stalls for at least one full GoP (all
-  /// P-frames depend on the I-frame). Clamped up to gop_duration_ms so a
-  /// marginally-late arrival is still counted as a full GoP loss.
+  /// If the delivery gap is within the jitter budget the player absorbs it
+  /// silently. If it exceeds the budget the player froze for exactly
+  /// `gap − JB` ms waiting for the I-frame.
   pub fn stall_ms(&self, cfg: &PlayoutConfig) -> Option<u64> {
     let gap = self.delivery_gap_ms(cfg.frame_interval_ms)?;
     let past_budget = gap - cfg.jitter_buffer_ms as i128;
     if past_budget <= 0 {
       Some(0)
     } else {
-      Some(past_budget.max(cfg.gop_duration_ms() as i128) as u64)
+      Some(past_budget as u64)
     }
   }
 
