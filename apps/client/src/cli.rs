@@ -62,14 +62,6 @@ impl From<CliSwitchMethod> for SwitchMethod {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum CliPlayoutMode {
-  /// Real-time streaming: jitter buffer model; late I-frames cause GoP-length freezes
-  Realtime,
-  /// Video-on-demand: playout buffer model; buffer absorbs gaps before stalling
-  Vod,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Command {
   /// Publish objects to a track
   Publish,
@@ -179,13 +171,14 @@ pub struct Cli {
   pub extra_track: Option<String>,
 
   // ── publish-multi args ────────────────────────────────────────────────────
-  /// Comma-separated track specs: "name:avg_bytes" or "name:avg_bytes:p_ratio".
-  /// avg_bytes — average payload per object (controls bitrate).
-  /// p_ratio   — P-frame size as a fraction of I-frame size; default 0.25
-  ///             (I-frame is 4× a P-frame).  Use 1.0 for flat objects.
+  /// Comma-separated track specs: "name:avg_bytes[:p_ratio[:delay_ms]]".
+  /// avg_bytes  — average payload per object (controls bitrate).
+  /// p_ratio    — P-frame size as fraction of I-frame; default 0.25.
+  /// delay_ms   — ms to delay before this track starts publishing; default 0.
+  ///              Use to create a controlled intra-GOP phase offset between tracks.
   /// Track numbering: lower number = lower bitrate (track 1 is lowest quality).
   ///   1:2500,2:5000,3:12500,4:20000
-  /// Example: --tracks "2:5000:0.25,3:12500:0.25"
+  /// Example with offsets: --tracks "3:12500:0.25:0,4:20000:0.25:500"
   #[arg(long, default_value = "1:2500,2:5000,3:12500,4:20000")]
   pub tracks: String,
 
@@ -226,22 +219,8 @@ pub struct Cli {
   #[arg(long)]
   pub output_json: Option<String>,
 
-  /// Playout model: realtime (jitter buffer) or vod (playout buffer)
-  #[arg(long, value_enum, default_value = "realtime")]
-  pub mode: CliPlayoutMode,
-
-  /// Jitter buffer target in ms (realtime mode only). Frames arriving more than
-  /// this many ms past their expected playout time are dropped.
+  /// Jitter buffer target in ms. Frames arriving more than this many ms past
+  /// their expected playout time are dropped, causing a stall of at least one GoP.
   #[arg(long, default_value_t = 0)]
   pub jitter_buffer_ms: u64,
-
-  /// Playout buffer size in GoPs (vod mode only). The buffer absorbs delivery
-  /// gaps up to playout_buffer_groups * gop_duration_ms before stalling.
-  #[arg(long, default_value_t = 1)]
-  pub playout_buffer_groups: u64,
-
-  /// Playout buffer refill ratio (vod mode only). Stalled playback resumes when
-  /// the buffer refills to this fraction of its target size (0.0 = resume immediately).
-  #[arg(long, default_value_t = 0.0)]
-  pub buffer_refill_ratio: f64,
 }

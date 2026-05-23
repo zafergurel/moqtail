@@ -17,30 +17,16 @@ use tracing::info;
 
 // ─── Playout model ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
-pub enum PlayoutMode {
-  Realtime,
-  Vod,
-}
-
 #[derive(Debug, Clone)]
 pub struct PlayoutConfig {
-  pub mode: PlayoutMode,
   pub frame_interval_ms: u64,
   pub objects_per_group: u64,
-  // realtime
   pub jitter_buffer_ms: u64,
-  // vod
-  pub playout_buffer_groups: u64,
-  pub buffer_refill_ratio: f64,
 }
 
 impl PlayoutConfig {
   pub fn gop_duration_ms(&self) -> u64 {
     self.frame_interval_ms * self.objects_per_group
-  }
-  pub fn playout_buffer_ms(&self) -> u64 {
-    self.playout_buffer_groups * self.gop_duration_ms()
   }
 }
 
@@ -116,35 +102,19 @@ impl SwitchRecord {
     Some(raw - frame_interval_ms as i128)
   }
 
-  /// Realtime metric: freeze duration in ms.
+  /// Stall duration in ms (jitter-buffer model).
   ///
-  /// I-frame missed jitter deadline. Per GoP impairment model: a dropped
-  /// I-frame freezes the decoder for at least one full GoP (all P-frames
-  /// depend on the I-frame). Clamped up to gop_duration_ms so that even a
-  /// marginally-late arrival is counted as a full GoP loss.
-  pub fn freeze_ms(&self, cfg: &PlayoutConfig) -> Option<u64> {
+  /// If the delivery gap exceeds the jitter buffer budget, the I-frame missed
+  /// its deadline and the decoder stalls for at least one full GoP (all
+  /// P-frames depend on the I-frame). Clamped up to gop_duration_ms so a
+  /// marginally-late arrival is still counted as a full GoP loss.
+  pub fn stall_ms(&self, cfg: &PlayoutConfig) -> Option<u64> {
     let gap = self.delivery_gap_ms(cfg.frame_interval_ms)?;
     let past_budget = gap - cfg.jitter_buffer_ms as i128;
     if past_budget <= 0 {
       Some(0)
     } else {
       Some(past_budget.max(cfg.gop_duration_ms() as i128) as u64)
-    }
-  }
-
-  /// VoD metric: stall duration in ms.
-  ///
-  /// Playout buffer absorbs the first `buffer_ms*(1-refill_ratio)` ms of gap.
-  /// Stall starts when the buffer empties; playback resumes once the buffer
-  /// refills to refill_ratio * buffer_ms.
-  pub fn stall_vod_ms(&self, cfg: &PlayoutConfig) -> Option<u64> {
-    let gap = self.delivery_gap_ms(cfg.frame_interval_ms)?;
-    let gap = gap.max(0) as u64;
-    if gap == 0 {
-      Some(0)
-    } else {
-      let absorbed = (cfg.playout_buffer_ms() as f64 * (1.0 - cfg.buffer_refill_ratio)) as u64;
-      Some(gap.saturating_sub(absorbed))
     }
   }
 
@@ -198,14 +168,6 @@ impl SwitchRecord {
   }
 
   pub fn to_json(&self, cfg: &PlayoutConfig) -> String {
-    let freeze_str = match cfg.mode {
-      PlayoutMode::Realtime => Self::opt_u64(self.freeze_ms(cfg)),
-      PlayoutMode::Vod => "null".to_string(),
-    };
-    let stall_str = match cfg.mode {
-      PlayoutMode::Vod => Self::opt_u64(self.stall_vod_ms(cfg)),
-      PlayoutMode::Realtime => "null".to_string(),
-    };
     format!(
       concat!(
         "{{\n",
@@ -213,7 +175,6 @@ impl SwitchRecord {
         "    \"track_to\": \"{}\",\n",
         "    \"switch_latency_ms\": {},\n",
         "    \"delivery_gap_ms\": {},\n",
-        "    \"freeze_ms\": {},\n",
         "    \"stall_ms\": {},\n",
         "    \"group_boundary_aligned\": {},\n",
         "    \"control_messages\": {},\n",
@@ -232,8 +193,7 @@ impl SwitchRecord {
       self.track_to,
       Self::opt_i128(self.switch_latency_ms()),
       Self::opt_i128(self.delivery_gap_ms(cfg.frame_interval_ms)),
-      freeze_str,
-      stall_str,
+      Self::opt_u64(self.stall_ms(cfg)),
       Self::opt_bool(self.group_boundary_aligned),
       self.control_messages,
       self.redundant_bytes,
@@ -296,41 +256,23 @@ impl SwitchStats {
       None => "null".to_string(),
     };
 
-    let mode_str = match self.playout.mode {
-      PlayoutMode::Realtime => "realtime",
-      PlayoutMode::Vod => "vod",
-    };
-
-    let playout_extra = match self.playout.mode {
-      PlayoutMode::Realtime => format!(
-        "  \"jitter_buffer_ms\": {},\n",
-        self.playout.jitter_buffer_ms
-      ),
-      PlayoutMode::Vod => format!(
-        "  \"playout_buffer_groups\": {},\n  \"buffer_refill_ratio\": {},\n",
-        self.playout.playout_buffer_groups, self.playout.buffer_refill_ratio
-      ),
-    };
-
     format!(
       concat!(
         "{{\n",
         "  \"method\": \"{}\",\n",
         "  \"bandwidth_cap_bps\": {},\n",
-        "  \"mode\": \"{}\",\n",
         "  \"frame_interval_ms\": {},\n",
         "  \"objects_per_group\": {},\n",
-        "{}",
+        "  \"jitter_buffer_ms\": {},\n",
         "  \"aetr\": {},\n",
         "  \"switches\": {}\n",
         "}}"
       ),
       self.method,
       self.bandwidth_cap_bps,
-      mode_str,
       self.playout.frame_interval_ms,
       self.playout.objects_per_group,
-      playout_extra,
+      self.playout.jitter_buffer_ms,
       aetr_str,
       switches_str,
     )

@@ -24,6 +24,8 @@
 #   --interval <ms>        Inter-object interval in ms (default: 40, i.e. 25fps)
 #   --group-count <n>      Total groups to publish (default: 1000 ≈ ~17 minutes)
 #   --relay-port <port>    Relay QUIC port (default: 4433)
+#   --scenario <name>      Scenario label used in output filenames (default: "local")
+#   --restart-pub          Restart publisher only (relay stays running); implies --skip-start for relay
 #   --output <dir>         Results directory (default: results/local_YYYYMMDD_HHMMSS)
 #   --help
 #
@@ -77,8 +79,10 @@ PUB_PID_FILE="/tmp/moqtail-pub-local.pid"
 
 BUILD=false
 SKIP_START=false
+RESTART_PUB=false
 SELECTED_METHODS=()
 OUTPUT_DIR=""
+SCENARIO="local"
 
 usage() {
   grep '^#' "$0" | sed 's/^# \{0,1\}//' | tail -n +2
@@ -99,6 +103,8 @@ while [[ $# -gt 0 ]]; do
     --interval)            PUB_INTERVAL_MS="$2";                shift 2 ;;
     --group-count)         PUB_GROUP_COUNT="$2";                shift 2 ;;
     --relay-port)          RELAY_PORT="$2"; RELAY_URL="https://127.0.0.1:${RELAY_PORT}"; shift 2 ;;
+    --scenario)            SCENARIO="$2";                       shift 2 ;;
+    --restart-pub)         RESTART_PUB=true; SKIP_START=true;  shift ;;
     --output)              OUTPUT_DIR="$2";                     shift 2 ;;
     --help|-h)             usage ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -192,8 +198,7 @@ stop_publisher() {
 
 run_one() {
   local method=$1 rep=$2
-  local label="${method}_0bps"
-  local outfile="$OUTPUT_DIR/${label}_rep${rep}.json"
+  local outfile="$OUTPUT_DIR/${method}_${SCENARIO}_rep${rep}.json"
 
   log "--- $method rep $rep ---"
 
@@ -228,7 +233,9 @@ trap cleanup EXIT INT TERM
 main() {
   log "=== local_test.sh ==="
   log "Methods:        ${METHODS[*]}"
+  log "Scenario:       $SCENARIO"
   log "Track sequence: $TRACK_SEQUENCE"
+  log "Tracks:         $PUB_TRACKS"
   log "Switch after:   ${SWITCH_AFTER}s"
   log "Jitter buffer:  ${JITTER_BUFFER_MS}ms"
   log "Reps:           $REPS"
@@ -244,6 +251,8 @@ main() {
 
   if ! "$SKIP_START"; then
     start_relay
+    start_publisher
+  elif "$RESTART_PUB"; then
     start_publisher
   fi
 

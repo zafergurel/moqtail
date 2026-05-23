@@ -50,6 +50,10 @@ pub struct TrackSpec {
   /// 1.0 means all objects are the same size (flat, no GOP structure).
   /// The average bitrate is preserved regardless of this value.
   pub p_ratio: f64,
+  /// Milliseconds to delay before this track starts publishing its first object.
+  /// All PUBLISH announcements are sent immediately; only data output is delayed.
+  /// Used to create a controlled intra-GOP phase offset between tracks.
+  pub start_delay_ms: u64,
 }
 
 impl TrackSpec {
@@ -58,6 +62,7 @@ impl TrackSpec {
       name: name.into(),
       payload_size,
       p_ratio: 0.25,
+      start_delay_ms: 0,
     }
   }
 
@@ -550,6 +555,7 @@ pub async fn run_multi(moq: MoqConnection, config: PublishMultiConfig) -> Result
     let interval_ms = config.interval_ms;
     let track_name = spec.name.clone();
 
+    let effective_start = start + Duration::from_millis(spec.start_delay_ms);
     tasks.push(tokio::spawn(async move {
       send_multi_track(
         &conn,
@@ -560,7 +566,7 @@ pub async fn run_multi(moq: MoqConnection, config: PublishMultiConfig) -> Result
         objects_per_group,
         spec,
         priority,
-        start,
+        effective_start,
       )
       .await
     }));

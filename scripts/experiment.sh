@@ -2,8 +2,8 @@
 # experiment.sh — Track switching experiment (remote relay, local publish-multi publisher)
 #
 # Runs on the subscriber machine. Starts the relay on a remote SSH host and a
-# local publish-multi publisher (artificial bytes, same as local_test.sh), then
-# iterates over a method × bandwidth matrix, saving one JSON file per run.
+# local publish-multi publisher (artificial bytes), then iterates over a
+# method × scenario matrix, saving one JSON file per run.
 #
 # Configuration is read from scripts/.env (gitignored). Copy
 # scripts/.env.example to scripts/.env and fill in your values.
@@ -13,34 +13,49 @@
 #
 # Options:
 #   --build              Build release binaries on relay and client locally
-#   --skip-start         Assume relay + publisher are already running
+#   --skip-start         Assume relay is already running (publisher restarted per group)
 #   --method  <name>     Only run this method (repeatable; default: all three)
-#   --bandwidth <bps>    Only run at this bandwidth; 0 = no limit (repeatable; default: all)
-#   --track-sequence <s> Comma-separated track sequence, e.g. "2,3,4,3,2"
-#                        Default: "2,3,4,3,2" (up-up-down-down across 4 bitrates)
-#   --switch-after <s>   Seconds per track before triggering next switch (default: 15)
-#   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 40)
 #   --reps <n>           Repetitions per condition (default: 3)
-#   --tracks <spec>      Track specs for publish-multi, e.g. "1:2500,2:5000,3:12500,4:20000"
+#   --switch-after <s>   Seconds per track before triggering the switch (default: 5)
+#   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 40)
 #   --objects-per-group <n>  Objects per group (default: 25, i.e. 1s GOP at 25fps)
 #   --interval <ms>      Inter-object interval in ms (default: 40, i.e. 25fps)
-#   --group-count <n>    Total groups to publish (default: 1000 ≈ ~17 minutes)
+#   --group-count <n>    Total groups to publish (default: 5000 ≈ ~83 minutes)
 #   --output <dir>       Results directory (default: results/YYYYMMDD_HHMMSS)
 #   --help
 #
-# Examples:
-#   # Baseline only (no bandwidth shaping), 3 reps per method
-#   bash scripts/experiment.sh --bandwidth 0
+# Scenario matrix (16 scenarios × 3 methods × 3 reps = 144 runs):
 #
-#   # Full matrix: all bandwidths × all methods × 3 reps
+#   Relative-position group (unlimited BW, track A = 3 / 2.5 Mbps, track B = 4 / 4 Mbps):
+#     rp_a2b_a500   A→B  A ahead by 500 ms  (B starts 500 ms late)
+#     rp_a2b_a1000  A→B  A ahead by 1 s
+#     rp_a2b_a2000  A→B  A ahead by 2 s
+#     rp_a2b_b500   A→B  B ahead by 500 ms  (A starts 500 ms late)
+#     rp_a2b_b1000  A→B  B ahead by 1 s
+#     rp_a2b_b2000  A→B  B ahead by 2 s
+#     rp_b2a_a500   B→A  A ahead by 500 ms
+#     rp_b2a_a1000  B→A  A ahead by 1 s
+#     rp_b2a_a2000  B→A  A ahead by 2 s
+#     rp_b2a_b500   B→A  B ahead by 500 ms
+#     rp_b2a_b1000  B→A  B ahead by 1 s
+#     rp_b2a_b2000  B→A  B ahead by 2 s
+#
+#   Bandwidth-condition group (both tracks in sync, no offset):
+#     bw_a2b_4500k  A→B  4.5 Mbps  (just above track B)
+#     bw_a2b_7000k  A→B  7.0 Mbps  (comfortable)
+#     bw_b2a_3000k  B→A  3.0 Mbps  (B=4 Mbps exceeds link; A=2.5 Mbps fits)
+#     bw_b2a_7000k  B→A  7.0 Mbps  (comfortable)
+#
+# Examples:
 #   bash scripts/experiment.sh --build
+#   bash scripts/experiment.sh --method switch-message --reps 1
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ── Load environment ───────────────────────────────────────────────────────────
+# ── Load environment ────────────────────────────────────────────────────────────
 
 ENV_FILE="$SCRIPT_DIR/.env"
 if [ ! -f "$ENV_FILE" ]; then
@@ -58,52 +73,70 @@ RELAY_HOST_IP="${RELAY_SSH##*@}"
 RELAY_URL="https://${RELAY_HOST_IP}:${RELAY_PORT}"
 NAMESPACE="${NAMESPACE:-moqtail-experiment}"
 
-# Optional: run publisher on a remote host instead of locally.
-# If PUB_SSH is unset, publisher runs on this machine.
 PUB_SSH="${PUB_SSH:-}"
 PUB_PROJECT="${PUB_PROJECT:-$ROOT_DIR}"
-# If publisher is on the relay host, it connects via loopback.
 if [ -n "$PUB_SSH" ] && [ "$PUB_SSH" = "$RELAY_SSH" ]; then
   PUB_RELAY_URL="https://127.0.0.1:${RELAY_PORT}"
 else
   PUB_RELAY_URL="$RELAY_URL"
 fi
 
-# ── Experiment defaults ────────────────────────────────────────────────────────
+# ── Experiment defaults ─────────────────────────────────────────────────────────
 
 ALL_METHODS=("switch-message" "sub-update-forward" "joining-fetch")
-# Bandwidth ladder (bps). 0 = unlimited baseline (no tc rule applied).
-ALL_BANDWIDTHS=(0 5000000 3000000 2000000 1500000 1000000)
-# Track sequence: lower index = lower bitrate
-#   track 1=500kbps, 2=1Mbps, 3=2.5Mbps, 4=4Mbps
-TRACK_SEQUENCE="2,3,4,3,2"
-SWITCH_AFTER=15
+SWITCH_AFTER=5
 JITTER_BUFFER_MS=40
 REPS=3
 TC_MARK=1
 
-# publish-multi defaults — video-only bitrate ladder (lower track = lower bitrate):
-#   track 1: 500 kbps (640×360)   → 2500 B/obj at 25fps
-#   track 2: 1 Mbps   (854×480)   → 5000 B/obj
-#   track 3: 2.5 Mbps (1280×720)  → 12500 B/obj
-#   track 4: 4 Mbps   (1920×1080) → 20000 B/obj
-PUB_TRACKS="1:2500,2:5000,3:12500,4:20000"
+# Track A = track 3 (2.5 Mbps), Track B = track 4 (4 Mbps)
+# payload_size B/obj at 25fps: 2.5 Mbps = 12500 B/obj, 4 Mbps = 20000 B/obj
+TRACK_A="3"
+TRACK_B="4"
+TRACK_A_PAYLOAD=12500
+TRACK_B_PAYLOAD=20000
+TRACK_P_RATIO="0.25"
+
 PUB_OBJECTS_PER_GROUP=25
 PUB_INTERVAL_MS=40
 PUB_GROUP_COUNT=5000
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
+# ── Publisher config groups ─────────────────────────────────────────────────────
+# Each entry: "pub_label delay_a_ms delay_b_ms scenario1 scenario2 ..."
+# Scenario format: "label|sequence|bw_bps"
+#   label    — used in output filename: {method}_{label}_rep{n}.json
+#   sequence — track sequence for --track-sequence (e.g. "3,4" = A→B)
+#   bw_bps   — tc bandwidth cap; 0 = no limit
+
+declare -a PUB_GROUPS=(
+  # ── Synchronized (no offset): bandwidth-condition scenarios ──────────────────
+  "sync|0|0|bw_a2b_4500k:3,4:4500000|bw_a2b_7000k:3,4:7000000|bw_b2a_3000k:4,3:3000000|bw_b2a_7000k:4,3:7000000"
+  # ── A ahead (B starts late): B's delay = offset ──────────────────────────────
+  "a_ahead_500|0|500|rp_a2b_a500:3,4:0|rp_b2a_a500:4,3:0"
+  "a_ahead_1000|0|1000|rp_a2b_a1000:3,4:0|rp_b2a_a1000:4,3:0"
+  "a_ahead_2000|0|2000|rp_a2b_a2000:3,4:0|rp_b2a_a2000:4,3:0"
+  # ── B ahead (A starts late): A's delay = offset ──────────────────────────────
+  "b_ahead_500|500|0|rp_a2b_b500:3,4:0|rp_b2a_b500:4,3:0"
+  "b_ahead_1000|1000|0|rp_a2b_b1000:3,4:0|rp_b2a_b1000:4,3:0"
+  "b_ahead_2000|2000|0|rp_a2b_b2000:3,4:0|rp_b2a_b2000:4,3:0"
+)
+
+# Derived total per selected methods
+TOTAL_SCENARIOS=16
+
+# ── Paths ───────────────────────────────────────────────────────────────────────
 
 CLIENT_BIN="$ROOT_DIR/target/release/client"
 PUB_LOG="/tmp/moqtail-pub.log"
 PUB_PID_FILE="/tmp/moqtail-pub.pid"
+# PUB_TRACKS is set dynamically per publisher group
+PUB_TRACKS=""
 
-# ── Flag overrides ─────────────────────────────────────────────────────────────
+# ── Flag overrides ──────────────────────────────────────────────────────────────
 
 BUILD=false
 SKIP_START=false
 SELECTED_METHODS=()
-SELECTED_BANDWIDTHS=()
 OUTPUT_DIR=""
 
 usage() {
@@ -116,12 +149,9 @@ while [[ $# -gt 0 ]]; do
     --build)             BUILD=true;                          shift ;;
     --skip-start)        SKIP_START=true;                     shift ;;
     --method)            SELECTED_METHODS+=("$2");             shift 2 ;;
-    --bandwidth)         SELECTED_BANDWIDTHS+=("$2");          shift 2 ;;
-    --track-sequence)    TRACK_SEQUENCE="$2";                  shift 2 ;;
+    --reps)              REPS="$2";                           shift 2 ;;
     --switch-after)      SWITCH_AFTER="$2";                   shift 2 ;;
     --jitter-buffer-ms)  JITTER_BUFFER_MS="$2";               shift 2 ;;
-    --reps)              REPS="$2";                           shift 2 ;;
-    --tracks)            PUB_TRACKS="$2";                     shift 2 ;;
     --objects-per-group) PUB_OBJECTS_PER_GROUP="$2";          shift 2 ;;
     --interval)          PUB_INTERVAL_MS="$2";                shift 2 ;;
     --group-count)       PUB_GROUP_COUNT="$2";                shift 2 ;;
@@ -131,16 +161,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[ ${#SELECTED_METHODS[@]}    -eq 0 ] && METHODS=("${ALL_METHODS[@]}")    || METHODS=("${SELECTED_METHODS[@]}")
-[ ${#SELECTED_BANDWIDTHS[@]} -eq 0 ] && BANDWIDTHS=("${ALL_BANDWIDTHS[@]}") || BANDWIDTHS=("${SELECTED_BANDWIDTHS[@]}")
+[ ${#SELECTED_METHODS[@]} -eq 0 ] && METHODS=("${ALL_METHODS[@]}") || METHODS=("${SELECTED_METHODS[@]}")
 [ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$ROOT_DIR/results/$(date +%Y%m%d_%H%M%S)"
 
-# ── Resume / fresh prompt ──────────────────────────────────────────────────────
-# If the output directory already has results, ask whether to resume or start fresh.
+# ── Resume / fresh prompt ───────────────────────────────────────────────────────
+
+total=$(( TOTAL_SCENARIOS * ${#METHODS[@]} * REPS ))
 
 if [ -d "$OUTPUT_DIR" ]; then
   existing=$(find "$OUTPUT_DIR" -maxdepth 1 -name '*.json' | wc -l)
-  total=$(( ${#METHODS[@]} * ${#BANDWIDTHS[@]} * REPS ))
   if [ "$existing" -gt 0 ] && [ "$existing" -lt "$total" ]; then
     echo ""
     echo "  Incomplete run: $existing / $total results in $OUTPUT_DIR"
@@ -163,7 +192,7 @@ if [ -d "$OUTPUT_DIR" ]; then
   fi
 fi
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────────
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -190,7 +219,7 @@ detect_subscriber_ip() {
   fi
 }
 
-# ── Build ──────────────────────────────────────────────────────────────────────
+# ── Build ───────────────────────────────────────────────────────────────────────
 
 do_build() {
   if [ -n "$PUB_SSH" ] && [ "$PUB_SSH" = "$RELAY_SSH" ]; then
@@ -209,7 +238,7 @@ do_build() {
   cargo build --release --bin client --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
 }
 
-# ── Relay ──────────────────────────────────────────────────────────────────────
+# ── Relay ───────────────────────────────────────────────────────────────────────
 
 start_relay() {
   log "Stopping any lingering relay on relay host..."
@@ -237,7 +266,7 @@ stop_relay() {
     true"
 }
 
-# ── Publisher ──────────────────────────────────────────────────────────────────
+# ── Publisher ───────────────────────────────────────────────────────────────────
 
 start_publisher() {
   local pub_bin="$PUB_PROJECT/target/release/client"
@@ -291,9 +320,8 @@ PYEOF"
     log "Publisher PID $(cat "$PUB_PID_FILE")"
   fi
 
-  local warmup=$(( SWITCH_AFTER > 5 ? 5 : SWITCH_AFTER ))
-  log "Waiting ${warmup}s for initial cache warm-up..."
-  sleep "$warmup"
+  log "Waiting ${SWITCH_AFTER}s for initial cache warm-up..."
+  sleep "$SWITCH_AFTER"
 }
 
 stop_publisher() {
@@ -308,7 +336,7 @@ stop_publisher() {
   fi
 }
 
-# ── tc bandwidth shaping (on relay host, toward subscriber) ────────────────────
+# ── tc bandwidth shaping (on relay host, toward subscriber) ─────────────────────
 
 apply_tc() {
   local bw=$1 subscriber_ip=$2
@@ -327,10 +355,9 @@ clear_tc() {
   sleep 1
 }
 
-# ── Health check + auto-restart ────────────────────────────────────────────────
+# ── Health check + auto-restart ─────────────────────────────────────────────────
 
 ensure_healthy() {
-  # Check relay: try to reach the UDP port on the relay host.
   local relay_up=false
   if ssh -o ConnectTimeout=5 "$RELAY_SSH" \
       "ss -ulnp 2>/dev/null | grep -q ':$RELAY_PORT'" 2>/dev/null; then
@@ -345,7 +372,6 @@ ensure_healthy() {
     return
   fi
 
-  # Check publisher process.
   local pub_alive=false
   if [ -n "$PUB_SSH" ]; then
     pub_ssh "[ -f $PUB_PID_FILE ] && kill -0 \$(cat $PUB_PID_FILE) 2>/dev/null" 2>/dev/null && pub_alive=true || true
@@ -358,7 +384,7 @@ ensure_healthy() {
   fi
 }
 
-# ── Single experiment run ──────────────────────────────────────────────────────
+# ── Single experiment run ───────────────────────────────────────────────────────
 
 print_result() {
   local outfile=$1
@@ -377,8 +403,8 @@ PYEOF
 }
 
 run_one() {
-  local method=$1 bw=$2 rep=$3 subscriber_ip=$4
-  local label="${method}_${bw}bps"
+  local method=$1 scenario=$2 sequence=$3 bw=$4 rep=$5 subscriber_ip=$6
+  local label="${method}_${scenario}"
   local outfile="$OUTPUT_DIR/${label}_rep${rep}.json"
 
   if [ -s "$outfile" ]; then
@@ -397,11 +423,11 @@ run_one() {
     --namespace "$NAMESPACE" \
     --command switch-test \
     --no-cert-validation \
-    --track-sequence "$TRACK_SEQUENCE" \
+    --track-sequence "$sequence" \
     --method "$method" \
     --switch-after "$SWITCH_AFTER" \
     --jitter-buffer-ms "$JITTER_BUFFER_MS" \
-    --bandwidth-cap-bps 0 \
+    --bandwidth-cap-bps "$bw" \
     --output-json "$outfile"; then
     log "Saved: $outfile"
     print_result "$outfile"
@@ -416,25 +442,56 @@ run_one() {
   sleep 2
 }
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Publisher group runner ──────────────────────────────────────────────────────
+# Args: pub_label delay_a_ms delay_b_ms scenario_spec...
+# scenario_spec format: "label:sequence:bw_bps"
+
+run_pub_group() {
+  local pub_label=$1
+  local delay_a=$2
+  local delay_b=$3
+  shift 3
+
+  log ""
+  log "=== Publisher group: $pub_label (delay_A=${delay_a}ms, delay_B=${delay_b}ms) ==="
+
+  PUB_TRACKS="${TRACK_A}:${TRACK_A_PAYLOAD}:${TRACK_P_RATIO}:${delay_a},${TRACK_B}:${TRACK_B_PAYLOAD}:${TRACK_P_RATIO}:${delay_b}"
+
+  stop_publisher
+  start_publisher
+
+  local scenario_spec scenario_label sequence bw
+  for scenario_spec in "$@"; do
+    IFS=':' read -r scenario_label sequence bw <<< "$scenario_spec"
+    for method in "${METHODS[@]}"; do
+      for rep in $(seq 1 "$REPS"); do
+        ensure_healthy
+        run_one "$method" "$scenario_label" "$sequence" "$bw" "$rep" "$subscriber_ip"
+        (( done_count++ )) || true
+        log "Progress: $done_count / $total"
+      done
+    done
+  done
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────────
 
 main() {
-  local subscriber_ip
   subscriber_ip=$(detect_subscriber_ip)
+  done_count=0
 
   log "=== experiment.sh ==="
-  log "Relay:          $RELAY_SSH  ($RELAY_HOST_IP:$RELAY_PORT)"
-  log "Publisher:      ${PUB_SSH:-local} (publish-multi → $PUB_RELAY_URL)"
-  log "Methods:        ${METHODS[*]}"
-  log "Bandwidths:     ${BANDWIDTHS[*]} bps"
-  log "Track sequence: $TRACK_SEQUENCE"
-  log "Switch after:   ${SWITCH_AFTER}s"
-  log "Jitter buffer:  ${JITTER_BUFFER_MS}ms"
-  log "Reps:           $REPS"
-  log "Subscriber IP:  $subscriber_ip"
+  log "Relay:         $RELAY_SSH  ($RELAY_HOST_IP:$RELAY_PORT)"
+  log "Publisher:     ${PUB_SSH:-local}"
+  log "Methods:       ${METHODS[*]}"
+  log "Switch after:  ${SWITCH_AFTER}s"
+  log "Jitter buffer: ${JITTER_BUFFER_MS}ms"
+  log "Reps:          $REPS"
+  log "Subscriber IP: $subscriber_ip"
+  log "Total runs:    $total"
 
   mkdir -p "$OUTPUT_DIR"
-  log "Results:        $OUTPUT_DIR"
+  log "Results:       $OUTPUT_DIR"
 
   if "$BUILD"; then
     do_build
@@ -442,26 +499,21 @@ main() {
 
   if ! "$SKIP_START"; then
     start_relay
-    start_publisher
   fi
 
   trap 'log "Interrupted — cleaning up..."; clear_tc "$subscriber_ip" 2>/dev/null; stop_publisher; stop_relay' EXIT INT TERM
 
-  local total=$(( ${#METHODS[@]} * ${#BANDWIDTHS[@]} * REPS ))
-  local done_count=0
-  log "Running $total experiment runs..."
-
-  for method in "${METHODS[@]}"; do
-    for bw in "${BANDWIDTHS[@]}"; do
-      for rep in $(seq 1 "$REPS"); do
-        ensure_healthy
-        run_one "$method" "$bw" "$rep" "$subscriber_ip"
-        (( done_count++ )) || true
-        log "Progress: $done_count / $total"
-      done
-    done
+  for group_entry in "${PUB_GROUPS[@]}"; do
+    IFS='|' read -ra parts <<< "$group_entry"
+    local_pub_label="${parts[0]}"
+    local_delay_a="${parts[1]}"
+    local_delay_b="${parts[2]}"
+    # Remaining parts are scenario specs
+    local_scenarios=("${parts[@]:3}")
+    run_pub_group "$local_pub_label" "$local_delay_a" "$local_delay_b" "${local_scenarios[@]}"
   done
 
+  log ""
   log "All done. Results in $OUTPUT_DIR"
 
   trap - EXIT INT TERM

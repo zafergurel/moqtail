@@ -119,7 +119,7 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     Command::SwitchTest => {
-      use crate::stats::{PlayoutConfig, PlayoutMode};
+      use crate::stats::PlayoutConfig;
 
       // Parse optional --track-sequence "2,3,4" into a Vec<String>.
       let track_sequence: Vec<String> = if cli.track_sequence.is_empty() {
@@ -134,15 +134,9 @@ async fn main() -> Result<(), anyhow::Error> {
       };
 
       let playout = PlayoutConfig {
-        mode: match cli.mode {
-          crate::cli::CliPlayoutMode::Realtime => PlayoutMode::Realtime,
-          crate::cli::CliPlayoutMode::Vod => PlayoutMode::Vod,
-        },
         frame_interval_ms: cli.interval,
         objects_per_group: cli.objects_per_group,
         jitter_buffer_ms: cli.jitter_buffer_ms,
-        playout_buffer_groups: cli.playout_buffer_groups,
-        buffer_refill_ratio: cli.buffer_refill_ratio,
       };
 
       let config = switcher::SwitchTestConfig {
@@ -170,7 +164,7 @@ fn parse_tracks(s: &str) -> Result<Vec<TrackSpec>, anyhow::Error> {
   s.split(',')
     .map(|entry| {
       let entry = entry.trim();
-      let parts: Vec<&str> = entry.splitn(3, ':').collect();
+      let parts: Vec<&str> = entry.splitn(4, ':').collect();
       match parts.as_slice() {
         [name, bytes_str] => {
           let bytes: usize = bytes_str
@@ -188,14 +182,25 @@ fn parse_tracks(s: &str) -> Result<Vec<TrackSpec>, anyhow::Error> {
           if p_ratio <= 0.0 || p_ratio > 1.0 {
             anyhow::bail!("p_ratio must be in (0, 1], got {} in '{}'", p_ratio, entry);
           }
-          Ok(TrackSpec {
-            name: name.trim().to_string(),
-            payload_size: bytes,
-            p_ratio,
-          })
+          Ok(TrackSpec { name: name.trim().to_string(), payload_size: bytes, p_ratio, start_delay_ms: 0 })
+        }
+        [name, bytes_str, ratio_str, delay_str] => {
+          let bytes: usize = bytes_str
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid payload size '{}' in '{}'", bytes_str, entry))?;
+          let p_ratio: f64 = ratio_str
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid p_ratio '{}' in '{}'", ratio_str, entry))?;
+          if p_ratio <= 0.0 || p_ratio > 1.0 {
+            anyhow::bail!("p_ratio must be in (0, 1], got {} in '{}'", p_ratio, entry);
+          }
+          let start_delay_ms: u64 = delay_str
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid start_delay_ms '{}' in '{}'", delay_str, entry))?;
+          Ok(TrackSpec { name: name.trim().to_string(), payload_size: bytes, p_ratio, start_delay_ms })
         }
         _ => anyhow::bail!(
-          "invalid track spec '{}'; expected 'name:bytes' or 'name:bytes:p_ratio'",
+          "invalid track spec '{}'; expected 'name:bytes', 'name:bytes:p_ratio', or 'name:bytes:p_ratio:delay_ms'",
           entry
         ),
       }
