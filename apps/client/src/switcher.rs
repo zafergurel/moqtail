@@ -440,6 +440,7 @@ async fn run_switch_message_phase(
   let post_deadline =
     tokio::time::Instant::now() + Duration::from_secs(config.switch_after_secs.max(10));
   let mut b_alias: Option<u64> = None;
+  let mut first_b_seen = false;
 
   loop {
     tokio::select! {
@@ -451,13 +452,22 @@ async fn run_switch_message_phase(
             record.trailing_a_bytes += ev.payload_size as u64;
             record.a_objects_post_decision += 1;
           } else if b_alias == Some(ev.track_alias) {
-            if record.first_b_object_time.is_none() {
-              record.first_b_object_time = Some(ev.received_at);
-              record.first_b_group = Some(ev.group);
-              record.group_boundary_aligned = Some(ev.object == 0);
-              info!("First B object (switch-message): group={}, object={}", ev.group, ev.object);
+            if !first_b_seen {
+              if ev.object == 0 {
+                record.first_b_object_time = Some(ev.received_at);
+                record.first_b_group = Some(ev.group);
+                record.group_boundary_aligned = Some(true);
+                first_b_seen = true;
+                info!("First B I-frame (switch-message): group={}", ev.group);
+                record.useful_b_bytes += ev.payload_size as u64;
+              } else {
+                // Pre-boundary object from relay catch-up (shouldn't normally occur)
+                record.redundant_bytes += ev.payload_size as u64;
+                record.b_objects_pre_active += 1;
+              }
+            } else {
+              record.useful_b_bytes += ev.payload_size as u64;
             }
-            record.useful_b_bytes += ev.payload_size as u64;
           }
         }
         None => break,
