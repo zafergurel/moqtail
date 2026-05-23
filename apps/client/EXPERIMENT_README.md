@@ -329,23 +329,26 @@ Subscriber                           Relay
 
 The relay delivers B starting from B's next group boundary after the REQUEST_UPDATE. The subscriber tears down A once the first live B group boundary arrives.
 
-**Method 3 — Joining Fetch** (4 control messages)
+**Method 3 — Joining Fetch** (3–4 control messages)
 
 ```
-Subscriber                           Relay
-    │──── SUBSCRIBE B (prio=200, fwd=true) ►│
-    │◄─── SubscribeOk(B) ──────────────────│
-    │──── JOINING_FETCH(B, offset=N) ──────►│  relay fetches last N groups of B
-    │◄─── FetchOk ─────────────────────────│
-    │◄═══ fetch objects (redundant) ═══════│  (current partial group of B)
-    │◄═══ live B from next boundary ═══════│  (first object_id=0 is first decodable)
-    │──── REQUEST_UPDATE(A, fwd=false) ────►│  stop A
-    │──── REQUEST_UPDATE(B, prio=128) ─────►│  raise B to normal priority
+Subscriber                                 Relay
+    │──── SUBSCRIBE B (prio=200, fwd=true) ──►│
+    │◄─── SubscribeOk(B) + LargestObject ─────│  relay reports B's current position
+    │                                          │
+    │  [if LargestObject.object > 0]           │
+    │──── FETCH(joining_start=0, type=Relative)►│  fetch I-frame … LargestObject
+    │◄─── FetchOk ─────────────────────────────│
+    │◄═══ fetch objects (I-frame … LargestObject) ══│
+    │                                          │
+    │◄═══ live B from next group boundary ════│  (first object_id=0 is first decodable)
+    │──── REQUEST_UPDATE(A, fwd=false) ───────►│  stop A
+    │──── REQUEST_UPDATE(B, prio=128) ────────►│  raise B to normal priority
 ```
 
-The fetch fills the current partial B group (eliminating the intra-GoP gap), then live B continues from the next boundary. The fetch objects are counted as `redundant_bytes`.
+The relay injects the track's current `LargestObject` position into the SubscribeOk. If B is mid-group (`LargestObject.object > 0`), the client issues a Relative Joining Fetch with `joining_start=0`, asking the relay to deliver all objects in the current group from the I-frame through LargestObject. The live subscription picks up from LargestObject+1 onward. If B happens to be at a group boundary (`LargestObject.object == 0`), the fetch is skipped and the live subscription delivers the I-frame directly (3 control messages instead of 4). Fetch objects are counted as `redundant_bytes`.
 
-**Implementation note — fixed offset vs. TRACK_STATUS:** The standard approach would send a TRACK_STATUS message first (1 RTT) to learn B's exact current position, then decide: if B is ahead of A, issue JOINING_FETCH to fill the partial group; if B is behind A, skip the fetch and subscribe to the live edge (accepting a stall until B catches up). Our implementation uses a fixed `--joining-groups-offset` instead, which avoids the explicit TRACK_STATUS round trip but always issues the fetch regardless of B's position. The RTT cost is still captured in `switch_delay_ms` because that metric is measured wall-clock from the decision instant to the first B I-frame arrival — every network round trip (SUBSCRIBE ack, FETCH request/response) elapses within that window.
+**No TRACK_STATUS round trip needed:** The relay already knows B's position when it processes the SUBSCRIBE (it stores `largest_location` per track) and includes it in SubscribeOk. The client gets the information it needs in the same round trip as the subscription itself.
 
 ---
 
@@ -413,11 +416,11 @@ t=0ms        t=140ms                          t=682ms
 
 ### 6.4 Metrics per method (expected behavior)
 
-| Method             | delivery_gap                       | stall                          | AETR   | Notes                                                            |
-| ------------------ | ---------------------------------- | ------------------------------ | ------ | ---------------------------------------------------------------- |
-| SWITCH message     | positive (waits for next boundary) | 0 if gap ≤ JB; GoP if gap > JB | Low    | Gap = time from last A to B's first boundary                     |
-| Sub Update Forward | ≤ 0 (slight overlap)               | 0                              | Medium | Pre-subscribed B starts at its next boundary; A overlaps         |
-| Joining Fetch      | `null` (no gap by design)          | `null`                         | High   | Fetch fills the intra-GoP hole; fetch bytes counted as redundant |
+| Method             | delivery_gap                            | stall                          | AETR   | Notes                                                      |
+| ------------------ | --------------------------------------- | ------------------------------ | ------ | ---------------------------------------------------------- |
+| SWITCH message     | positive (waits for next boundary)      | 0 if gap ≤ JB; GoP if gap > JB | Low    | Gap = time from last A to B's first boundary               |
+| Sub Update Forward | ≤ 0 (slight overlap)                    | 0                              | Medium | Pre-subscribed B starts at its next boundary; A overlaps   |
+| Joining Fetch      | ≤ 0 (I-frame via fetch before A drains) | 0                              | High   | Fetch fills the partial group from relay cache; stall is 0 |
 
 ---
 
@@ -640,20 +643,20 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 
 ### Metrics reference
 
-| Field                     | Description                                                                                                                                                                         |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `switch_delay_ms`         | `t_first_b − t_decision` (ms). Negative = B pre-buffered, arrived before decision.                                                                                                  |
-| `delivery_gap_ms`         | `t_first_b − (t_last_a + 40ms)`. Signed playout gap. Negative = B arrived before A's slot ended.                                                                                    |
-| `stall_ms`                | `0` if gap ≤ JB; `gap − JB` if gap > JB. Measured freeze time: how long the player waited for the I-frame beyond the jitter budget. `null` for Joining Fetch (gap filled by fetch). |
-| `group_boundary_aligned`  | First B object had `object_id == 0` (I-frame).                                                                                                                                      |
-| `control_messages`        | Switch-specific control messages sent.                                                                                                                                              |
-| `redundant_bytes`         | Joining-Fetch warm-up bytes + pre-boundary B objects.                                                                                                                               |
-| `trailing_a_bytes`        | A bytes received after switch decision.                                                                                                                                             |
-| `useful_b_bytes`          | B bytes from first live group boundary onward.                                                                                                                                      |
-| `excess_bytes`            | `redundant_bytes + trailing_a_bytes`.                                                                                                                                               |
-| `total_bytes`             | `useful_b_bytes + excess_bytes`.                                                                                                                                                    |
-| `aetr`                    | `excess_bytes / total_bytes` per switch. Top-level `aetr` is mean across all switches.                                                                                              |
-| `a_objects_post_decision` | A objects that arrived after the decision.                                                                                                                                          |
+| Field                     | Description                                                                                                                         |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `switch_delay_ms`         | `t_first_b − t_decision` (ms). Negative = B pre-buffered, arrived before decision.                                                  |
+| `delivery_gap_ms`         | `t_first_b − (t_last_a + 40ms)`. Signed playout gap. Negative = B arrived before A's slot ended.                                    |
+| `stall_ms`                | `0` if gap ≤ JB; `gap − JB` if gap > JB. Measured freeze time: how long the player waited for the I-frame beyond the jitter budget. |
+| `group_boundary_aligned`  | First B object had `object_id == 0` (I-frame).                                                                                      |
+| `control_messages`        | Switch-specific control messages sent.                                                                                              |
+| `redundant_bytes`         | Joining-Fetch warm-up bytes + pre-boundary B objects.                                                                               |
+| `trailing_a_bytes`        | A bytes received after switch decision.                                                                                             |
+| `useful_b_bytes`          | B bytes from first live group boundary onward.                                                                                      |
+| `excess_bytes`            | `redundant_bytes + trailing_a_bytes`.                                                                                               |
+| `total_bytes`             | `useful_b_bytes + excess_bytes`.                                                                                                    |
+| `aetr`                    | `excess_bytes / total_bytes` per switch. Top-level `aetr` is mean across all switches.                                              |
+| `a_objects_post_decision` | A objects that arrived after the decision.                                                                                          |
 
 ### Switch method summary
 
@@ -661,7 +664,7 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 | ------------------ | -------------------- | ------------ | ------------------------------------- | ------ |
 | SWITCH message     | `switch-message`     | 1            | Positive; = time to B's next boundary | Low    |
 | Sub Update Forward | `sub-update-forward` | 3            | ≤ 0; A/B overlap                      | Medium |
-| Joining Fetch      | `joining-fetch`      | 4            | null (fetch fills gap)                | High   |
+| Joining Fetch      | `joining-fetch`      | 3–4          | null (fetch fills gap)                | High   |
 
 ### `client switch-test` flags
 
@@ -671,7 +674,6 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 --method                    switch-message | sub-update-forward | joining-fetch
 --switch-after <secs>       Seconds per track before triggering the next switch   [15]
 --jitter-buffer-ms <ms>     Jitter budget; gap > JB triggers a GoP-length stall   [0]
---joining-groups-offset <n> Groups to prefetch in joining-fetch warm-up            [2]
 --bandwidth-cap-bps <bps>   Recorded in JSON only; does not apply tc               [0]
 --output-json <path>        Write result JSON to this path
 ```

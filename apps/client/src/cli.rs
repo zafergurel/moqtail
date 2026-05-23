@@ -207,10 +207,6 @@ pub struct Cli {
   #[arg(long, default_value_t = 15)]
   pub switch_after: u64,
 
-  /// Number of groups to prefetch in joining-fetch warm-up
-  #[arg(long, default_value_t = 2)]
-  pub joining_groups_offset: u64,
-
   /// Bandwidth cap in bps recorded in the output JSON (0 = no limit)
   #[arg(long, default_value_t = 0)]
   pub bandwidth_cap_bps: u64,

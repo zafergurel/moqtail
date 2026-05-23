@@ -18,7 +18,7 @@ use anyhow::Result;
 use moqtail::model::common::tuple::{Tuple, TupleField};
 use moqtail::model::control::constant::FetchType;
 use moqtail::model::control::control_message::ControlMessage;
-use moqtail::model::control::fetch::{Fetch, JoiningFetchProps};
+use moqtail::model::control::fetch::Fetch;
 use moqtail::model::control::request_update::RequestUpdate;
 use moqtail::model::control::subscribe::Subscribe;
 use moqtail::model::control::switch::Switch;
@@ -43,7 +43,6 @@ pub struct SwitchTestConfig {
   pub track_b: String,
   pub method: SwitchMethod,
   pub switch_after_secs: u64,
-  pub joining_groups_offset: u64,
   pub bandwidth_cap_bps: u64,
   pub output_json: Option<String>,
   pub playout: crate::stats::PlayoutConfig,
@@ -308,53 +307,88 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
       }
 
       SwitchMethod::JoiningFetch => {
-        // Pre-subscribe the target track at low priority, then send JOINING_FETCH.
+        // Subscribe to B (LatestObject). Inspect LargestObject in SubscribeOk
+        // to decide whether to FETCH the beginning of the current group.
         let b_req_id = state.take_req_id();
-        let b_alias = subscribe_track(
-          &mut control_stream,
-          &config.namespace,
-          to_track,
+        let subscribe = Subscribe::new_latest_object(
           b_req_id,
-          200,
-          true,
-        )
-        .await?;
-
-        let fetch_req_id = state.take_req_id();
-        let fetch = Fetch {
-          request_id: fetch_req_id,
-          fetch_type: FetchType::RelativeFetch,
-          standalone_fetch_props: None,
-          joining_fetch_props: Some(JoiningFetchProps {
-            joining_request_id: b_req_id,
-            joining_start: config.joining_groups_offset,
-          }),
-          parameters: vec![MessageParameter::new_subscriber_priority(200)],
-        };
+          Tuple::from_utf8_path(&config.namespace),
+          TupleField::from_utf8(to_track),
+          vec![
+            MessageParameter::new_subscriber_priority(200),
+            MessageParameter::new_forward(true),
+          ],
+        );
         control_stream
-          .send(&ControlMessage::Fetch(Box::new(fetch.clone())))
+          .send(&ControlMessage::Subscribe(Box::new(subscribe)))
           .await
-          .map_err(|e| anyhow::anyhow!("Fetch send failed: {:?}", e))?;
+          .map_err(|e| anyhow::anyhow!("Subscribe send failed: {:?}", e))?;
 
-        pending_fetches
-          .write()
-          .await
-          .insert(fetch_req_id, FetchRequest::new(fetch_req_id, 0, fetch, 0));
+        let (b_alias, had_fetch) = match control_stream.next_message().await {
+          Ok(ControlMessage::SubscribeOk(m)) => {
+            let alias = m.track_alias;
+            info!(
+              "JoiningFetch: SubscribeOk for {}, alias={}",
+              to_track, alias
+            );
 
-        loop {
-          match control_stream.next_message().await {
-            Ok(ControlMessage::FetchOk(m)) => {
-              info!("JoiningFetch FetchOk: {:?}", m);
-              break;
-            }
-            Ok(ControlMessage::RequestOk(m)) => info!("JoiningFetch RequestOk: {:?}", m),
-            Ok(ControlMessage::RequestError(e)) => {
-              anyhow::bail!("JoiningFetch RequestError: {:?}", e)
-            }
-            Ok(m) => warn!("JoiningFetch: unexpected msg after Fetch: {:?}", m),
-            Err(e) => anyhow::bail!("JoiningFetch: error reading FetchOk: {:?}", e),
+            let largest = m.subscribe_parameters.iter().find_map(|p| {
+              if let MessageParameter::LargestObject { location } = p {
+                Some(location.clone())
+              } else {
+                None
+              }
+            });
+
+            let did_fetch = if let Some(loc) = largest {
+              if loc.object > 0 {
+                // B is mid-group: issue a Joining Fetch to deliver [I-frame … LargestObject].
+                let fetch_req_id = state.take_req_id();
+                let fetch = Fetch::new_joining(
+                  fetch_req_id,
+                  FetchType::RelativeFetch,
+                  b_req_id,
+                  0,
+                  vec![MessageParameter::new_subscriber_priority(200)],
+                )
+                .map_err(|e| anyhow::anyhow!("Fetch::new_joining: {}", e))?;
+                control_stream
+                  .send(&ControlMessage::Fetch(Box::new(fetch.clone())))
+                  .await
+                  .map_err(|e| anyhow::anyhow!("Fetch send failed: {:?}", e))?;
+                pending_fetches
+                  .write()
+                  .await
+                  .insert(fetch_req_id, FetchRequest::new(fetch_req_id, 0, fetch, 0));
+                loop {
+                  match control_stream.next_message().await {
+                    Ok(ControlMessage::FetchOk(m)) => {
+                      info!("JoiningFetch FetchOk: {:?}", m);
+                      break;
+                    }
+                    Ok(ControlMessage::RequestOk(m)) => info!("JoiningFetch RequestOk: {:?}", m),
+                    Ok(ControlMessage::RequestError(e)) => {
+                      anyhow::bail!("JoiningFetch RequestError: {:?}", e)
+                    }
+                    Ok(m) => warn!("JoiningFetch: unexpected msg after Fetch: {:?}", m),
+                    Err(e) => anyhow::bail!("JoiningFetch: error reading FetchOk: {:?}", e),
+                  }
+                }
+                true
+              } else {
+                info!("JoiningFetch: B at group boundary, no fetch needed");
+                false
+              }
+            } else {
+              info!("JoiningFetch: no LargestObject in SubscribeOk");
+              false
+            };
+
+            (alias, did_fetch)
           }
-        }
+          Ok(m) => anyhow::bail!("Expected SubscribeOk for {}, got {:?}", to_track, m),
+          Err(e) => anyhow::bail!("Error waiting SubscribeOk for {}: {:?}", to_track, e),
+        };
 
         run_joining_fetch_phase(
           &mut control_stream,
@@ -362,6 +396,7 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
           &mut state,
           b_alias,
           b_req_id,
+          had_fetch,
           from_track,
           to_track,
           &config,
@@ -616,13 +651,13 @@ async fn run_joining_fetch_phase(
   state: &mut SwitchState,
   b_alias: u64,
   b_req_id: u64,
+  had_fetch: bool,
   from_track: &str,
   to_track: &str,
   config: &SwitchTestConfig,
 ) -> Result<PhaseResult> {
   let mut record = SwitchRecord::new(from_track, to_track);
-  // SUBSCRIBE B + JOINING_FETCH already sent.
-  record.control_messages += 2;
+  record.control_messages = if had_fetch { 2 } else { 1 };
   record.switch_decision_time = Some(Instant::now());
   let current_alias = state.current_alias;
   let current_req_id = state.current_req_id;
@@ -643,9 +678,37 @@ async fn run_joining_fetch_phase(
       ev = rx.recv() => match ev {
         Some(ev) => {
           if ev.track_alias == 0 {
-            // Joining-fetch warm-up object.
-            record.redundant_bytes += ev.payload_size as u64;
+            // Standalone-fetch warm-up object.
             record.b_objects_pre_active += 1;
+            record.redundant_bytes += ev.payload_size as u64;
+            if !first_b_seen && ev.object == 0 {
+              record.first_b_object_time = Some(ev.received_at);
+              record.first_b_group = Some(ev.group);
+              record.group_boundary_aligned = Some(true);
+              first_b_seen = true;
+              info!("First B I-frame via fetch (joining-fetch): group={}", ev.group);
+
+              let ru_a_req = state.take_req_id();
+              if let Err(e) = send_request_update(
+                cs, ru_a_req, current_req_id,
+                vec![MessageParameter::new_forward(false)],
+              ).await {
+                warn!("joining_fetch: RequestUpdate A failed: {:?}", e);
+                break;
+              }
+              record.control_messages += 1;
+
+              let ru_b_req = state.take_req_id();
+              if let Err(e) = send_request_update(
+                cs, ru_b_req, b_req_id,
+                vec![MessageParameter::new_subscriber_priority(128)],
+              ).await {
+                warn!("joining_fetch: RequestUpdate B failed: {:?}", e);
+                break;
+              }
+              record.control_messages += 1;
+              post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+            }
           } else if ev.track_alias == current_alias {
             record.last_a_object_time = Some(ev.received_at);
             record.last_a_group = Some(ev.group);
