@@ -1,5 +1,19 @@
 # relay
 
+## 0.13.4
+
+### Patch Changes
+
+- [#199](https://github.com/moqtail/moqtail/pull/199) [`1c209c5`](https://github.com/moqtail/moqtail/commit/1c209c5bd1138c6ed4153d818d3d9a7f64278721) Thanks [@zafergurel](https://github.com/zafergurel)! - Fix relay not sending FETCH_OK for non-empty fetch ranges. The relay previously only sent FETCH_OK when the requested range was empty; for any fetch that returned objects the control-stream response was omitted, causing subscribers to block indefinitely waiting for it.
+
+## 0.13.3
+
+### Patch Changes
+
+- [#197](https://github.com/moqtail/moqtail/pull/197) [`0ddb35a`](https://github.com/moqtail/moqtail/commit/0ddb35a1215877bda60abc3455d183c23fe4d95b) Thanks [@zafergurel](https://github.com/zafergurel)! - Fix Joining Fetch range calculation per draft §9.16.2.
+  - **End location**: The relay now correctly sets End Location to `{LargestObject.Group, LargestObject.Object + 1}` (exclusive), so a Joining Fetch with `joining_start = 0` delivers all objects from the I-frame through the current LargestObject — previously the end was `{LargestObject.Group, 0}`, making the range empty for `joining_start = 0` and omitting the current partial group for any other value.
+  - **LargestObject in SubscribeOk**: When a subscriber arrives for an already-confirmed track, the relay now injects the track's current `LargestObject` position as a `MessageParameter::LargestObject` in the SubscribeOk, allowing the subscriber to decide whether to issue a Joining Fetch.
+
 ## 0.13.2
 
 ### Patch Changes
