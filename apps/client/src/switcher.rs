@@ -356,19 +356,6 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
           }
         }
 
-        // Explicitly re-enable forwarding on the live subscription. The relay stores only
-        // one subscription per client per track: if this track was subscribed in an earlier
-        // switch the existing object is still forward=false. Sending REQUEST_UPDATE here
-        // activates it regardless of whether this is a fresh or reused subscription.
-        let ru_fwd = state.take_req_id();
-        send_request_update(
-          &mut control_stream,
-          ru_fwd,
-          b_req_id,
-          vec![MessageParameter::new_forward(true)],
-        )
-        .await?;
-
         run_joining_fetch_phase(
           &mut control_stream,
           &mut rx,
@@ -624,8 +611,8 @@ async fn run_joining_fetch_phase(
   config: &SwitchTestConfig,
 ) -> Result<PhaseResult> {
   let mut record = SwitchRecord::new(from_track, to_track);
-  // SUBSCRIBE B + JOINING_FETCH + REQUEST_UPDATE forward=true were already sent.
-  record.control_messages += 3;
+  // SUBSCRIBE B + JOINING_FETCH already sent.
+  record.control_messages += 2;
   record.switch_decision_time = Some(Instant::now());
   let current_alias = state.current_alias;
   let current_req_id = state.current_req_id;

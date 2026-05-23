@@ -329,19 +329,18 @@ Subscriber                           Relay
 
 The relay delivers B starting from B's next group boundary after the REQUEST_UPDATE. The subscriber tears down A once the first live B group boundary arrives.
 
-**Method 3 — Joining Fetch** (5 control messages)
+**Method 3 — Joining Fetch** (4 control messages)
 
 ```
 Subscriber                           Relay
-    │──── SUBSCRIBE B (forward=true) ─►│
-    │◄─── SubscribeOk(B) ─────────────│
-    │──── JOINING_FETCH(B, offset=N) ─►│  relay fetches last N groups of B
-    │◄─── FetchOk ─────────────────────│
-    │──── REQUEST_UPDATE(B, fwd=true) ─►│  ensure live B is flowing
-    │◄═══ fetch objects (redundant) ═══│  (current partial group of B)
-    │◄═══ live B from next boundary ═══│  (first object_id=0 is first decodable)
-    │──── REQUEST_UPDATE(A, fwd=false)►│
-    │──── REQUEST_UPDATE(B, prio=128) ►│
+    │──── SUBSCRIBE B (prio=200, fwd=true) ►│
+    │◄─── SubscribeOk(B) ──────────────────│
+    │──── JOINING_FETCH(B, offset=N) ──────►│  relay fetches last N groups of B
+    │◄─── FetchOk ─────────────────────────│
+    │◄═══ fetch objects (redundant) ═══════│  (current partial group of B)
+    │◄═══ live B from next boundary ═══════│  (first object_id=0 is first decodable)
+    │──── REQUEST_UPDATE(A, fwd=false) ────►│  stop A
+    │──── REQUEST_UPDATE(B, prio=128) ─────►│  raise B to normal priority
 ```
 
 The fetch fills the current partial B group (eliminating the intra-GoP gap), then live B continues from the next boundary. The fetch objects are counted as `redundant_bytes`.
@@ -661,7 +660,7 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 | ------------------ | -------------------- | ------------ | ------------------------------------- | ------ |
 | SWITCH message     | `switch-message`     | 1            | Positive; = time to B's next boundary | Low    |
 | Sub Update Forward | `sub-update-forward` | 3            | ≤ 0; A/B overlap                      | Medium |
-| Joining Fetch      | `joining-fetch`      | 5            | null (fetch fills gap)                | High   |
+| Joining Fetch      | `joining-fetch`      | 4            | null (fetch fills gap)                | High   |
 
 ### `client switch-test` flags
 
