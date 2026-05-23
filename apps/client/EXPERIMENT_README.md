@@ -345,6 +345,8 @@ Subscriber                           Relay
 
 The fetch fills the current partial B group (eliminating the intra-GoP gap), then live B continues from the next boundary. The fetch objects are counted as `redundant_bytes`.
 
+**Implementation note — fixed offset vs. TRACK_STATUS:** The standard approach would send a TRACK_STATUS message first (1 RTT) to learn B's exact current position, then decide: if B is ahead of A, issue JOINING_FETCH to fill the partial group; if B is behind A, skip the fetch and subscribe to the live edge (accepting a stall until B catches up). Our implementation uses a fixed `--joining-groups-offset` instead, which avoids the explicit TRACK_STATUS round trip but always issues the fetch regardless of B's position. The RTT cost is still captured in `switch_delay_ms` because that metric is measured wall-clock from the decision instant to the first B I-frame arrival — every network round trip (SUBSCRIBE ack, FETCH request/response) elapses within that window.
+
 ---
 
 ## 6. How metrics are computed
@@ -365,7 +367,7 @@ receives:   ──A──A──A──A──A──A─┼─A─A─A─A─�
 
 | Field             | Formula                         | What it measures                                                                                                                                                  |
 | ----------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `switch_delay_ms` | `t_first_b − t_decision`        | Wall-clock delay: how long until first B object arrived after the switch decision was made                                                                        |
+| `switch_delay_ms` | `t_first_b − t_decision`        | Wall-clock delay: how long until first B **I-frame** arrived after the switch decision. Inherently includes any RTTs (control-message acks, fetch round trips).   |
 | `delivery_gap_ms` | `t_first_b − (t_last_a + 40ms)` | Playout gap: time between when the next frame was expected (after last A) and when first B actually arrived; negative = B arrived before A's slot ended (overlap) |
 | `stall_ms`        | see §6.2                        | Estimated viewer freeze due to missed I-frame deadline                                                                                                            |
 
