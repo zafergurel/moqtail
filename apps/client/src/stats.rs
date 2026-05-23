@@ -79,7 +79,7 @@ impl SwitchRecord {
 
   /// Milliseconds between switch decision and first B object.
   /// Negative means the first B object arrived before the decision (JoiningFetch pre-warm-up case).
-  pub fn switch_latency_ms(&self) -> Option<i128> {
+  pub fn switch_delay_ms(&self) -> Option<i128> {
     let decision = self.switch_decision_time?;
     let first_b = self.first_b_object_time?;
     if first_b >= decision {
@@ -173,7 +173,7 @@ impl SwitchRecord {
         "{{\n",
         "    \"track_from\": \"{}\",\n",
         "    \"track_to\": \"{}\",\n",
-        "    \"switch_latency_ms\": {},\n",
+        "    \"switch_delay_ms\": {},\n",
         "    \"delivery_gap_ms\": {},\n",
         "    \"stall_ms\": {},\n",
         "    \"group_boundary_aligned\": {},\n",
@@ -191,7 +191,7 @@ impl SwitchRecord {
       ),
       self.track_from,
       self.track_to,
-      Self::opt_i128(self.switch_latency_ms()),
+      Self::opt_i128(self.switch_delay_ms()),
       Self::opt_i128(self.delivery_gap_ms(cfg.frame_interval_ms)),
       Self::opt_u64(self.stall_ms(cfg)),
       Self::opt_bool(self.group_boundary_aligned),

@@ -360,16 +360,16 @@ receives:   ──A──A──A──A──A──A─┼─A─A─A─A─�
                                 │           │◄── gap ──────►│
                                 │           │  (includes    │
                                 │◄─────────────────────────►│
-                                     switch_latency_ms
+                                     switch_delay_ms
 ```
 
-| Field               | Formula                         | What it measures                                                                                                                                                  |
-| ------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `switch_latency_ms` | `t_first_b − t_decision`        | Wall-clock delay: how long until first B object arrived after the switch decision was made                                                                        |
-| `delivery_gap_ms`   | `t_first_b − (t_last_a + 40ms)` | Playout gap: time between when the next frame was expected (after last A) and when first B actually arrived; negative = B arrived before A's slot ended (overlap) |
-| `stall_ms`          | see §6.2                        | Estimated viewer freeze due to missed I-frame deadline                                                                                                            |
+| Field             | Formula                         | What it measures                                                                                                                                                  |
+| ----------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `switch_delay_ms` | `t_first_b − t_decision`        | Wall-clock delay: how long until first B object arrived after the switch decision was made                                                                        |
+| `delivery_gap_ms` | `t_first_b − (t_last_a + 40ms)` | Playout gap: time between when the next frame was expected (after last A) and when first B actually arrived; negative = B arrived before A's slot ended (overlap) |
+| `stall_ms`        | see §6.2                        | Estimated viewer freeze due to missed I-frame deadline                                                                                                            |
 
-**Important**: `t_last_a` is updated for every trailing A object that arrives after the decision. It is the receive time of the _last_ A object, not the decision time. This is why `delivery_gap_ms` ≠ `switch_latency_ms`.
+**Important**: `t_last_a` is updated for every trailing A object that arrives after the decision. It is the receive time of the _last_ A object, not the decision time. This is why `delivery_gap_ms` ≠ `switch_delay_ms`.
 
 ### 6.2 Stall formula
 
@@ -382,7 +382,7 @@ GoP = frame_interval_ms × objects_per_group = 40 × 25 = 1000 ms
 
 The clamping to `GoP` is the critical behavior: **missing an I-frame by even 1 ms causes a full GoP freeze**. All 24 P-frames in the GoP depend on the I-frame, so the decoder cannot decode any of them until the next I-frame arrives (1 s later).
 
-### 6.3 Why switch_latency < stall is valid
+### 6.3 Why switch_delay < stall is valid
 
 This is the most counter-intuitive aspect of the metrics. Consider the `a_ahead_500` scenario with `switch-message` and `jitter_buffer=500ms`:
 
@@ -395,20 +395,20 @@ t=0ms        t=140ms                          t=682ms
   │              │◄────── delivery_gap ─────────►│
   │              │   682ms - 140ms - 40ms = 502ms│
   │◄──────────────────────────────────────────── │
-        switch_latency = 682ms
+        switch_delay = 682ms
 ```
 
-- `switch_latency` = 682ms — "B arrived 682ms after the decision."
+- `switch_delay` = 682ms — "B arrived 682ms after the decision."
 - `delivery_gap` = 502ms — "B arrived 502ms after the expected next-frame slot."
 - `stall` = max(502−500, 1000) = **1000ms** — "the I-frame was 2ms late, so the decoder freezes for 1 full GoP."
 
-The stall (1000ms) exceeds the switch latency (682ms) because:
+The stall (1000ms) exceeds the switch delay (682ms) because:
 
 1. A kept flowing for ~140ms after the decision (trailing objects), so the playout cursor advanced.
 2. The gap is measured from the _last A received_ (t=140ms), not from the decision (t=0).
 3. The gap (502ms) barely exceeded the jitter buffer (500ms by only 2ms), but the GoP-floor clamps the stall to 1000ms.
 
-**In summary**: `switch_latency` answers "how long did the switch take?" `stall` answers "how badly would the viewer's player freeze?" They measure fundamentally different things and can have any ordering.
+**In summary**: `switch_delay` answers "how long did the switch take?" `stall` answers "how badly would the viewer's player freeze?" They measure fundamentally different things and can have any ordering.
 
 ### 6.4 Metrics per method (expected behavior)
 
@@ -474,7 +474,7 @@ delay_A=500ms, delay_B=0 (B ahead scenario, "rp_a2b_b500"):
 | --------- | ------------------ | -------------------------------------------------------------------------- |
 | A ahead δ | SWITCH message     | Waits δ ms for B's boundary → gap ≈ δ; stall occurs when δ > JB            |
 | A ahead δ | Sub Update Forward | Waits for B's next boundary regardless of δ; gap always ≤ 0 (pre-buffered) |
-| A ahead δ | Joining Fetch      | Fetch fills the partial group; gap = null; switch_latency ≈ 1 GoP          |
+| A ahead δ | Joining Fetch      | Fetch fills the partial group; gap = null; switch_delay ≈ 1 GoP            |
 | B ahead δ | SWITCH message     | B's boundary just passed → B data cached → gap ≈ −δ (negative, no stall)   |
 | B ahead δ | Sub Update Forward | Same as above: gap ≤ 0                                                     |
 | B ahead δ | Joining Fetch      | Fetch fills partial group; gap = null                                      |
@@ -514,7 +514,7 @@ for scen in SCENARIOS:
         if not files:
             continue
         runs = [json.loads(f.read_text()) for f in files]
-        dlys = [r["switches"][0].get("switch_latency_ms") for r in runs if r.get("switches")]
+        dlys = [r["switches"][0].get("switch_delay_ms") for r in runs if r.get("switches")]
         gaps = [r["switches"][0].get("delivery_gap_ms")   for r in runs if r.get("switches")]
         stls = [r["switches"][0].get("stall_ms")          for r in runs if r.get("switches")]
         aets = [r.get("aetr") for r in runs]
@@ -534,7 +534,7 @@ jq '.switches[]' results/**/*.json
 
 ```bash
 # switching delay from every event
-jq -r '.switches[].switch_latency_ms' results/local_*/*.json
+jq -r '.switches[].switch_delay_ms' results/local_*/*.json
 
 # method + aetr, one line per file
 jq -r '[.method, (.aetr | tostring)] | join("\t")' results/local_*/*.json
@@ -546,7 +546,7 @@ jq -r '[.method, (.aetr | tostring)] | join("\t")' results/local_*/*.json
 for method in switch-message sub-update-forward joining-fetch; do
   echo "── $method ──────────────────────────"
   jq -r '.switches[] | [
-      (.switch_latency_ms // "null"),
+      (.switch_delay_ms // "null"),
       (.delivery_gap_ms   // "null"),
       (.stall_ms          // "null"),
       (.aetr * 100),
@@ -563,7 +563,7 @@ done
 ### 8.6 Collect all rows as TSV (for spreadsheet / R / Python)
 
 ```bash
-echo -e "method\tbandwidth_cap_bps\trep\ttrack_from\ttrack_to\tswitch_latency_ms\tdelivery_gap_ms\tstall_ms\taetr\tgroup_boundary_aligned\tcontrol_messages\tredundant_bytes\ttrailing_a_bytes"
+echo -e "method\tbandwidth_cap_bps\trep\ttrack_from\ttrack_to\tswitch_delay_ms\tdelivery_gap_ms\tstall_ms\taetr\tgroup_boundary_aligned\tcontrol_messages\tredundant_bytes\ttrailing_a_bytes"
 
 for f in results/**/*.json; do
   method=$(jq -r '.method' "$f")
@@ -573,7 +573,7 @@ for f in results/**/*.json; do
     .switches[] |
     [$m, $b, $r,
      .track_from, .track_to,
-     (.switch_latency_ms | tostring),
+     (.switch_delay_ms | tostring),
      (.delivery_gap_ms   | tostring),
      (.stall_ms          | tostring),
      (.aetr              | tostring),
@@ -618,7 +618,7 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
     {
       "track_from": "3",
       "track_to": "4",
-      "switch_latency_ms": 683,
+      "switch_delay_ms": 683,
       "delivery_gap_ms": 502,
       "stall_ms": 1000,
       "group_boundary_aligned": true,
@@ -641,7 +641,7 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 
 | Field                     | Description                                                                                                                           |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `switch_latency_ms`       | `t_first_b − t_decision` (ms). Negative = B pre-buffered, arrived before decision.                                                    |
+| `switch_delay_ms`         | `t_first_b − t_decision` (ms). Negative = B pre-buffered, arrived before decision.                                                    |
 | `delivery_gap_ms`         | `t_first_b − (t_last_a + 40ms)`. Signed playout gap. Negative = B arrived before A's slot ended.                                      |
 | `stall_ms`                | `0` if gap ≤ JB; `max(gap−JB, GoP)` if gap > JB. Estimated viewer freeze (GoP = 1 s). `null` for Joining Fetch (gap filled by fetch). |
 | `group_boundary_aligned`  | First B object had `object_id == 0` (I-frame).                                                                                        |

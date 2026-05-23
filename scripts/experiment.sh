@@ -393,11 +393,9 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 parts = []
 for i, s in enumerate(d.get('switches', [])):
-    lat = s['switch_latency_ms']
-    frz = s['freeze_ms']
+    lat = s.get('switch_delay_ms')
     stall = s.get('stall_ms')
-    metric = f"stall={stall}ms" if stall is not None else f"freeze={frz}ms"
-    parts.append(f"sw{i+1}: {lat}ms ({metric})")
+    parts.append(f"sw{i+1}: {lat}ms (stall={stall}ms)")
 print("  " + "  |  ".join(parts))
 PYEOF
 }
