@@ -18,7 +18,7 @@ use moqtail::model::{
   control::{
     constant::SUPPORTED_VERSIONS, control_message::ControlMessage, server_setup::ServerSetup,
   },
-  data::{constant::ObjectForwardingPreference, datagram::Datagram},
+  data::datagram::Datagram,
   error::TerminationCode,
 };
 use moqtail::transport::{
@@ -60,9 +60,9 @@ impl Session {
       "New session:
       Remote Address: '{:?}'
       Origin: '{:?}'
-      Authority: '{}', 
+      Authority: '{}',
       Path: '{}'
-      User-Agent: '{:?}' 
+      User-Agent: '{:?}'
       Headers: '{:?}'
       ",
       remote_addr, origin, authority, path, user_agent, headers
@@ -96,11 +96,13 @@ impl Session {
     let track_manager = server.track_manager.clone();
     let server_config = server.app_config;
     let relay_pending_requests = server.relay_pending_requests.clone();
+    let upstream_fetch_senders = server.upstream_fetch_senders.clone();
     let relay_next_request_id = server.relay_next_request_id.clone();
     let connection = session_request.accept().await?;
 
     let request_maps = RequestMaps {
       relay_pending_requests,
+      upstream_fetch_senders,
     };
 
     let context = Arc::new(SessionContext::new(
@@ -343,10 +345,6 @@ impl Session {
 
                 if let Some(track) = context_clone.track_manager.get_track_by_alias(context_clone.connection_id, datagram_obj.track_alias).await {
                   let track = track.read().await;
-                  // Set forwarding preference to Datagram
-                  track.set_forwarding_preference(ObjectForwardingPreference::Datagram).await;
-
-                  // Call new_datagram
                   if let Err(e) = track.new_datagram(&datagram_obj).await {
                     error!("Failed to process datagram: {:?}", e);
                   }
@@ -577,12 +575,16 @@ impl Session {
 
     debug!("client is {}", client.connection_id);
 
-    let mut stream_handler = &RecvDataStream::new(stream, client.fetch_requests.clone());
+    let mut stream_handler = &RecvDataStream::new(stream, client.outgoing_fetch_requests.clone());
 
     let mut first_object = true;
     let mut track_alias = 0u64;
     let mut stream_id: Option<StreamId> = None;
     let mut current_track: Option<Arc<RwLock<Track>>> = None;
+    // Used if this stream is a response to an upstream fetch the relay issued.
+    let mut upstream_sender: Option<
+      tokio::sync::mpsc::Sender<super::session_context::UpstreamFetchEvent>,
+    > = None;
 
     let mut object_count = 0;
 
@@ -617,11 +619,23 @@ impl Session {
                 debug!("received Fetch header: {:?}", header);
                 let fetch_request_id = header.request_id;
                 track_alias = client
-                  .fetch_requests
+                  .outgoing_fetch_requests
                   .read()
                   .await
                   .get(&fetch_request_id)
                   .map_or(0, |r| r.track_alias);
+
+                // Check if this stream is a response to a relay-initiated
+                // upstream fetch. If so, grab the sender to forward objects.
+                if let Some(sender) = context
+                  .upstream_fetch_senders
+                  .read()
+                  .await
+                  .get(&fetch_request_id)
+                  .cloned()
+                {
+                  upstream_sender = Some(sender);
+                }
               }
             }
 
@@ -692,6 +706,17 @@ impl Session {
               "Failed to process object track: alias: {:?} track name: {:?} error: {:?}",
               track_alias, &track.full_track_name, e
             );
+          }
+
+          // Forward object to upstream fetch channel if this is a relay-initiated fetch
+          if let Some(ref sender) = upstream_sender
+            && let Ok(fetch_object) = object.clone().try_into_fetch()
+          {
+            let _ = sender
+              .send(super::session_context::UpstreamFetchEvent::Object(
+                fetch_object,
+              ))
+              .await;
           }
 
           object_count += 1;
