@@ -28,18 +28,18 @@
 # Scenario matrix (16 scenarios × 4 methods × 3 reps = 192 runs):
 #
 #   Relative-position group (unlimited BW, track A = 3 / 2.5 Mbps, track B = 4 / 4 Mbps):
-#     rp_a2b_a500   A→B  A ahead by 500 ms  (B starts 500 ms late)
-#     rp_a2b_a1000  A→B  A ahead by 1 s
-#     rp_a2b_a2000  A→B  A ahead by 2 s
-#     rp_a2b_b500   A→B  B ahead by 500 ms  (A starts 500 ms late)
-#     rp_a2b_b1000  A→B  B ahead by 1 s
-#     rp_a2b_b2000  A→B  B ahead by 2 s
-#     rp_b2a_a500   B→A  A ahead by 500 ms
-#     rp_b2a_a1000  B→A  A ahead by 1 s
-#     rp_b2a_a2000  B→A  A ahead by 2 s
-#     rp_b2a_b500   B→A  B ahead by 500 ms
-#     rp_b2a_b1000  B→A  B ahead by 1 s
-#     rp_b2a_b2000  B→A  B ahead by 2 s
+#     rp_a2b_a100   A→B  A ahead by 100 ms  (B starts 100 ms late)
+#     rp_a2b_a400   A→B  A ahead by 400 ms
+#     rp_a2b_a700   A→B  A ahead by 700 ms
+#     rp_a2b_b100   A→B  B ahead by 100 ms  (A starts 100 ms late)
+#     rp_a2b_b400   A→B  B ahead by 400 ms
+#     rp_a2b_b700   A→B  B ahead by 700 ms
+#     rp_b2a_a100   B→A  A ahead by 100 ms
+#     rp_b2a_a400   B→A  A ahead by 400 ms
+#     rp_b2a_a700   B→A  A ahead by 700 ms
+#     rp_b2a_b100   B→A  B ahead by 100 ms
+#     rp_b2a_b400   B→A  B ahead by 400 ms
+#     rp_b2a_b700   B→A  B ahead by 700 ms
 #
 #   Bandwidth-condition group (both tracks in sync, no offset):
 #     bw_a2b_4500k  A→B  4.5 Mbps  (just above track B)
@@ -116,13 +116,13 @@ declare -a PUB_GROUPS=(
   # ── Synchronized (no offset): bandwidth-condition scenarios ──────────────────
   "sync|0|0|bw_a2b_4500k:3,4:4500000|bw_a2b_7000k:3,4:7000000|bw_b2a_3000k:4,3:3000000|bw_b2a_7000k:4,3:7000000"
   # ── A ahead (B starts late): B's delay = offset ──────────────────────────────
-  "a_ahead_500|0|500|rp_a2b_a500:3,4:0|rp_b2a_a500:4,3:0"
-  "a_ahead_1000|0|1000|rp_a2b_a1000:3,4:0|rp_b2a_a1000:4,3:0"
-  "a_ahead_2000|0|2000|rp_a2b_a2000:3,4:0|rp_b2a_a2000:4,3:0"
+  "a_ahead_100|0|100|rp_a2b_a100:3,4:0|rp_b2a_a100:4,3:0"
+  "a_ahead_400|0|400|rp_a2b_a400:3,4:0|rp_b2a_a400:4,3:0"
+  "a_ahead_700|0|700|rp_a2b_a700:3,4:0|rp_b2a_a700:4,3:0"
   # ── B ahead (A starts late): A's delay = offset ──────────────────────────────
-  "b_ahead_500|500|0|rp_a2b_b500:3,4:0|rp_b2a_b500:4,3:0"
-  "b_ahead_1000|1000|0|rp_a2b_b1000:3,4:0|rp_b2a_b1000:4,3:0"
-  "b_ahead_2000|2000|0|rp_a2b_b2000:3,4:0|rp_b2a_b2000:4,3:0"
+  "b_ahead_100|100|0|rp_a2b_b100:3,4:0|rp_b2a_b100:4,3:0"
+  "b_ahead_400|400|0|rp_a2b_b400:3,4:0|rp_b2a_b400:4,3:0"
+  "b_ahead_700|700|0|rp_a2b_b700:3,4:0|rp_b2a_b700:4,3:0"
 )
 
 # Derived total per selected methods
