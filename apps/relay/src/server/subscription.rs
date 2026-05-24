@@ -17,6 +17,7 @@ use crate::server::client::switch_context::SwitchStatus;
 use crate::server::config::AppConfig;
 use crate::server::object_logger::ObjectLogger;
 use crate::server::stream_id::StreamId;
+use crate::server::track::ActiveSubgroupHeaderMap;
 use crate::server::track::TrackEvent;
 use crate::server::track_cache::CacheConsumeEvent;
 use crate::server::track_cache::TrackCache;
@@ -298,9 +299,13 @@ pub struct Subscription {
   object_logger: ObjectLogger,
   config: &'static AppConfig,
   check_switch_context_on_next_object: Arc<AtomicBool>,
-  /// Subgroup header cached while forward=false. Cleared when forward→true (stream opened)
+  /// Subgroup header cached while forward=false. Cleared when forward becomes true (stream opened)
   /// or when a new group starts (old group ended without forward ever becoming true).
   pending_header: Arc<Mutex<Option<(StreamId, HeaderInfo)>>>,
+  /// Shared map of open publisher subgroup streams and their original subgroup header.
+  /// Used to open a QUIC send stream for a new mid-group subscriber with the exact
+  /// original header rather than a synthesized one.
+  active_subgroup_headers: ActiveSubgroupHeaderMap,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -316,6 +321,7 @@ impl Subscription {
     client_connection_id: usize,
     log_folder: String,
     config: &'static AppConfig,
+    active_subgroup_headers: ActiveSubgroupHeaderMap,
   ) -> Self {
     Self {
       relay_track_id,
@@ -332,6 +338,7 @@ impl Subscription {
       config,
       check_switch_context_on_next_object: Arc::new(AtomicBool::new(false)),
       pending_header: Arc::new(Mutex::new(None)),
+      active_subgroup_headers,
     }
   }
 
@@ -345,6 +352,7 @@ impl Subscription {
     client_connection_id: usize,
     log_folder: String,
     config: &'static AppConfig,
+    active_subgroup_headers: ActiveSubgroupHeaderMap,
   ) -> Self {
     let event_rx = Arc::new(Mutex::new(Some(event_rx)));
     let sub = Self::create_instance(
@@ -358,6 +366,7 @@ impl Subscription {
       client_connection_id,
       log_folder,
       config,
+      active_subgroup_headers,
     );
 
     info!(
@@ -538,7 +547,7 @@ impl Subscription {
       }
 
       // Update explicit subscription state fields if they are present in the parameters.
-      // Track whether forward transitions false→true so we can flush pending_header below.
+      // Track whether forward transitions false to true so we can flush pending_header below.
       let mut transition = false;
       for param in &request_update.parameters {
         match param {
@@ -969,7 +978,32 @@ impl Subscription {
             None
           }
         } else {
-          self.subscriber.get_stream(&stream_id).await
+          match self.subscriber.get_stream(&stream_id).await {
+            Some(s) => Some(s),
+            None => {
+              // New subscriber joined mid-subgroup. Look up the original header
+              // from the track-level cache and open a QUIC send stream with it.
+              let cached = self
+                .active_subgroup_headers
+                .read()
+                .await
+                .get(&stream_id)
+                .cloned();
+              if let Some(h) = cached {
+                debug!(
+                  "mid-subgroup join: opening stream from cached header for subscriber={} relay_track_id={} stream_id={}",
+                  self.client_connection_id, self.relay_track_id, stream_id
+                );
+                self
+                  .handle_header(h)
+                  .await
+                  .ok()
+                  .map(|(_, send_stream)| send_stream)
+              } else {
+                None
+              }
+            }
+          }
         };
 
         if let Some(send_stream) = send_stream {
