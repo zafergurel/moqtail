@@ -356,6 +356,94 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
   Ok(())
 }
 
+// ─── Freshness tracker ───────────────────────────────────────────────────────
+//
+// Determines whether an incoming B I-frame carries content the player has not
+// yet displayed.  A B I-frame at group g is "fresh" iff g > threshold, where:
+//
+//   threshold = latest_played_a_group  (if any A I-frame crossed JB)
+//             | decision_a_group       (fallback: A's last group at decision)
+//             | 0
+//
+// latest_played_a_group advances whenever an A I-frame that arrived more than
+// jitter_buffer_ms ago is detected — meaning the player has committed to
+// displaying it.
+
+struct FreshnessTracker {
+  jitter_buffer_ms: u64,
+  decision_a_group: Option<u64>,
+  last_a_iframe_group: Option<u64>,
+  last_a_iframe_ts: Option<Instant>,
+  latest_played_a_group: Option<u64>,
+}
+
+impl FreshnessTracker {
+  fn new(jitter_buffer_ms: u64, decision_a_group: Option<u64>) -> Self {
+    Self {
+      jitter_buffer_ms,
+      decision_a_group,
+      last_a_iframe_group: None,
+      last_a_iframe_ts: None,
+      latest_played_a_group: None,
+    }
+  }
+
+  /// Call when an A I-frame (object == 0) arrives.
+  fn on_a_iframe(&mut self, group: u64, received_at: Instant) {
+    // Check whether the previous A I-frame has now been played before we
+    // overwrite it.
+    self.try_advance_played();
+    self.last_a_iframe_group = Some(group);
+    self.last_a_iframe_ts = Some(received_at);
+    info!(
+      "freshness: new A I-frame recorded group={}, latest_played_a_group={:?}",
+      group, self.latest_played_a_group
+    );
+  }
+
+  /// Advance latest_played_a_group if the tracked A I-frame has been in the
+  /// jitter buffer long enough to be considered played.
+  fn try_advance_played(&mut self) {
+    if let (Some(ts), Some(grp)) = (self.last_a_iframe_ts, self.last_a_iframe_group)
+      && ts.elapsed().as_millis() as u64 >= self.jitter_buffer_ms
+      && self.latest_played_a_group.is_none_or(|p| grp > p)
+    {
+      self.latest_played_a_group = Some(grp);
+      info!(
+        "freshness: A I-frame played — latest_played_a_group advances to {}",
+        grp
+      );
+    }
+  }
+
+  /// Returns true if a B I-frame at `b_group` is fresh enough to decode.
+  /// Always call this before deciding whether to accept or reject a B I-frame.
+  fn is_b_iframe_fresh(&mut self, b_group: u64) -> bool {
+    self.try_advance_played();
+    let threshold = self
+      .latest_played_a_group
+      .or(self.decision_a_group)
+      .unwrap_or(0);
+    let fresh = b_group > threshold;
+    if fresh {
+      info!(
+        "freshness: B I-frame FRESH — group={} > threshold={}",
+        b_group, threshold
+      );
+    } else {
+      info!(
+        "freshness: B I-frame STALE — group={} <= threshold={}, discarding",
+        b_group, threshold
+      );
+    }
+    fresh
+  }
+
+  fn apply_to_record(&self, record: &mut SwitchRecord) {
+    record.latest_played_a_group = self.latest_played_a_group;
+  }
+}
+
 // ─── Method A: SWITCH cold (no cache warm-up) ─────────────────────────────────
 
 async fn run_switch_cold_phase(
@@ -370,7 +458,7 @@ async fn run_switch_cold_phase(
   let current_alias = state.current_alias;
   let current_req_id = state.current_req_id;
 
-  // Phase 1: receive current track objects for switch_after_secs.
+  // Phase 1: receive current track objects for switch_after_ms.
   let deadline = tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms);
   loop {
     tokio::select! {
@@ -388,6 +476,12 @@ async fn run_switch_cold_phase(
       }
     }
   }
+  record.decision_a_group = record.last_a_group;
+  let mut freshness = FreshnessTracker::new(config.playout.jitter_buffer_ms, record.last_a_group);
+  info!(
+    "switch-cold: decision fired, decision_a_group={:?}",
+    record.decision_a_group
+  );
 
   // Phase 2: send SWITCH message.
   let switch_req_id = state.take_req_id();
@@ -419,21 +513,23 @@ async fn run_switch_cold_phase(
             record.last_a_object_time = Some(ev.received_at);
             record.trailing_a_bytes += ev.payload_size as u64;
             record.a_objects_post_decision += 1;
+            if ev.object == 0 {
+              freshness.on_a_iframe(ev.group, ev.received_at);
+            }
           } else if b_alias == Some(ev.track_alias) {
             if record.first_b_object_time.is_none() {
               record.first_b_object_time = Some(ev.received_at);
               record.first_b_group = Some(ev.group);
             }
             if !first_b_seen {
-              if ev.object == 0 {
+              if ev.object == 0 && freshness.is_b_iframe_fresh(ev.group) {
                 record.actual_switch_time = Some(ev.received_at);
                 record.switched_b_group = Some(ev.group);
                 record.group_boundary_aligned = Some(true);
                 first_b_seen = true;
-                info!("First B I-frame (switch-cold): switched_b_group={}", ev.group);
+                info!("switch-cold: accepted fresh B I-frame, switched_b_group={}", ev.group);
                 record.useful_b_bytes += ev.payload_size as u64;
               } else {
-                // Pre-boundary object from relay catch-up (shouldn't normally occur)
                 record.redundant_bytes += ev.payload_size as u64;
                 record.b_objects_pre_active += 1;
               }
@@ -446,10 +542,8 @@ async fn run_switch_cold_phase(
       },
       msg = cs.next_message() => match msg {
         Ok(ControlMessage::SubscribeOk(m)) => {
-          info!("SWITCH: SubscribeOk for {}, alias={}", to_track, m.track_alias);
+          info!("switch-cold: SubscribeOk for {}, alias={}", to_track, m.track_alias);
           b_alias = Some(m.track_alias);
-          // Stop collecting post-switch data once we have the first B object
-          // (post_deadline handles the overall timeout)
         }
         Ok(other) => info!("switch_cold: unexpected ctrl msg: {:?}", other),
         Err(e) => { warn!("switch_cold: control stream error: {:?}", e); break; }
@@ -457,8 +551,8 @@ async fn run_switch_cold_phase(
     }
   }
 
+  freshness.apply_to_record(&mut record);
   let new_alias = b_alias.unwrap_or(current_alias);
-  // After a SWITCH, the relay created subscription req_id = switch_req_id.
   Ok(PhaseResult {
     record,
     new_alias,
@@ -524,6 +618,12 @@ async fn run_switch_warm_phase(
     }
   }
   record.switch_decision_time = Some(Instant::now());
+  record.decision_a_group = record.last_a_group;
+  let mut freshness = FreshnessTracker::new(config.playout.jitter_buffer_ms, record.last_a_group);
+  info!(
+    "switch-warm: decision fired, decision_a_group={:?}",
+    record.decision_a_group
+  );
 
   // Phase 2: send SWITCH message.
   let switch_req_id = state.take_req_id();
@@ -555,18 +655,21 @@ async fn run_switch_warm_phase(
             record.last_a_object_time = Some(ev.received_at);
             record.trailing_a_bytes += ev.payload_size as u64;
             record.a_objects_post_decision += 1;
+            if ev.object == 0 {
+              freshness.on_a_iframe(ev.group, ev.received_at);
+            }
           } else if b_alias == Some(ev.track_alias) {
             if record.first_b_object_time.is_none() {
               record.first_b_object_time = Some(ev.received_at);
               record.first_b_group = Some(ev.group);
             }
             if !first_b_seen {
-              if ev.object == 0 {
+              if ev.object == 0 && freshness.is_b_iframe_fresh(ev.group) {
                 record.actual_switch_time = Some(ev.received_at);
                 record.switched_b_group = Some(ev.group);
                 record.group_boundary_aligned = Some(true);
                 first_b_seen = true;
-                info!("First B I-frame (switch-warm): switched_b_group={}", ev.group);
+                info!("switch-warm: accepted fresh B I-frame, switched_b_group={}", ev.group);
                 record.useful_b_bytes += ev.payload_size as u64;
               } else {
                 record.redundant_bytes += ev.payload_size as u64;
@@ -590,6 +693,7 @@ async fn run_switch_warm_phase(
     }
   }
 
+  freshness.apply_to_record(&mut record);
   let new_alias = b_alias.unwrap_or(current_alias);
   Ok(PhaseResult {
     record,
@@ -615,7 +719,7 @@ async fn run_sub_update_forward_phase(
   let current_alias = state.current_alias;
   let current_req_id = state.current_req_id;
 
-  // Phase 1: receive A objects for switch_after_secs.
+  // Phase 1: receive A objects for switch_after_ms.
   let deadline = tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms);
   loop {
     tokio::select! {
@@ -633,8 +737,14 @@ async fn run_sub_update_forward_phase(
       }
     }
   }
+  record.decision_a_group = record.last_a_group;
+  let mut freshness = FreshnessTracker::new(config.playout.jitter_buffer_ms, record.last_a_group);
+  info!(
+    "sub-update-forward: decision fired, decision_a_group={:?}",
+    record.decision_a_group
+  );
 
-  // Phase 2: enable B immediately (no group boundary wait).
+  // Phase 2: enable B (forward=true).
   let ru_req_b = state.take_req_id();
   send_request_update(
     cs,
@@ -645,7 +755,9 @@ async fn run_sub_update_forward_phase(
   .await?;
   record.control_messages += 1;
 
-  // Phase 3: drain A and B concurrently; tear down A on first live B object.
+  // Phase 3: drain A and B concurrently.
+  // A keeps flowing and advancing the freshness threshold.
+  // Tear down A only when the first FRESH B I-frame arrives.
   let post_deadline =
     tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms.max(10_000));
   let mut first_b_seen = false;
@@ -665,34 +777,40 @@ async fn run_sub_update_forward_phase(
             record.last_a_object_time = Some(ev.received_at);
             record.trailing_a_bytes += ev.payload_size as u64;
             record.a_objects_post_decision += 1;
+            if ev.object == 0 {
+              freshness.on_a_iframe(ev.group, ev.received_at);
+            }
           } else if ev.track_alias == b_alias {
             if record.first_b_object_time.is_none() {
               record.first_b_object_time = Some(ev.received_at);
               record.first_b_group = Some(ev.group);
             }
             if !first_b_seen {
-              if ev.object == 0 {
-                // Group boundary reached — B is now decodable.
+              if ev.object == 0 && freshness.is_b_iframe_fresh(ev.group) {
+                // Fresh B I-frame — decoder can start here.
                 record.actual_switch_time = Some(ev.received_at);
                 record.switched_b_group = Some(ev.group);
                 record.group_boundary_aligned = Some(true);
                 first_b_seen = true;
-                info!("First B group boundary (sub-update-forward): switched_b_group={}", ev.group);
+                info!(
+                  "sub-update-forward: accepted fresh B I-frame, switched_b_group={}",
+                  ev.group
+                );
 
-                // Tear down A now that B has an I-frame.
+                // Tear down A now that B has a decodable I-frame.
                 let ru_req_a = state.take_req_id();
                 if let Err(e) = send_request_update(
                   cs, ru_req_a, current_req_id,
                   vec![MessageParameter::new_forward(false)],
                 ).await {
-                  warn!("sub_update_forward_2: RequestUpdate A failed: {:?}", e);
+                  warn!("sub_update_forward: RequestUpdate A failed: {:?}", e);
                   break;
                 }
                 record.control_messages += 1;
                 post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
                 record.useful_b_bytes += ev.payload_size as u64;
               } else {
-                // Pre-boundary B object — decoder cannot use it without the I-frame.
+                // Stale I-frame or pre-boundary object — not yet decodable.
                 record.b_objects_pre_active += 1;
                 record.redundant_bytes += ev.payload_size as u64;
               }
@@ -711,6 +829,7 @@ async fn run_sub_update_forward_phase(
     }
   }
 
+  freshness.apply_to_record(&mut record);
   Ok(PhaseResult {
     record,
     new_alias: b_alias,
@@ -738,15 +857,16 @@ async fn run_joining_fetch_phase(
     current_alias, config.switch_after_ms
   );
 
-  // Phase 1: collect A for switch_after_secs, then set switch_decision_time.
+  // Phase 1: collect A for switch_after_ms, then set switch_decision_time.
   let deadline = tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms);
   loop {
     tokio::select! {
       _ = tokio::time::sleep_until(deadline) => {
         record.switch_decision_time = Some(Instant::now());
+        record.decision_a_group = record.last_a_group;
         info!(
-          "joining-fetch: Phase1 done, last_a_group={:?}",
-          record.last_a_group
+          "joining-fetch: decision fired, last_a_group={:?}, decision_a_group={:?}",
+          record.last_a_group, record.decision_a_group
         );
         break;
       },
@@ -769,6 +889,8 @@ async fn run_joining_fetch_phase(
       }
     }
   }
+  let mut freshness =
+    FreshnessTracker::new(config.playout.jitter_buffer_ms, record.decision_a_group);
 
   // Phase 2: send Subscribe-B, await SubscribeOk, optionally send FETCH.
   let b_req_id = state.take_req_id();
@@ -849,7 +971,10 @@ async fn run_joining_fetch_phase(
     Err(e) => anyhow::bail!("Error waiting SubscribeOk for {}: {:?}", to_track, e),
   };
 
-  // Phase 3: collect B until first I-frame, then 5-second tail (mirrors sub-update-forward).
+  // Phase 3: collect B until first fresh I-frame, then 5-second tail.
+  // Fetch objects (alias=0) and live B objects (alias=b_alias) are both subject
+  // to the freshness check.  A objects continue arriving as trailing data and
+  // advance the freshness threshold.
   let post_deadline =
     tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms.max(10_000));
   let mut first_b_seen = false;
@@ -865,65 +990,33 @@ async fn run_joining_fetch_phase(
       } => break,
       ev = rx.recv() => match ev {
         Some(ev) => {
-          if ev.track_alias == 0 {
-            // Standalone-fetch warm-up object.
-            record.b_objects_pre_active += 1;
-            record.redundant_bytes += ev.payload_size as u64;
-            if record.first_b_object_time.is_none() {
-              record.first_b_object_time = Some(ev.received_at);
-              record.first_b_group = Some(ev.group);
-            }
-            if !first_b_seen && ev.object == 0 {
-              record.actual_switch_time = Some(ev.received_at);
-              record.switched_b_group = Some(ev.group);
-              record.group_boundary_aligned = Some(true);
-              first_b_seen = true;
-              info!("First B I-frame via fetch (joining-fetch): switched_b_group={}", ev.group);
-
-              let ru_a_req = state.take_req_id();
-              if let Err(e) = send_request_update(
-                cs, ru_a_req, current_req_id,
-                vec![MessageParameter::new_forward(false)],
-              ).await {
-                warn!("joining_fetch: RequestUpdate A failed: {:?}", e);
-                break;
-              }
-              record.control_messages += 1;
-
-              let ru_b_req = state.take_req_id();
-              if let Err(e) = send_request_update(
-                cs, ru_b_req, b_req_id,
-                vec![MessageParameter::new_subscriber_priority(128)],
-              ).await {
-                warn!("joining_fetch: RequestUpdate B failed: {:?}", e);
-                break;
-              }
-              record.control_messages += 1;
-              post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
-            }
-          } else if ev.track_alias == current_alias {
+          if ev.track_alias == current_alias {
+            // Trailing A object — also advances the freshness threshold.
             record.last_a_object_time = Some(ev.received_at);
             record.last_a_group = Some(ev.group);
+            if ev.object == 0 {
+              freshness.on_a_iframe(ev.group, ev.received_at);
+            }
             if first_b_seen {
               record.trailing_a_bytes += ev.payload_size as u64;
               record.a_objects_post_decision += 1;
             }
-          } else if ev.track_alias == b_alias {
+          } else if ev.track_alias == 0 {
+            // Fetch object.
             if record.first_b_object_time.is_none() {
               record.first_b_object_time = Some(ev.received_at);
               record.first_b_group = Some(ev.group);
             }
             if !first_b_seen {
-              if ev.object != 0 {
-                // Pre-boundary live object — not yet decodable.
-                record.b_objects_pre_active += 1;
-                record.redundant_bytes += ev.payload_size as u64;
-              } else {
+              if ev.object == 0 && freshness.is_b_iframe_fresh(ev.group) {
                 record.actual_switch_time = Some(ev.received_at);
                 record.switched_b_group = Some(ev.group);
                 record.group_boundary_aligned = Some(true);
                 first_b_seen = true;
-                info!("First live B group boundary (joining-fetch): switched_b_group={}", ev.group);
+                info!(
+                  "joining-fetch: accepted fresh fetch I-frame, switched_b_group={}",
+                  ev.group
+                );
 
                 let ru_a_req = state.take_req_id();
                 if let Err(e) = send_request_update(
@@ -946,6 +1039,54 @@ async fn run_joining_fetch_phase(
                 record.control_messages += 1;
                 post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
                 record.useful_b_bytes += ev.payload_size as u64;
+              } else {
+                record.b_objects_pre_active += 1;
+                record.redundant_bytes += ev.payload_size as u64;
+              }
+            } else {
+              record.useful_b_bytes += ev.payload_size as u64;
+            }
+          } else if ev.track_alias == b_alias {
+            // Live B object.
+            if record.first_b_object_time.is_none() {
+              record.first_b_object_time = Some(ev.received_at);
+              record.first_b_group = Some(ev.group);
+            }
+            if !first_b_seen {
+              if ev.object == 0 && freshness.is_b_iframe_fresh(ev.group) {
+                record.actual_switch_time = Some(ev.received_at);
+                record.switched_b_group = Some(ev.group);
+                record.group_boundary_aligned = Some(true);
+                first_b_seen = true;
+                info!(
+                  "joining-fetch: accepted fresh live B I-frame, switched_b_group={}",
+                  ev.group
+                );
+
+                let ru_a_req = state.take_req_id();
+                if let Err(e) = send_request_update(
+                  cs, ru_a_req, current_req_id,
+                  vec![MessageParameter::new_forward(false)],
+                ).await {
+                  warn!("joining_fetch: RequestUpdate A failed: {:?}", e);
+                  break;
+                }
+                record.control_messages += 1;
+
+                let ru_b_req = state.take_req_id();
+                if let Err(e) = send_request_update(
+                  cs, ru_b_req, b_req_id,
+                  vec![MessageParameter::new_subscriber_priority(128)],
+                ).await {
+                  warn!("joining_fetch: RequestUpdate B failed: {:?}", e);
+                  break;
+                }
+                record.control_messages += 1;
+                post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                record.useful_b_bytes += ev.payload_size as u64;
+              } else {
+                record.b_objects_pre_active += 1;
+                record.redundant_bytes += ev.payload_size as u64;
               }
             } else {
               record.useful_b_bytes += ev.payload_size as u64;
@@ -962,6 +1103,7 @@ async fn run_joining_fetch_phase(
     }
   }
 
+  freshness.apply_to_record(&mut record);
   Ok(PhaseResult {
     record,
     new_alias: b_alias,

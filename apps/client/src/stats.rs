@@ -52,6 +52,13 @@ pub struct SwitchRecord {
   pub control_messages: u64,
   // Quality flags
   pub group_boundary_aligned: Option<bool>,
+  /// A's last group at the moment the switch decision fires (any object).
+  pub decision_a_group: Option<u64>,
+  /// Highest A group whose I-frame has been in the jitter buffer long enough to
+  /// be considered played (arrival_ts + JB ≤ now) at the time the fresh B
+  /// I-frame was accepted. None when no post-decision A I-frame crossed the
+  /// threshold before B arrived.
+  pub latest_played_a_group: Option<u64>,
   pub last_a_group: Option<u64>,
   pub first_b_group: Option<u64>,
   pub switched_b_group: Option<u64>,
@@ -73,6 +80,8 @@ impl SwitchRecord {
       b_objects_pre_active: 0,
       control_messages: 0,
       group_boundary_aligned: None,
+      decision_a_group: None,
+      latest_played_a_group: None,
       last_a_group: None,
       first_b_group: None,
       switched_b_group: None,
@@ -208,6 +217,8 @@ impl SwitchRecord {
         "    \"total_bytes\": {},\n",
         "    \"aetr\": {},\n",
         "    \"a_objects_post_decision\": {},\n",
+        "    \"decision_a_group\": {},\n",
+        "    \"latest_played_a_group\": {},\n",
         "    \"last_a_group\": {},\n",
         "    \"first_b_group\": {},\n",
         "    \"switched_b_group\": {},\n",
@@ -229,6 +240,8 @@ impl SwitchRecord {
       self.total_bytes(),
       Self::opt_f64(self.aetr()),
       self.a_objects_post_decision,
+      Self::opt_u64(self.decision_a_group),
+      Self::opt_u64(self.latest_played_a_group),
       Self::opt_u64(self.last_a_group),
       Self::opt_u64(self.first_b_group),
       Self::opt_u64(self.switched_b_group),
