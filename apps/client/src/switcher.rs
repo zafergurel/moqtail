@@ -417,18 +417,22 @@ impl FreshnessTracker {
   }
 
   /// Returns true if a B I-frame at `b_group` is fresh enough to decode.
-  /// Always call this before deciding whether to accept or reject a B I-frame.
+  ///
+  /// Threshold is fixed at `decision_a_group` — the content position A had
+  /// committed to when the switch was decided.  We do NOT advance it with
+  /// `latest_played_a_group` because A and B advance at the same rate: if B
+  /// is permanently Δ ms behind A and Δ ≥ JB, every B group g arrives after
+  /// A group g is "played", so the threshold would chase B indefinitely and
+  /// the switch would never complete.  `latest_played_a_group` is still
+  /// tracked for reporting purposes.
   fn is_b_iframe_fresh(&mut self, b_group: u64) -> bool {
     self.try_advance_played();
-    let threshold = self
-      .latest_played_a_group
-      .or(self.decision_a_group)
-      .unwrap_or(0);
+    let threshold = self.decision_a_group.unwrap_or(0);
     let fresh = b_group > threshold;
     if fresh {
       info!(
-        "freshness: B I-frame FRESH — group={} > threshold={}",
-        b_group, threshold
+        "freshness: B I-frame FRESH — group={} > threshold={} (latest_played={:?})",
+        b_group, threshold, self.latest_played_a_group
       );
     } else {
       info!(
