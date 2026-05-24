@@ -128,7 +128,7 @@ write_metadata() {
   local _track_a _track_b
   IFS=',' read -ra _seq <<< "$TRACK_SEQUENCE"
   _track_a="${_seq[0]}"
-  _track_b="${_seq[-1]}"
+  _track_b="${_seq[${#_seq[@]}-1]}"
 
   python3 - <<PYEOF
 import json
