@@ -99,6 +99,34 @@ def _load_all_runs(results_dir: Path, methods):
     return data
 
 
+def _load_all_runs_auto(results_dir: Path):
+    """Auto-discover methods and scenarios from filenames.
+
+    Filename format: {method}_{scenario}_rep{N}.json
+    Method names use only hyphens (no underscores), so the first '_'
+    in the stem (after stripping '_repN') splits method from scenario.
+    """
+    data: dict = {}
+    for f in sorted(results_dir.glob("*.json")):
+        if f.stem == "experiment-metadata":
+            continue
+        idx = f.stem.rfind("_rep")
+        if idx < 0:
+            continue
+        stem_no_rep = f.stem[:idx]
+        first_under = stem_no_rep.find("_")
+        if first_under < 0:
+            continue
+        method = stem_no_rep[:first_under]
+        scenario = stem_no_rep[first_under + 1:]
+        data.setdefault(method, {}).setdefault(scenario, [])
+        try:
+            data[method][scenario].append(json.loads(f.read_text()))
+        except Exception:
+            pass
+    return data
+
+
 # ── Rendering helpers ──────────────────────────────────────────────────────────
 
 def short_label(label: str) -> str:
@@ -207,9 +235,11 @@ def main(results_dir: Path):
             print_rp_section(data_legacy, _LEGACY_METHODS, rp_a2b, rp_b2a, jitter_ms=40)
             print_bw_section(data_legacy, _LEGACY_METHODS, bw_scens, jitter_ms=40)
         else:
-            # Unknown scenario names — generic flat table.
+            # Unknown scenario names — generic flat table, auto-discover methods.
             print(f"\nGeneric summary: {results_dir}")
-            print_generic_summary(_load_all_runs(results_dir, _LEGACY_METHODS), _LEGACY_METHODS)
+            auto_data = _load_all_runs_auto(results_dir)
+            auto_methods = sorted(auto_data.keys())
+            print_generic_summary(auto_data, auto_methods)
         return
 
     # ── Metadata-driven path ───────────────────────────────────────────────────
