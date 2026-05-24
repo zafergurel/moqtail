@@ -12,19 +12,20 @@
 #   bash scripts/experiment.sh [options]
 #
 # Options:
-#   --build              Build release binaries on relay and client locally
-#   --skip-start         Assume relay is already running (publisher restarted per group)
-#   --method  <name>     Only run this method (repeatable; default: all three)
-#   --reps <n>           Repetitions per condition (default: 3)
-#   --switch-after <ms>  Milliseconds per track before triggering the switch (default: 5000)
-#   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 40)
-#   --objects-per-group <n>  Objects per group (default: 25, i.e. 1s GOP at 25fps)
-#   --interval <ms>      Inter-object interval in ms (default: 40, i.e. 25fps)
-#   --group-count <n>    Total groups to publish (default: 5000 ≈ ~83 minutes)
-#   --output <dir>       Results directory (default: results/YYYYMMDD_HHMMSS)
+#   --build                    Build release binaries on relay and client locally
+#   --skip-start               Assume relay is already running (publisher restarted per group)
+#   --method  <name>           Only run this method (repeatable; default: all four)
+#   --reps <n>                 Repetitions per condition (default: 3)
+#   --switch-after <ms>        Milliseconds per track before triggering the switch (default: 5000)
+#   --switch-warm-lead-secs <s> Seconds before switch to pre-subscribe B (switch-warm only) (default: 2)
+#   --jitter-buffer-ms <ms>    Jitter buffer for realtime freeze calculation (default: 200)
+#   --objects-per-group <n>    Objects per group (default: 25, i.e. 1s GOP at 25fps)
+#   --interval <ms>            Inter-object interval in ms (default: 40, i.e. 25fps)
+#   --group-count <n>          Total groups to publish (default: 5000 ≈ ~83 minutes)
+#   --output <dir>             Results directory (default: results/YYYYMMDD_HHMMSS)
 #   --help
 #
-# Scenario matrix (16 scenarios × 3 methods × 3 reps = 144 runs):
+# Scenario matrix (16 scenarios × 4 methods × 3 reps = 192 runs):
 #
 #   Relative-position group (unlimited BW, track A = 3 / 2.5 Mbps, track B = 4 / 4 Mbps):
 #     rp_a2b_a500   A→B  A ahead by 500 ms  (B starts 500 ms late)
@@ -48,7 +49,7 @@
 #
 # Examples:
 #   bash scripts/experiment.sh --build
-#   bash scripts/experiment.sh --method switch-message --reps 1
+#   bash scripts/experiment.sh --method switch-cold --reps 1
 
 set -euo pipefail
 
@@ -87,6 +88,7 @@ fi
 
 ALL_METHODS=("switch-cold" "switch-warm" "sub-update-forward" "joining-fetch")
 SWITCH_AFTER=5000
+SWITCH_WARM_LEAD_SECS=2
 JITTER_BUFFER_MS=200
 REPS=3
 TC_MARK=1
@@ -152,8 +154,9 @@ while [[ $# -gt 0 ]]; do
     --skip-start)        SKIP_START=true;                     shift ;;
     --method)            SELECTED_METHODS+=("$2");             shift 2 ;;
     --reps)              REPS="$2";                           shift 2 ;;
-    --switch-after)      SWITCH_AFTER="$2";                   shift 2 ;;
-    --jitter-buffer-ms)  JITTER_BUFFER_MS="$2";               shift 2 ;;
+    --switch-after)          SWITCH_AFTER="$2";                shift 2 ;;
+    --switch-warm-lead-secs) SWITCH_WARM_LEAD_SECS="$2";      shift 2 ;;
+    --jitter-buffer-ms)      JITTER_BUFFER_MS="$2";           shift 2 ;;
     --objects-per-group) PUB_OBJECTS_PER_GROUP="$2";          shift 2 ;;
     --interval)          PUB_INTERVAL_MS="$2";                shift 2 ;;
     --group-count)       PUB_GROUP_COUNT="$2";                shift 2 ;;
@@ -234,8 +237,9 @@ meta = {
     "relay_host_ip":    "$RELAY_HOST_IP",
     "relay_port":       $RELAY_PORT,
     "subscriber_ip":    "$subscriber_ip",
-    "switch_after_ms":  $SWITCH_AFTER,
-    "jitter_buffer_ms": $JITTER_BUFFER_MS,
+    "switch_after_ms":       $SWITCH_AFTER,
+    "switch_warm_lead_secs": $SWITCH_WARM_LEAD_SECS,
+    "jitter_buffer_ms":      $JITTER_BUFFER_MS,
     "reps":             $REPS,
     "methods":          $methods_json,
     "track_a":          "$TRACK_A",
@@ -481,6 +485,7 @@ run_one() {
     --track-sequence "$sequence" \
     --method "$method" \
     --switch-after "$SWITCH_AFTER" \
+    --switch-warm-lead-secs "$SWITCH_WARM_LEAD_SECS" \
     --jitter-buffer-ms "$JITTER_BUFFER_MS" \
     --bandwidth-cap-bps "$bw" \
     --output-json "$outfile"; then
@@ -540,6 +545,7 @@ main() {
   log "Publisher:     ${PUB_SSH:-local}"
   log "Methods:       ${METHODS[*]}"
   log "Switch after:  ${SWITCH_AFTER}ms"
+  log "Warm lead:     ${SWITCH_WARM_LEAD_SECS}s"
   log "Jitter buffer: ${JITTER_BUFFER_MS}ms"
   log "Reps:          $REPS"
   log "Subscriber IP: $subscriber_ip"
