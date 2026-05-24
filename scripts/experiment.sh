@@ -572,6 +572,11 @@ main() {
   trap - EXIT INT TERM
   stop_publisher
   stop_relay
+
+  local summary_file="$OUTPUT_DIR/results.md"
+  python3 "$ROOT_DIR/results/summarize.py" "$OUTPUT_DIR" > "$summary_file" 2>&1 \
+    && log "Summary: $summary_file" \
+    || log "WARNING: summarize.py failed"
 }
 
 main
