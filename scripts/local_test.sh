@@ -41,6 +41,8 @@
 
 set -euo pipefail
 
+INVOCATION="$0 $*"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -152,6 +154,7 @@ meta = {
         {"label": "$SCENARIO", "sequence": "$TRACK_SEQUENCE",
          "bw_bps": 0, "delay_a_ms": 0, "delay_b_ms": 0}
     ],
+    "command":          "$INVOCATION",
 }
 Path("$meta_file").write_text(json.dumps(meta, indent=2) + "\n")
 PYEOF
