@@ -13,7 +13,8 @@
 #
 # Options:
 #   --build                    Build release binaries on relay and client locally
-#   --skip-start               Assume relay is already running (publisher restarted per group)
+#   --skip-start               Skip the initial relay startup (assume it is already running)
+#   --no-restart-services      Do NOT restart relay+publisher before each run (default: restart each run)
 #   --method  <name>           Only run this method (repeatable; default: all four)
 #   --reps <n>                 Repetitions per condition (default: 3)
 #   --switch-after <ms>        Milliseconds per track before triggering the switch (default: 5000)
@@ -140,6 +141,7 @@ PUB_TRACKS=""
 
 BUILD=false
 SKIP_START=false
+RESTART_SERVICES=true
 SELECTED_METHODS=()
 OUTPUT_DIR=""
 
@@ -150,9 +152,10 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --build)             BUILD=true;                          shift ;;
-    --skip-start)        SKIP_START=true;                     shift ;;
-    --method)            SELECTED_METHODS+=("$2");             shift 2 ;;
+    --build)               BUILD=true;                          shift ;;
+    --skip-start)          SKIP_START=true;                     shift ;;
+    --no-restart-services) RESTART_SERVICES=false;              shift ;;
+    --method)              SELECTED_METHODS+=("$2");             shift 2 ;;
     --reps)              REPS="$2";                           shift 2 ;;
     --switch-after)          SWITCH_AFTER="$2";                shift 2 ;;
     --switch-warm-lead-secs) SWITCH_WARM_LEAD_SECS="$2";      shift 2 ;;
@@ -471,6 +474,13 @@ run_one() {
     return 0
   fi
 
+  if "$RESTART_SERVICES"; then
+    stop_publisher
+    stop_relay
+    start_relay
+    start_publisher
+  fi
+
   log "--- $label rep $rep ---"
 
   if [ "$bw" -gt 0 ]; then
@@ -517,15 +527,20 @@ run_pub_group() {
 
   PUB_TRACKS="${TRACK_A}:${TRACK_A_PAYLOAD}:${TRACK_P_RATIO}:${delay_a},${TRACK_B}:${TRACK_B_PAYLOAD}:${TRACK_P_RATIO}:${delay_b}"
 
-  stop_publisher
-  start_publisher
+  if ! "$RESTART_SERVICES"; then
+    # Services shared across runs — restart publisher once per group (delay config may have changed).
+    stop_publisher
+    start_publisher
+  fi
 
   local scenario_spec scenario_label sequence bw
   for scenario_spec in "$@"; do
     IFS=':' read -r scenario_label sequence bw <<< "$scenario_spec"
     for method in "${METHODS[@]}"; do
       for rep in $(seq 1 "$REPS"); do
-        ensure_healthy
+        if ! "$RESTART_SERVICES"; then
+          ensure_healthy
+        fi
         run_one "$method" "$scenario_label" "$sequence" "$bw" "$rep" "$subscriber_ip"
         (( done_count++ )) || true
         log "Progress: $done_count / $total"
@@ -541,15 +556,16 @@ main() {
   done_count=0
 
   log "=== experiment.sh ==="
-  log "Relay:         $RELAY_SSH  ($RELAY_HOST_IP:$RELAY_PORT)"
-  log "Publisher:     ${PUB_SSH:-local}"
-  log "Methods:       ${METHODS[*]}"
-  log "Switch after:  ${SWITCH_AFTER}ms"
-  log "Warm lead:     ${SWITCH_WARM_LEAD_SECS}s"
-  log "Jitter buffer: ${JITTER_BUFFER_MS}ms"
-  log "Reps:          $REPS"
-  log "Subscriber IP: $subscriber_ip"
-  log "Total runs:    $total"
+  log "Relay:            $RELAY_SSH  ($RELAY_HOST_IP:$RELAY_PORT)"
+  log "Publisher:        ${PUB_SSH:-local}"
+  log "Methods:          ${METHODS[*]}"
+  log "Switch after:     ${SWITCH_AFTER}ms"
+  log "Warm lead:        ${SWITCH_WARM_LEAD_SECS}s"
+  log "Jitter buffer:    ${JITTER_BUFFER_MS}ms"
+  log "Reps:             $REPS"
+  log "Restart services: $RESTART_SERVICES"
+  log "Subscriber IP:    $subscriber_ip"
+  log "Total runs:       $total"
 
   mkdir -p "$OUTPUT_DIR"
   log "Results:       $OUTPUT_DIR"
@@ -559,7 +575,8 @@ main() {
     do_build
   fi
 
-  if ! "$SKIP_START"; then
+  if ! "$SKIP_START" && ! "$RESTART_SERVICES"; then
+    # Services shared across runs — start relay once here.
     start_relay
   fi
 

@@ -10,7 +10,8 @@
 #
 # Options:
 #   --build                Build release binaries before running
-#   --skip-start           Assume relay + publisher are already running
+#   --skip-start           Skip the initial relay+publisher startup (assume they are already running)
+#   --no-restart-services  Do NOT restart relay+publisher before each run (default: restart each run)
 #   --method  <name>       Only run this method (repeatable; default: all four)
 #   --track-sequence <s>   Comma-separated track sequence, e.g. "2,3,4"
 #                          When given, each run performs M switches (M = len-1).
@@ -20,13 +21,12 @@
 #   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 200)
 #   --reps <n>             Repetitions per method (default: 3)
 #   --tracks <spec>        Track specs for publish-multi, e.g. "1:20000,2:12500,3:5000"
-#                          Default: full 5-track ladder matching ffmpeg.sh bitrates
+#                          Default: full 4-track video-only ladder
 #   --objects-per-group <n>  Objects per group (default: 25, i.e. 1s GOP at 25fps)
 #   --interval <ms>        Inter-object interval in ms (default: 40, i.e. 25fps)
 #   --group-count <n>      Total groups to publish (default: 1000 ≈ ~17 minutes)
 #   --relay-port <port>    Relay QUIC port (default: 4433)
 #   --scenario <name>      Scenario label used in output filenames (default: "local")
-#   --restart-pub          Restart publisher only (relay stays running); implies --skip-start for relay
 #   --output <dir>         Results directory (default: results/local_YYYYMMDD_HHMMSS)
 #   --help
 #
@@ -83,7 +83,7 @@ PUB_PID_FILE="/tmp/moqtail-pub-local.pid"
 
 BUILD=false
 SKIP_START=false
-RESTART_PUB=false
+RESTART_SERVICES=true
 SELECTED_METHODS=()
 OUTPUT_DIR=""
 SCENARIO="local"
@@ -97,6 +97,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --build)               BUILD=true;                          shift ;;
     --skip-start)          SKIP_START=true;                     shift ;;
+    --no-restart-services) RESTART_SERVICES=false;              shift ;;
     --method)              SELECTED_METHODS+=("$2");             shift 2 ;;
     --track-sequence)      TRACK_SEQUENCE="$2";                 shift 2 ;;
     --switch-after)        SWITCH_AFTER="$2";                   shift 2 ;;
@@ -109,7 +110,6 @@ while [[ $# -gt 0 ]]; do
     --group-count)         PUB_GROUP_COUNT="$2";                shift 2 ;;
     --relay-port)          RELAY_PORT="$2"; RELAY_URL="https://127.0.0.1:${RELAY_PORT}"; shift 2 ;;
     --scenario)            SCENARIO="$2";                       shift 2 ;;
-    --restart-pub)         RESTART_PUB=true; SKIP_START=true;  shift ;;
     --output)              OUTPUT_DIR="$2";                     shift 2 ;;
     --help|-h)             usage ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -188,6 +188,7 @@ start_relay() {
   log "Starting local relay (port $RELAY_PORT) → $RELAY_LOG"
   "$RELAY_BIN" --port "$RELAY_PORT" >"$RELAY_LOG" 2>&1 &
   echo $! >"$RELAY_PID_FILE"
+  RELAY_STARTED=true
   sleep 2
   log "Relay PID $(cat "$RELAY_PID_FILE")"
 }
@@ -246,6 +247,13 @@ run_one() {
   local method=$1 rep=$2
   local outfile="$OUTPUT_DIR/${method}_${SCENARIO}_rep${rep}.json"
 
+  if "$RESTART_SERVICES"; then
+    stop_publisher
+    stop_relay
+    start_relay
+    start_publisher
+  fi
+
   log "--- $method rep $rep ---"
 
   "$CLIENT_BIN" \
@@ -279,29 +287,29 @@ trap cleanup EXIT INT TERM
 
 main() {
   log "=== local_test.sh ==="
-  log "Methods:        ${METHODS[*]}"
-  log "Scenario:       $SCENARIO"
-  log "Track sequence: $TRACK_SEQUENCE"
-  log "Tracks:         $PUB_TRACKS"
-  log "Switch after:   ${SWITCH_AFTER}ms"
-  log "Warm lead:      ${SWITCH_WARM_LEAD_SECS}s"
-  log "Jitter buffer:  ${JITTER_BUFFER_MS}ms"
-  log "Reps:           $REPS"
-  log "Publisher:      local (publish-multi)"
-  log "Relay:          local ($RELAY_URL)"
+  log "Methods:          ${METHODS[*]}"
+  log "Scenario:         $SCENARIO"
+  log "Track sequence:   $TRACK_SEQUENCE"
+  log "Tracks:           $PUB_TRACKS"
+  log "Switch after:     ${SWITCH_AFTER}ms"
+  log "Warm lead:        ${SWITCH_WARM_LEAD_SECS}s"
+  log "Jitter buffer:    ${JITTER_BUFFER_MS}ms"
+  log "Reps:             $REPS"
+  log "Restart services: $RESTART_SERVICES"
+  log "Publisher:        local (publish-multi)"
+  log "Relay:            local ($RELAY_URL)"
 
   mkdir -p "$OUTPUT_DIR"
-  log "Results:        $OUTPUT_DIR"
+  log "Results:          $OUTPUT_DIR"
   write_metadata
 
-  if "$BUILD" || ! "$SKIP_START"; then
+  if "$BUILD"; then
     do_build
   fi
 
-  if ! "$SKIP_START"; then
+  if ! "$SKIP_START" && ! "$RESTART_SERVICES"; then
+    # Services shared across all runs — start once here.
     start_relay
-    start_publisher
-  elif "$RESTART_PUB"; then
     start_publisher
   fi
 
