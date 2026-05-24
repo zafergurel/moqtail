@@ -146,7 +146,6 @@ async fn main() -> Result<(), anyhow::Error> {
         track_b: cli.track_b,
         method: cli.method.into(),
         switch_after_ms: cli.switch_after,
-        switch_warm_lead_ms: cli.switch_warm_lead_secs * 1000,
         bandwidth_cap_bps: cli.bandwidth_cap_bps,
         output_json: cli.output_json,
         playout,

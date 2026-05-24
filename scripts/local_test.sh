@@ -17,7 +17,6 @@
 #                          When given, each run performs M switches (M = len-1).
 #                          Default: "3,4" (single upswitch, 720p → 1080p)
 #   --switch-after <ms>    Milliseconds per track before triggering next switch (default: 5000)
-#   --switch-warm-lead-secs <s>  Seconds before switch to pre-subscribe B (switch-warm only) (default: 2)
 #   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 200)
 #   --reps <n>             Repetitions per method (default: 3)
 #   --delays <list>        Comma-separated relative-position delays in ms (default: "0,100,400")
@@ -33,7 +32,7 @@
 #
 # Examples:
 #   # Quick smoke test: one method, one rep, relay already running
-#   bash scripts/local_test.sh --skip-start --method switch-cold --reps 1
+#   bash scripts/local_test.sh --skip-start --method switch --reps 1
 #
 #   # Full run: build + 4 methods × 3 reps with default delays
 #   bash scripts/local_test.sh --build --track-sequence "2,3,4"
@@ -50,11 +49,10 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 
-ALL_METHODS=("switch-cold" "switch-warm" "sub-update-forward" "joining-fetch")
+ALL_METHODS=("switch" "sub-update-forward" "joining-fetch")
 # Default track sequence: single upswitch 720p→1080p (lower number = lower bitrate)
 TRACK_SEQUENCE="3,4"
 SWITCH_AFTER=5000
-SWITCH_WARM_LEAD_SECS=2
 JITTER_BUFFER_MS=200
 REPS=3
 RELAY_PORT=4433
@@ -108,7 +106,6 @@ while [[ $# -gt 0 ]]; do
     --method)              SELECTED_METHODS+=("$2");             shift 2 ;;
     --track-sequence)      TRACK_SEQUENCE="$2";                 shift 2 ;;
     --switch-after)        SWITCH_AFTER="$2";                   shift 2 ;;
-    --switch-warm-lead-secs) SWITCH_WARM_LEAD_SECS="$2";        shift 2 ;;
     --jitter-buffer-ms)    JITTER_BUFFER_MS="$2";               shift 2 ;;
     --reps)                REPS="$2";                           shift 2 ;;
     --delays)              DELAYS="$2";                         shift 2 ;;
@@ -166,9 +163,8 @@ meta = {
     "timestamp":        "$(date +%Y%m%d_%H%M%S)",
     "relay_host":       "127.0.0.1",
     "relay_port":       $RELAY_PORT,
-    "switch_after_ms":       $SWITCH_AFTER,
-    "switch_warm_lead_secs": $SWITCH_WARM_LEAD_SECS,
-    "jitter_buffer_ms":      $JITTER_BUFFER_MS,
+    "switch_after_ms":  $SWITCH_AFTER,
+    "jitter_buffer_ms": $JITTER_BUFFER_MS,
     "reps":             $REPS,
     "methods":          $methods_json,
     "track_a":          "$TRACK_A",
@@ -303,7 +299,6 @@ run_one() {
     --track-sequence "$TRACK_SEQUENCE" \
     --method "$method" \
     --switch-after "$SWITCH_AFTER" \
-    --switch-warm-lead-secs "$SWITCH_WARM_LEAD_SECS" \
     --jitter-buffer-ms "$JITTER_BUFFER_MS" \
     --bandwidth-cap-bps 0 \
     --output-json "$outfile" \
@@ -348,7 +343,6 @@ main() {
   log "Delays:           $DELAYS"
   log "Tracks:           $PUB_TRACKS"
   log "Switch after:     ${SWITCH_AFTER}ms"
-  log "Warm lead:        ${SWITCH_WARM_LEAD_SECS}s"
   log "Jitter buffer:    ${JITTER_BUFFER_MS}ms"
   log "Reps:             $REPS"
   log "Restart services: $RESTART_SERVICES"

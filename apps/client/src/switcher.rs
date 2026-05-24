@@ -43,8 +43,6 @@ pub struct SwitchTestConfig {
   pub track_b: String,
   pub method: SwitchMethod,
   pub switch_after_ms: u64,
-  /// How many ms before the switch decision to pre-subscribe B (switch-warm only).
-  pub switch_warm_lead_ms: u64,
   pub bandwidth_cap_bps: u64,
   pub output_json: Option<String>,
   pub playout: crate::stats::PlayoutConfig,
@@ -63,8 +61,7 @@ impl SwitchTestConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SwitchMethod {
-  SwitchCold,
-  SwitchWarm,
+  Switch,
   SubUpdateForward,
   JoiningFetch,
 }
@@ -72,8 +69,7 @@ pub enum SwitchMethod {
 impl SwitchMethod {
   pub fn as_str(&self) -> &'static str {
     match self {
-      SwitchMethod::SwitchCold => "switch-cold",
-      SwitchMethod::SwitchWarm => "switch-warm",
+      SwitchMethod::Switch => "switch",
       SwitchMethod::SubUpdateForward => "sub-update-forward",
       SwitchMethod::JoiningFetch => "joining-fetch",
     }
@@ -273,20 +269,8 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
     );
 
     let phase = match config.method {
-      SwitchMethod::SwitchCold => {
-        run_switch_cold_phase(
-          &mut control_stream,
-          &mut rx,
-          &mut state,
-          from_track,
-          to_track,
-          &config,
-        )
-        .await?
-      }
-
-      SwitchMethod::SwitchWarm => {
-        run_switch_warm_phase(
+      SwitchMethod::Switch => {
+        run_switch_phase(
           &mut control_stream,
           &mut rx,
           &mut state,
@@ -448,9 +432,9 @@ impl FreshnessTracker {
   }
 }
 
-// ─── Method A: SWITCH cold (no cache warm-up) ─────────────────────────────────
+// ─── Method A: SWITCH ────────────────────────────────────────────────────────
 
-async fn run_switch_cold_phase(
+async fn run_switch_phase(
   cs: &mut moqtail::transport::control_stream_handler::ControlStreamHandler,
   rx: &mut mpsc::UnboundedReceiver<ObjectEvent>,
   state: &mut SwitchState,
@@ -483,7 +467,7 @@ async fn run_switch_cold_phase(
   record.decision_a_group = record.last_a_group;
   let mut freshness = FreshnessTracker::new(config.playout.jitter_buffer_ms, record.last_a_group);
   info!(
-    "switch-cold: decision fired, decision_a_group={:?}",
+    "switch: decision fired, decision_a_group={:?}",
     record.decision_a_group
   );
 
@@ -531,7 +515,7 @@ async fn run_switch_cold_phase(
                 record.switched_b_group = Some(ev.group);
                 record.group_boundary_aligned = Some(true);
                 first_b_seen = true;
-                info!("switch-cold: accepted fresh B I-frame, switched_b_group={}", ev.group);
+                info!("switch: accepted fresh B I-frame, switched_b_group={}", ev.group);
                 record.useful_b_bytes += ev.payload_size as u64;
               } else {
                 record.redundant_bytes += ev.payload_size as u64;
@@ -546,153 +530,11 @@ async fn run_switch_cold_phase(
       },
       msg = cs.next_message() => match msg {
         Ok(ControlMessage::SubscribeOk(m)) => {
-          info!("switch-cold: SubscribeOk for {}, alias={}", to_track, m.track_alias);
+          info!("switch: SubscribeOk for {}, alias={}", to_track, m.track_alias);
           b_alias = Some(m.track_alias);
         }
-        Ok(other) => info!("switch_cold: unexpected ctrl msg: {:?}", other),
-        Err(e) => { warn!("switch_cold: control stream error: {:?}", e); break; }
-      }
-    }
-  }
-
-  freshness.apply_to_record(&mut record);
-  let new_alias = b_alias.unwrap_or(current_alias);
-  Ok(PhaseResult {
-    record,
-    new_alias,
-    new_req_id: switch_req_id,
-  })
-}
-
-// ─── Method A2: SWITCH warm (pre-subscribe B to warm relay cache) ─────────────
-
-async fn run_switch_warm_phase(
-  cs: &mut moqtail::transport::control_stream_handler::ControlStreamHandler,
-  rx: &mut mpsc::UnboundedReceiver<ObjectEvent>,
-  state: &mut SwitchState,
-  from_track: &str,
-  to_track: &str,
-  config: &SwitchTestConfig,
-) -> Result<PhaseResult> {
-  let mut record = SwitchRecord::new(from_track, to_track);
-  let current_alias = state.current_alias;
-  let current_req_id = state.current_req_id;
-
-  let warm_lead_ms = config.switch_warm_lead_ms.min(config.switch_after_ms);
-  let pre_warm_ms = config.switch_after_ms - warm_lead_ms;
-
-  // Phase 1a: receive A until warm-up time.
-  let warm_deadline = tokio::time::Instant::now() + Duration::from_millis(pre_warm_ms);
-  loop {
-    tokio::select! {
-      _ = tokio::time::sleep_until(warm_deadline) => break,
-      ev = rx.recv() => match ev {
-        Some(ev) if ev.track_alias == current_alias => {
-          record.last_a_object_time = Some(ev.received_at);
-          record.last_a_group = Some(ev.group);
-        }
-        Some(_) => {}
-        None => break,
-      }
-    }
-  }
-
-  // Phase 1b: pre-subscribe B with forward=false to warm the relay's B cache.
-  let warm_req_id = state.take_req_id();
-  subscribe_track(cs, &config.namespace, to_track, warm_req_id, 128, false).await?;
-  record.control_messages += 1; // SUBSCRIBE B (warm)
-  info!(
-    "switch-warm: pre-subscribed B ({}) for cache warming",
-    to_track
-  );
-
-  // Phase 1c: continue receiving A for the warm window.
-  let switch_deadline = tokio::time::Instant::now() + Duration::from_millis(warm_lead_ms);
-  loop {
-    tokio::select! {
-      _ = tokio::time::sleep_until(switch_deadline) => break,
-      ev = rx.recv() => match ev {
-        Some(ev) if ev.track_alias == current_alias => {
-          record.last_a_object_time = Some(ev.received_at);
-          record.last_a_group = Some(ev.group);
-        }
-        Some(_) => {}
-        None => break,
-      }
-    }
-  }
-  record.switch_decision_time = Some(Instant::now());
-  record.decision_a_group = record.last_a_group;
-  let mut freshness = FreshnessTracker::new(config.playout.jitter_buffer_ms, record.last_a_group);
-  info!(
-    "switch-warm: decision fired, decision_a_group={:?}",
-    record.decision_a_group
-  );
-
-  // Phase 2: send SWITCH message.
-  let switch_req_id = state.take_req_id();
-  let ns = Tuple::from_utf8_path(&config.namespace);
-  let switch = Switch::new(
-    switch_req_id,
-    ns,
-    TupleField::from_utf8(to_track),
-    current_req_id,
-    vec![],
-  );
-  cs.send(&ControlMessage::Switch(Box::new(switch)))
-    .await
-    .map_err(|e| anyhow::anyhow!("Switch send failed: {:?}", e))?;
-  record.control_messages += 1; // SWITCH
-
-  // Phase 3: wait for SubscribeOk for the switched B, then collect objects.
-  let post_deadline =
-    tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms.max(10_000));
-  let mut b_alias: Option<u64> = None;
-  let mut first_b_seen = false;
-
-  loop {
-    tokio::select! {
-      _ = tokio::time::sleep_until(post_deadline) => break,
-      ev = rx.recv() => match ev {
-        Some(ev) => {
-          if ev.track_alias == current_alias {
-            record.last_a_object_time = Some(ev.received_at);
-            record.trailing_a_bytes += ev.payload_size as u64;
-            record.a_objects_post_decision += 1;
-            if ev.object == 0 {
-              freshness.on_a_iframe(ev.group, ev.received_at);
-            }
-          } else if b_alias == Some(ev.track_alias) {
-            if record.first_b_object_time.is_none() {
-              record.first_b_object_time = Some(ev.received_at);
-              record.first_b_group = Some(ev.group);
-            }
-            if !first_b_seen {
-              if ev.object == 0 && freshness.is_b_iframe_fresh(ev.group) {
-                record.actual_switch_time = Some(ev.received_at);
-                record.switched_b_group = Some(ev.group);
-                record.group_boundary_aligned = Some(true);
-                first_b_seen = true;
-                info!("switch-warm: accepted fresh B I-frame, switched_b_group={}", ev.group);
-                record.useful_b_bytes += ev.payload_size as u64;
-              } else {
-                record.redundant_bytes += ev.payload_size as u64;
-                record.b_objects_pre_active += 1;
-              }
-            } else {
-              record.useful_b_bytes += ev.payload_size as u64;
-            }
-          }
-        }
-        None => break,
-      },
-      msg = cs.next_message() => match msg {
-        Ok(ControlMessage::SubscribeOk(m)) => {
-          info!("switch-warm: SubscribeOk for {}, alias={}", to_track, m.track_alias);
-          b_alias = Some(m.track_alias);
-        }
-        Ok(other) => info!("switch_warm: unexpected ctrl msg: {:?}", other),
-        Err(e) => { warn!("switch_warm: control stream error: {:?}", e); break; }
+        Ok(other) => info!("switch: unexpected ctrl msg: {:?}", other),
+        Err(e) => { warn!("switch: control stream error: {:?}", e); break; }
       }
     }
   }

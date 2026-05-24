@@ -43,10 +43,8 @@ pub enum DeliveryMode {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliSwitchMethod {
-  /// SWITCH message with no prior contact with B; relay waits for next live group (1 control message)
-  SwitchCold,
-  /// SWITCH message after pre-subscribing B to warm relay cache (2 control messages)
-  SwitchWarm,
+  /// SWITCH message (1 control message)
+  Switch,
   /// Pre-subscribe B; enable B at timer fire, tear down A on first live B group boundary (3 control messages)
   SubUpdateForward,
   /// Joining Fetch warm-up then stop A on first live B group boundary (4–5 control messages)
@@ -56,8 +54,7 @@ pub enum CliSwitchMethod {
 impl From<CliSwitchMethod> for SwitchMethod {
   fn from(m: CliSwitchMethod) -> Self {
     match m {
-      CliSwitchMethod::SwitchCold => SwitchMethod::SwitchCold,
-      CliSwitchMethod::SwitchWarm => SwitchMethod::SwitchWarm,
+      CliSwitchMethod::Switch => SwitchMethod::Switch,
       CliSwitchMethod::SubUpdateForward => SwitchMethod::SubUpdateForward,
       CliSwitchMethod::JoiningFetch => SwitchMethod::JoiningFetch,
     }
@@ -203,16 +200,12 @@ pub struct Cli {
   pub track_sequence: String,
 
   /// Switch method to use
-  #[arg(long, value_enum, default_value = "switch-cold")]
+  #[arg(long, value_enum, default_value = "switch")]
   pub method: CliSwitchMethod,
 
   /// Milliseconds to receive each track before triggering the next switch
   #[arg(long, default_value_t = 15000)]
   pub switch_after: u64,
-
-  /// How many seconds before the switch decision to pre-subscribe B for cache warming (switch-warm only)
-  #[arg(long, default_value_t = 2)]
-  pub switch_warm_lead_secs: u64,
 
   /// Bandwidth cap in bps recorded in the output JSON (0 = no limit)
   #[arg(long, default_value_t = 0)]
