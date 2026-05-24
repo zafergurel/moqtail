@@ -197,6 +197,60 @@ fi
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+write_metadata() {
+  local meta_file="$OUTPUT_DIR/experiment-metadata.json"
+  local methods_json
+  methods_json=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:]))" "${METHODS[@]}")
+
+  # Build scenario list: one line per scenario (label|sequence|bw_bps|delay_a_ms|delay_b_ms)
+  local tmp_scen
+  tmp_scen=$(mktemp)
+  local group_entry
+  for group_entry in "${PUB_GROUPS[@]}"; do
+    IFS='|' read -ra _gp <<< "$group_entry"
+    local _da="${_gp[1]}" _db="${_gp[2]}"
+    local _i
+    for (( _i=3; _i<${#_gp[@]}; _i++ )); do
+      local _lbl _seq _bw
+      IFS=':' read -r _lbl _seq _bw <<< "${_gp[$_i]}"
+      printf '%s|%s|%s|%s|%s\n' "$_lbl" "$_seq" "$_bw" "$_da" "$_db" >> "$tmp_scen"
+    done
+  done
+
+  python3 - "$tmp_scen" <<PYEOF
+import json, sys
+from pathlib import Path
+scenarios = []
+for line in open(sys.argv[1]).read().strip().splitlines():
+    lbl, seq, bw, da, db = line.split('|')
+    scenarios.append({"label": lbl, "sequence": seq,
+                       "bw_bps": int(bw), "delay_a_ms": int(da), "delay_b_ms": int(db)})
+meta = {
+    "source":           "experiment.sh",
+    "timestamp":        "$(date +%Y%m%d_%H%M%S)",
+    "relay_host":       "$RELAY_SSH",
+    "relay_host_ip":    "$RELAY_HOST_IP",
+    "relay_port":       $RELAY_PORT,
+    "subscriber_ip":    "$subscriber_ip",
+    "switch_after_ms":  $SWITCH_AFTER,
+    "jitter_buffer_ms": $JITTER_BUFFER_MS,
+    "reps":             $REPS,
+    "methods":          $methods_json,
+    "track_a":          "$TRACK_A",
+    "track_b":          "$TRACK_B",
+    "track_a_payload":  $TRACK_A_PAYLOAD,
+    "track_b_payload":  $TRACK_B_PAYLOAD,
+    "objects_per_group": $PUB_OBJECTS_PER_GROUP,
+    "interval_ms":      $PUB_INTERVAL_MS,
+    "group_count":      $PUB_GROUP_COUNT,
+    "scenarios":        scenarios,
+}
+Path("$meta_file").write_text(json.dumps(meta, indent=2) + "\n")
+PYEOF
+  rm -f "$tmp_scen"
+  log "Metadata: $meta_file"
+}
+
 relay_ssh() { ssh -o ConnectTimeout=10 "$RELAY_SSH" "$@"; }
 pub_ssh()   {
   if [ -n "$PUB_SSH" ]; then
@@ -490,6 +544,7 @@ main() {
 
   mkdir -p "$OUTPUT_DIR"
   log "Results:       $OUTPUT_DIR"
+  write_metadata
 
   if "$BUILD"; then
     do_build

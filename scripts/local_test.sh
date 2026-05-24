@@ -119,6 +119,45 @@ done
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+write_metadata() {
+  local meta_file="$OUTPUT_DIR/experiment-metadata.json"
+  local methods_json
+  methods_json=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:]))" "${METHODS[@]}")
+
+  # Derive track_a / track_b from first and last elements of TRACK_SEQUENCE
+  local _track_a _track_b
+  IFS=',' read -ra _seq <<< "$TRACK_SEQUENCE"
+  _track_a="${_seq[0]}"
+  _track_b="${_seq[-1]}"
+
+  python3 - <<PYEOF
+import json
+from pathlib import Path
+meta = {
+    "source":           "local_test.sh",
+    "timestamp":        "$(date +%Y%m%d_%H%M%S)",
+    "relay_host":       "127.0.0.1",
+    "relay_port":       $RELAY_PORT,
+    "switch_after_ms":  $SWITCH_AFTER,
+    "jitter_buffer_ms": $JITTER_BUFFER_MS,
+    "reps":             $REPS,
+    "methods":          $methods_json,
+    "track_a":          "$_track_a",
+    "track_b":          "$_track_b",
+    "track_sequence":   "$TRACK_SEQUENCE",
+    "objects_per_group": $PUB_OBJECTS_PER_GROUP,
+    "interval_ms":      $PUB_INTERVAL_MS,
+    "group_count":      $PUB_GROUP_COUNT,
+    "scenarios": [
+        {"label": "$SCENARIO", "sequence": "$TRACK_SEQUENCE",
+         "bw_bps": 0, "delay_a_ms": 0, "delay_b_ms": 0}
+    ],
+}
+Path("$meta_file").write_text(json.dumps(meta, indent=2) + "\n")
+PYEOF
+  log "Metadata: $meta_file"
+}
+
 # ── Build ──────────────────────────────────────────────────────────────────────
 
 do_build() {
@@ -244,6 +283,7 @@ main() {
 
   mkdir -p "$OUTPUT_DIR"
   log "Results:        $OUTPUT_DIR"
+  write_metadata
 
   if "$BUILD" || ! "$SKIP_START"; then
     do_build
