@@ -15,7 +15,7 @@
 #   --track-sequence <s>   Comma-separated track sequence, e.g. "2,3,4"
 #                          When given, each run performs M switches (M = len-1).
 #                          Default: "2,3" (single switch, 720p → 480p)
-#   --switch-after <secs>  Seconds per track before triggering next switch (default: 15)
+#   --switch-after <ms>    Milliseconds per track before triggering next switch (default: 5000)
 #   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 0)
 #   --reps <n>             Repetitions per method (default: 3)
 #   --tracks <spec>        Track specs for publish-multi, e.g. "1:20000,2:12500,3:5000"
@@ -48,9 +48,9 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ALL_METHODS=("switch-message" "sub-update-forward" "joining-fetch")
 # Default track sequence: single upswitch 480p→720p (lower number = lower bitrate)
-TRACK_SEQUENCE="2,3"
-SWITCH_AFTER=15
-JITTER_BUFFER_MS=40
+TRACK_SEQUENCE="3,4"
+SWITCH_AFTER=5000
+JITTER_BUFFER_MS=500
 REPS=3
 RELAY_PORT=4433
 RELAY_URL="https://127.0.0.1:${RELAY_PORT}"
@@ -181,7 +181,7 @@ start_publisher() {
 
   # Wait a moment so the relay has received at least a couple of groups
   # from every track before the first switch-test run starts.
-  local warmup=$(( SWITCH_AFTER > 5 ? 5 : SWITCH_AFTER ))
+  local warmup=$(( SWITCH_AFTER > 5000 ? 5 : SWITCH_AFTER / 1000 ))
   log "Publisher PID $(cat "$PUB_PID_FILE") — waiting ${warmup}s for initial cache warm-up..."
   sleep "$warmup"
 }
@@ -236,7 +236,7 @@ main() {
   log "Scenario:       $SCENARIO"
   log "Track sequence: $TRACK_SEQUENCE"
   log "Tracks:         $PUB_TRACKS"
-  log "Switch after:   ${SWITCH_AFTER}s"
+  log "Switch after:   ${SWITCH_AFTER}ms"
   log "Jitter buffer:  ${JITTER_BUFFER_MS}ms"
   log "Reps:           $REPS"
   log "Publisher:      local (publish-multi)"
@@ -245,7 +245,7 @@ main() {
   mkdir -p "$OUTPUT_DIR"
   log "Results:        $OUTPUT_DIR"
 
-  if "$BUILD"; then
+  if "$BUILD" || ! "$SKIP_START"; then
     do_build
   fi
 
@@ -269,6 +269,12 @@ main() {
   done
 
   log "All done. Results in $OUTPUT_DIR"
+
+  local summary_file="$OUTPUT_DIR/results.md"
+  python3 "$ROOT_DIR/results/summarize.py" "$OUTPUT_DIR" > "$summary_file" 2>&1 \
+    && log "Summary: $summary_file" \
+    || log "WARNING: summarize.py failed"
+
   # cleanup via trap
 }
 

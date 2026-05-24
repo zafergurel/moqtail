@@ -34,7 +34,10 @@ pub struct SwitchRecord {
   // Internal timing (used to compute derived fields, not serialised directly)
   pub switch_decision_time: Option<Instant>,
   pub last_a_object_time: Option<Instant>,
+  /// Time the first B object of any kind arrived (any object_id).
   pub first_b_object_time: Option<Instant>,
+  /// Time the first decodable B frame arrived (object_id == 0). Used for switch_delay_ms.
+  pub actual_switch_time: Option<Instant>,
   // Byte-level bookkeeping
   /// Joining-fetch warm-up bytes (B objects delivered before first live B object)
   pub redundant_bytes: u64,
@@ -51,6 +54,7 @@ pub struct SwitchRecord {
   pub group_boundary_aligned: Option<bool>,
   pub last_a_group: Option<u64>,
   pub first_b_group: Option<u64>,
+  pub switched_b_group: Option<u64>,
 }
 
 impl SwitchRecord {
@@ -61,6 +65,7 @@ impl SwitchRecord {
       switch_decision_time: None,
       last_a_object_time: None,
       first_b_object_time: None,
+      actual_switch_time: None,
       redundant_bytes: 0,
       trailing_a_bytes: 0,
       useful_b_bytes: 0,
@@ -70,12 +75,35 @@ impl SwitchRecord {
       group_boundary_aligned: None,
       last_a_group: None,
       first_b_group: None,
+      switched_b_group: None,
     }
   }
 
-  /// Milliseconds between switch decision and first B object.
-  /// Negative means the first B object arrived before the decision (JoiningFetch pre-warm-up case).
+  /// Milliseconds between switch decision and first decodable B frame (object_id == 0).
+  /// Negative means the decodable frame arrived before the decision (JoiningFetch pre-warm-up case).
   pub fn switch_delay_ms(&self) -> Option<i128> {
+    let decision = self.switch_decision_time?;
+    let actual = self.actual_switch_time?;
+    if actual >= decision {
+      Some(actual.duration_since(decision).as_millis() as i128)
+    } else {
+      Some(-(decision.duration_since(actual).as_millis() as i128))
+    }
+  }
+
+  /// Signed ms from switch decision to the last A object received.
+  pub fn last_a_object_time_ms(&self) -> Option<i128> {
+    let decision = self.switch_decision_time?;
+    let last_a = self.last_a_object_time?;
+    if last_a >= decision {
+      Some(last_a.duration_since(decision).as_millis() as i128)
+    } else {
+      Some(-(decision.duration_since(last_a).as_millis() as i128))
+    }
+  }
+
+  /// Signed ms from switch decision to the first B object received (any object_id).
+  pub fn first_b_object_time_ms(&self) -> Option<i128> {
     let decision = self.switch_decision_time?;
     let first_b = self.first_b_object_time?;
     if first_b >= decision {
@@ -85,17 +113,17 @@ impl SwitchRecord {
     }
   }
 
-  /// Raw signed gap: t_first_b − (t_last_a + frame_interval_ms).
-  /// Positive = B arrived after next expected frame; negative = overlap.
+  /// Gap between last A frame and first decodable B frame, minus one frame interval.
+  /// Clamped to 0: negative means B arrived before the next expected slot (no gap).
   pub fn delivery_gap_ms(&self, frame_interval_ms: u64) -> Option<i128> {
     let last_a = self.last_a_object_time?;
-    let first_b = self.first_b_object_time?;
-    let raw: i128 = if first_b >= last_a {
-      first_b.duration_since(last_a).as_millis() as i128
+    let actual = self.actual_switch_time?;
+    let raw: i128 = if actual >= last_a {
+      actual.duration_since(last_a).as_millis() as i128
     } else {
-      -(last_a.duration_since(first_b).as_millis() as i128)
+      -(last_a.duration_since(actual).as_millis() as i128)
     };
-    Some(raw - frame_interval_ms as i128)
+    Some((raw - frame_interval_ms as i128).max(0))
   }
 
   /// Stall duration in ms (jitter-buffer model).
@@ -181,7 +209,10 @@ impl SwitchRecord {
         "    \"aetr\": {},\n",
         "    \"a_objects_post_decision\": {},\n",
         "    \"last_a_group\": {},\n",
-        "    \"first_b_group\": {}\n",
+        "    \"first_b_group\": {},\n",
+        "    \"switched_b_group\": {},\n",
+        "    \"last_a_object_time_ms\": {},\n",
+        "    \"first_b_object_time_ms\": {}\n",
         "  }}"
       ),
       self.track_from,
@@ -200,6 +231,9 @@ impl SwitchRecord {
       self.a_objects_post_decision,
       Self::opt_u64(self.last_a_group),
       Self::opt_u64(self.first_b_group),
+      Self::opt_u64(self.switched_b_group),
+      Self::opt_i128(self.last_a_object_time_ms()),
+      Self::opt_i128(self.first_b_object_time_ms()),
     )
   }
 }

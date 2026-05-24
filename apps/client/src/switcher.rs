@@ -42,7 +42,7 @@ pub struct SwitchTestConfig {
   pub track_a: String,
   pub track_b: String,
   pub method: SwitchMethod,
-  pub switch_after_secs: u64,
+  pub switch_after_ms: u64,
   pub bandwidth_cap_bps: u64,
   pub output_json: Option<String>,
   pub playout: crate::stats::PlayoutConfig,
@@ -126,7 +126,7 @@ struct PhaseResult {
 async fn receiver_task(
   conn: Arc<wtransport::Connection>,
   pending_fetches: Arc<RwLock<BTreeMap<u64, FetchRequest>>>,
-  tx: mpsc::Sender<ObjectEvent>,
+  tx: mpsc::UnboundedSender<ObjectEvent>,
 ) {
   loop {
     match conn.accept_uni().await {
@@ -147,7 +147,7 @@ async fn receiver_task(
                   payload_size: obj.payload.as_ref().map_or(0, |p| p.len()),
                   received_at: Instant::now(),
                 };
-                if tx_clone.send(event).await.is_err() {
+                if tx_clone.send(event).is_err() {
                   return;
                 }
                 handler = next_handler;
@@ -243,7 +243,7 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
   .await?;
 
   // Start the background receiver task.
-  let (tx, mut rx) = mpsc::channel::<ObjectEvent>(2000);
+  let (tx, mut rx) = mpsc::unbounded_channel::<ObjectEvent>();
   let conn_clone = connection.clone();
   let pf_clone = pending_fetches.clone();
   tokio::spawn(async move { receiver_task(conn_clone, pf_clone, tx).await });
@@ -307,96 +307,11 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
       }
 
       SwitchMethod::JoiningFetch => {
-        // Subscribe to B (LatestObject). Inspect LargestObject in SubscribeOk
-        // to decide whether to FETCH the beginning of the current group.
-        let b_req_id = state.take_req_id();
-        let subscribe = Subscribe::new_latest_object(
-          b_req_id,
-          Tuple::from_utf8_path(&config.namespace),
-          TupleField::from_utf8(to_track),
-          vec![
-            MessageParameter::new_subscriber_priority(200),
-            MessageParameter::new_forward(true),
-          ],
-        );
-        control_stream
-          .send(&ControlMessage::Subscribe(Box::new(subscribe)))
-          .await
-          .map_err(|e| anyhow::anyhow!("Subscribe send failed: {:?}", e))?;
-
-        let (b_alias, had_fetch) = match control_stream.next_message().await {
-          Ok(ControlMessage::SubscribeOk(m)) => {
-            let alias = m.track_alias;
-            info!(
-              "JoiningFetch: SubscribeOk for {}, alias={}",
-              to_track, alias
-            );
-
-            let largest = m.subscribe_parameters.iter().find_map(|p| {
-              if let MessageParameter::LargestObject { location } = p {
-                Some(location.clone())
-              } else {
-                None
-              }
-            });
-
-            let did_fetch = if let Some(loc) = largest {
-              if loc.object > 0 {
-                // B is mid-group: issue a Joining Fetch to deliver [I-frame … LargestObject].
-                let fetch_req_id = state.take_req_id();
-                let fetch = Fetch::new_joining(
-                  fetch_req_id,
-                  FetchType::RelativeFetch,
-                  b_req_id,
-                  0,
-                  vec![MessageParameter::new_subscriber_priority(200)],
-                )
-                .map_err(|e| anyhow::anyhow!("Fetch::new_joining: {}", e))?;
-                control_stream
-                  .send(&ControlMessage::Fetch(Box::new(fetch.clone())))
-                  .await
-                  .map_err(|e| anyhow::anyhow!("Fetch send failed: {:?}", e))?;
-                pending_fetches
-                  .write()
-                  .await
-                  .insert(fetch_req_id, FetchRequest::new(fetch_req_id, 0, fetch, 0));
-                loop {
-                  match control_stream.next_message().await {
-                    Ok(ControlMessage::FetchOk(m)) => {
-                      info!("JoiningFetch FetchOk: {:?}", m);
-                      break;
-                    }
-                    Ok(ControlMessage::RequestOk(m)) => info!("JoiningFetch RequestOk: {:?}", m),
-                    Ok(ControlMessage::RequestError(e)) => {
-                      anyhow::bail!("JoiningFetch RequestError: {:?}", e)
-                    }
-                    Ok(m) => warn!("JoiningFetch: unexpected msg after Fetch: {:?}", m),
-                    Err(e) => anyhow::bail!("JoiningFetch: error reading FetchOk: {:?}", e),
-                  }
-                }
-                true
-              } else {
-                info!("JoiningFetch: B at group boundary, no fetch needed");
-                false
-              }
-            } else {
-              info!("JoiningFetch: no LargestObject in SubscribeOk");
-              false
-            };
-
-            (alias, did_fetch)
-          }
-          Ok(m) => anyhow::bail!("Expected SubscribeOk for {}, got {:?}", to_track, m),
-          Err(e) => anyhow::bail!("Error waiting SubscribeOk for {}: {:?}", to_track, e),
-        };
-
         run_joining_fetch_phase(
           &mut control_stream,
           &mut rx,
           &mut state,
-          b_alias,
-          b_req_id,
-          had_fetch,
+          &pending_fetches,
           from_track,
           to_track,
           &config,
@@ -429,7 +344,7 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
 
 async fn run_switch_message_phase(
   cs: &mut moqtail::transport::control_stream_handler::ControlStreamHandler,
-  rx: &mut mpsc::Receiver<ObjectEvent>,
+  rx: &mut mpsc::UnboundedReceiver<ObjectEvent>,
   state: &mut SwitchState,
   from_track: &str,
   to_track: &str,
@@ -440,10 +355,13 @@ async fn run_switch_message_phase(
   let current_req_id = state.current_req_id;
 
   // Phase 1: receive current track objects for switch_after_secs.
-  let deadline = tokio::time::Instant::now() + Duration::from_secs(config.switch_after_secs);
+  let deadline = tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms);
   loop {
     tokio::select! {
-      _ = tokio::time::sleep_until(deadline) => break,
+      _ = tokio::time::sleep_until(deadline) => {
+        record.switch_decision_time = Some(Instant::now());
+        break
+      },
       ev = rx.recv() => match ev {
         Some(ev) if ev.track_alias == current_alias => {
           record.last_a_object_time = Some(ev.received_at);
@@ -468,12 +386,11 @@ async fn run_switch_message_phase(
   cs.send(&ControlMessage::Switch(Box::new(switch)))
     .await
     .map_err(|e| anyhow::anyhow!("Switch send failed: {:?}", e))?;
-  record.switch_decision_time = Some(Instant::now());
   record.control_messages += 1;
 
   // Phase 3: wait for SubscribeOk for B, then collect post-switch objects.
   let post_deadline =
-    tokio::time::Instant::now() + Duration::from_secs(config.switch_after_secs.max(10));
+    tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms.max(10_000));
   let mut b_alias: Option<u64> = None;
   let mut first_b_seen = false;
 
@@ -487,13 +404,17 @@ async fn run_switch_message_phase(
             record.trailing_a_bytes += ev.payload_size as u64;
             record.a_objects_post_decision += 1;
           } else if b_alias == Some(ev.track_alias) {
+            if record.first_b_object_time.is_none() {
+              record.first_b_object_time = Some(ev.received_at);
+              record.first_b_group = Some(ev.group);
+            }
             if !first_b_seen {
               if ev.object == 0 {
-                record.first_b_object_time = Some(ev.received_at);
-                record.first_b_group = Some(ev.group);
+                record.actual_switch_time = Some(ev.received_at);
+                record.switched_b_group = Some(ev.group);
                 record.group_boundary_aligned = Some(true);
                 first_b_seen = true;
-                info!("First B I-frame (switch-message): group={}", ev.group);
+                info!("First B I-frame (switch-message): switched_b_group={}", ev.group);
                 record.useful_b_bytes += ev.payload_size as u64;
               } else {
                 // Pre-boundary object from relay catch-up (shouldn't normally occur)
@@ -533,7 +454,7 @@ async fn run_switch_message_phase(
 
 async fn run_sub_update_forward_phase(
   cs: &mut moqtail::transport::control_stream_handler::ControlStreamHandler,
-  rx: &mut mpsc::Receiver<ObjectEvent>,
+  rx: &mut mpsc::UnboundedReceiver<ObjectEvent>,
   state: &mut SwitchState,
   b_alias: u64,
   b_req_id: u64,
@@ -547,10 +468,13 @@ async fn run_sub_update_forward_phase(
   let current_req_id = state.current_req_id;
 
   // Phase 1: receive A objects for switch_after_secs.
-  let deadline = tokio::time::Instant::now() + Duration::from_secs(config.switch_after_secs);
+  let deadline = tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms);
   loop {
     tokio::select! {
-      _ = tokio::time::sleep_until(deadline) => break,
+      _ = tokio::time::sleep_until(deadline) => {
+        record.switch_decision_time = Some(Instant::now());
+        break
+      },
       ev = rx.recv() => match ev {
         Some(ev) if ev.track_alias == current_alias => {
           record.last_a_object_time = Some(ev.received_at);
@@ -571,12 +495,11 @@ async fn run_sub_update_forward_phase(
     vec![MessageParameter::new_forward(true)],
   )
   .await?;
-  record.switch_decision_time = Some(Instant::now());
   record.control_messages += 1;
 
   // Phase 3: drain A and B concurrently; tear down A on first live B object.
   let post_deadline =
-    tokio::time::Instant::now() + Duration::from_secs(config.switch_after_secs.max(10));
+    tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms.max(10_000));
   let mut first_b_seen = false;
   let mut post_b_deadline: Option<tokio::time::Instant> = None;
 
@@ -595,14 +518,18 @@ async fn run_sub_update_forward_phase(
             record.trailing_a_bytes += ev.payload_size as u64;
             record.a_objects_post_decision += 1;
           } else if ev.track_alias == b_alias {
+            if record.first_b_object_time.is_none() {
+              record.first_b_object_time = Some(ev.received_at);
+              record.first_b_group = Some(ev.group);
+            }
             if !first_b_seen {
               if ev.object == 0 {
                 // Group boundary reached — B is now decodable.
-                record.first_b_object_time = Some(ev.received_at);
-                record.first_b_group = Some(ev.group);
+                record.actual_switch_time = Some(ev.received_at);
+                record.switched_b_group = Some(ev.group);
                 record.group_boundary_aligned = Some(true);
                 first_b_seen = true;
-                info!("First B group boundary (sub-update-forward): group={}", ev.group);
+                info!("First B group boundary (sub-update-forward): switched_b_group={}", ev.group);
 
                 // Tear down A now that B has an I-frame.
                 let ru_req_a = state.take_req_id();
@@ -647,30 +574,143 @@ async fn run_sub_update_forward_phase(
 
 async fn run_joining_fetch_phase(
   cs: &mut moqtail::transport::control_stream_handler::ControlStreamHandler,
-  rx: &mut mpsc::Receiver<ObjectEvent>,
+  rx: &mut mpsc::UnboundedReceiver<ObjectEvent>,
   state: &mut SwitchState,
-  b_alias: u64,
-  b_req_id: u64,
-  had_fetch: bool,
+  pending_fetches: &Arc<RwLock<BTreeMap<u64, FetchRequest>>>,
   from_track: &str,
   to_track: &str,
   config: &SwitchTestConfig,
 ) -> Result<PhaseResult> {
   let mut record = SwitchRecord::new(from_track, to_track);
-  record.control_messages = if had_fetch { 2 } else { 1 };
-  record.switch_decision_time = Some(Instant::now());
   let current_alias = state.current_alias;
   let current_req_id = state.current_req_id;
 
-  let overall_deadline =
-    tokio::time::Instant::now() + Duration::from_secs(config.switch_after_secs * 2 + 30);
+  info!(
+    "joining-fetch: Phase1 start, current_alias={}, switch_after_ms={}",
+    current_alias, config.switch_after_ms
+  );
+
+  // Phase 1: collect A for switch_after_secs, then set switch_decision_time.
+  let deadline = tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms);
+  loop {
+    tokio::select! {
+      _ = tokio::time::sleep_until(deadline) => {
+        record.switch_decision_time = Some(Instant::now());
+        info!(
+          "joining-fetch: Phase1 done, last_a_group={:?}",
+          record.last_a_group
+        );
+        break;
+      },
+      ev = rx.recv() => match ev {
+        Some(ev) if ev.track_alias == current_alias => {
+          record.last_a_object_time = Some(ev.received_at);
+          record.last_a_group = Some(ev.group);
+        }
+        Some(ev) => {
+          info!(
+            "joining-fetch: Phase1 unexpected track_alias={} (want {}), group={}, object={}",
+            ev.track_alias, current_alias, ev.group, ev.object
+          );
+        }
+        None => return Ok(PhaseResult {
+          record,
+          new_alias: current_alias,
+          new_req_id: current_req_id,
+        }),
+      }
+    }
+  }
+
+  // Phase 2: send Subscribe-B, await SubscribeOk, optionally send FETCH.
+  let b_req_id = state.take_req_id();
+  let subscribe = Subscribe::new_latest_object(
+    b_req_id,
+    Tuple::from_utf8_path(&config.namespace),
+    TupleField::from_utf8(to_track),
+    vec![
+      MessageParameter::new_subscriber_priority(200),
+      MessageParameter::new_forward(true),
+    ],
+  );
+  cs.send(&ControlMessage::Subscribe(Box::new(subscribe)))
+    .await
+    .map_err(|e| anyhow::anyhow!("Subscribe send failed: {:?}", e))?;
+  record.control_messages += 1;
+
+  let b_alias = match cs.next_message().await {
+    Ok(ControlMessage::SubscribeOk(m)) => {
+      let alias = m.track_alias;
+      info!(
+        "JoiningFetch: SubscribeOk for {}, alias={}",
+        to_track, alias
+      );
+
+      let largest = m.subscribe_parameters.iter().find_map(|p| {
+        if let MessageParameter::LargestObject { location } = p {
+          Some(location.clone())
+        } else {
+          None
+        }
+      });
+
+      if let Some(loc) = largest {
+        if loc.object > 0 {
+          // B is mid-group: issue a Joining Fetch to deliver [I-frame … LargestObject].
+          let fetch_req_id = state.take_req_id();
+          let fetch = Fetch::new_joining(
+            fetch_req_id,
+            FetchType::RelativeFetch,
+            b_req_id,
+            0,
+            vec![MessageParameter::new_subscriber_priority(200)],
+          )
+          .map_err(|e| anyhow::anyhow!("Fetch::new_joining: {}", e))?;
+          cs.send(&ControlMessage::Fetch(Box::new(fetch.clone())))
+            .await
+            .map_err(|e| anyhow::anyhow!("Fetch send failed: {:?}", e))?;
+          pending_fetches
+            .write()
+            .await
+            .insert(fetch_req_id, FetchRequest::new(fetch_req_id, 0, fetch, 0));
+          record.control_messages += 1;
+          loop {
+            match cs.next_message().await {
+              Ok(ControlMessage::FetchOk(m)) => {
+                info!("JoiningFetch FetchOk: {:?}", m);
+                break;
+              }
+              Ok(ControlMessage::RequestOk(m)) => info!("JoiningFetch RequestOk: {:?}", m),
+              Ok(ControlMessage::RequestError(e)) => {
+                anyhow::bail!("JoiningFetch RequestError: {:?}", e)
+              }
+              Ok(m) => warn!("JoiningFetch: unexpected msg after Fetch: {:?}", m),
+              Err(e) => anyhow::bail!("JoiningFetch: error reading FetchOk: {:?}", e),
+            }
+          }
+        } else {
+          info!("JoiningFetch: B at group boundary, no fetch needed");
+        }
+      } else {
+        info!("JoiningFetch: no LargestObject in SubscribeOk");
+      }
+
+      alias
+    }
+    Ok(m) => anyhow::bail!("Expected SubscribeOk for {}, got {:?}", to_track, m),
+    Err(e) => anyhow::bail!("Error waiting SubscribeOk for {}: {:?}", to_track, e),
+  };
+
+  // Phase 3: collect B until first I-frame, then 5-second tail (mirrors sub-update-forward).
+  let post_deadline =
+    tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms.max(10_000));
   let mut first_b_seen = false;
   let mut post_b_deadline: Option<tokio::time::Instant> = None;
 
   loop {
     let maybe_post = post_b_deadline;
     tokio::select! {
-      _ = tokio::time::sleep_until(overall_deadline) => break,
+      _ = tokio::time::sleep_until(post_deadline) => break,
       _ = async {
         if let Some(d) = maybe_post { tokio::time::sleep_until(d).await }
         else { std::future::pending::<()>().await }
@@ -681,12 +721,16 @@ async fn run_joining_fetch_phase(
             // Standalone-fetch warm-up object.
             record.b_objects_pre_active += 1;
             record.redundant_bytes += ev.payload_size as u64;
-            if !first_b_seen && ev.object == 0 {
+            if record.first_b_object_time.is_none() {
               record.first_b_object_time = Some(ev.received_at);
               record.first_b_group = Some(ev.group);
+            }
+            if !first_b_seen && ev.object == 0 {
+              record.actual_switch_time = Some(ev.received_at);
+              record.switched_b_group = Some(ev.group);
               record.group_boundary_aligned = Some(true);
               first_b_seen = true;
-              info!("First B I-frame via fetch (joining-fetch): group={}", ev.group);
+              info!("First B I-frame via fetch (joining-fetch): switched_b_group={}", ev.group);
 
               let ru_a_req = state.take_req_id();
               if let Err(e) = send_request_update(
@@ -717,19 +761,22 @@ async fn run_joining_fetch_phase(
               record.a_objects_post_decision += 1;
             }
           } else if ev.track_alias == b_alias {
+            if record.first_b_object_time.is_none() {
+              record.first_b_object_time = Some(ev.received_at);
+              record.first_b_group = Some(ev.group);
+            }
             if !first_b_seen {
               if ev.object != 0 {
                 // Pre-boundary live object — not yet decodable.
                 record.b_objects_pre_active += 1;
                 record.redundant_bytes += ev.payload_size as u64;
               } else {
-                record.first_b_object_time = Some(ev.received_at);
-                record.first_b_group = Some(ev.group);
+                record.actual_switch_time = Some(ev.received_at);
+                record.switched_b_group = Some(ev.group);
                 record.group_boundary_aligned = Some(true);
                 first_b_seen = true;
-                info!("First live B group boundary (joining-fetch): group={}", ev.group);
+                info!("First live B group boundary (joining-fetch): switched_b_group={}", ev.group);
 
-                // Stop A (forward=false), raise B priority.
                 let ru_a_req = state.take_req_id();
                 if let Err(e) = send_request_update(
                   cs, ru_a_req, current_req_id,
@@ -749,8 +796,6 @@ async fn run_joining_fetch_phase(
                   break;
                 }
                 record.control_messages += 1;
-
-                // Collect trailing A for 5 more seconds then stop.
                 post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
                 record.useful_b_bytes += ev.payload_size as u64;
               }

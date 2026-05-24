@@ -16,7 +16,7 @@
 #   --skip-start         Assume relay is already running (publisher restarted per group)
 #   --method  <name>     Only run this method (repeatable; default: all three)
 #   --reps <n>           Repetitions per condition (default: 3)
-#   --switch-after <s>   Seconds per track before triggering the switch (default: 5)
+#   --switch-after <ms>  Milliseconds per track before triggering the switch (default: 5000)
 #   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 40)
 #   --objects-per-group <n>  Objects per group (default: 25, i.e. 1s GOP at 25fps)
 #   --interval <ms>      Inter-object interval in ms (default: 40, i.e. 25fps)
@@ -84,7 +84,7 @@ fi
 # ── Experiment defaults ─────────────────────────────────────────────────────────
 
 ALL_METHODS=("switch-message" "sub-update-forward" "joining-fetch")
-SWITCH_AFTER=5
+SWITCH_AFTER=5000
 JITTER_BUFFER_MS=40
 REPS=3
 TC_MARK=1
@@ -320,8 +320,8 @@ PYEOF"
     log "Publisher PID $(cat "$PUB_PID_FILE")"
   fi
 
-  log "Waiting ${SWITCH_AFTER}s for initial cache warm-up..."
-  sleep "$SWITCH_AFTER"
+  log "Waiting $(( SWITCH_AFTER / 1000 ))s for initial cache warm-up..."
+  sleep $(( SWITCH_AFTER / 1000 ))
 }
 
 stop_publisher() {
@@ -482,7 +482,7 @@ main() {
   log "Relay:         $RELAY_SSH  ($RELAY_HOST_IP:$RELAY_PORT)"
   log "Publisher:     ${PUB_SSH:-local}"
   log "Methods:       ${METHODS[*]}"
-  log "Switch after:  ${SWITCH_AFTER}s"
+  log "Switch after:  ${SWITCH_AFTER}ms"
   log "Jitter buffer: ${JITTER_BUFFER_MS}ms"
   log "Reps:          $REPS"
   log "Subscriber IP: $subscriber_ip"

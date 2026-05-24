@@ -203,8 +203,8 @@ pub struct Cli {
   #[arg(long, value_enum, default_value = "switch-message")]
   pub method: CliSwitchMethod,
 
-  /// Seconds to receive each track before triggering the next switch
-  #[arg(long, default_value_t = 15)]
+  /// Milliseconds to receive each track before triggering the next switch
+  #[arg(long, default_value_t = 15000)]
   pub switch_after: u64,
 
   /// Bandwidth cap in bps recorded in the output JSON (0 = no limit)

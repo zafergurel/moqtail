@@ -19,7 +19,7 @@
 #   --bandwidth <bps>    Only run at this bandwidth; 0 = no limit (repeatable; default: all)
 #   --track-sequence <s> Comma-separated track sequence, e.g. "2,3,4,3,2"
 #                        Default: "2,3,4,3,2" (up-up-down-down across 4 bitrates)
-#   --switch-after <s>   Seconds before triggering each switch (default: 15)
+#   --switch-after <ms>  Milliseconds before triggering each switch (default: 15000)
 #   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 100)
 #   --reps <n>           Repetitions per condition (default: 3)
 #   --output <dir>       Results directory (default: results/YYYYMMDD_HHMMSS)
@@ -64,7 +64,7 @@ ALL_BANDWIDTHS=(0 5000000 3000000 2000000 1500000 1000000)
 # Track sequence: lower index = lower bitrate (matches ffmpeg.sh ordering)
 #   track 1=360p/500kbps, 2=480p/1Mbps, 3=720p/2.5Mbps, 4=1080p/4Mbps
 TRACK_SEQUENCE="2,3,4,3,2"
-SWITCH_AFTER=15       # seconds before triggering each switch
+SWITCH_AFTER=15000    # milliseconds before triggering each switch
 JITTER_BUFFER_MS=40   # ms; one frame at 25fps
 REPS=3
 TC_MARK=1         # iptables mark; use a consistent value per subscriber (1–255)
@@ -269,7 +269,7 @@ main() {
   log "Methods:        ${METHODS[*]}"
   log "Bandwidths:     ${BANDWIDTHS[*]} bps"
   log "Track sequence: $TRACK_SEQUENCE"
-  log "Switch after:   ${SWITCH_AFTER}s"
+  log "Switch after:   ${SWITCH_AFTER}ms"
   log "Jitter buffer:  ${JITTER_BUFFER_MS}ms"
   log "Reps:           $REPS"
 

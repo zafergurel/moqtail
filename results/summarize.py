@@ -37,19 +37,84 @@ SCENARIOS = [
 def load_runs(results_dir: Path):
     """Return dict[method][scenario] = list of JSON dicts (one per rep)."""
     data = {m: {s: [] for s in SCENARIOS} for m in METHODS}
-    pattern = re.compile(r"^(.+)_([^_]+)_rep(\d+)\.json$")
     for f in sorted(results_dir.glob("*.json")):
-        m = pattern.match(f.name)
-        if not m:
-            continue
-        method, scenario, _rep = m.group(1), m.group(2), m.group(3)
-        if method not in data or scenario not in data[method]:
-            continue
-        try:
-            data[method][scenario].append(json.loads(f.read_text()))
-        except Exception:
-            pass
+        name = f.stem  # e.g. joining-fetch_rp_a2b_a500_rep1
+        for method in METHODS:
+            prefix = method + "_"
+            if not name.startswith(prefix):
+                continue
+            rest = name[len(prefix):]  # e.g. rp_a2b_a500_rep1
+            idx = rest.rfind("_rep")
+            if idx < 0:
+                break
+            scenario = rest[:idx]
+            if scenario not in data[method]:
+                break
+            try:
+                data[method][scenario].append(json.loads(f.read_text()))
+            except Exception:
+                pass
+            break
     return data
+
+
+def load_all_runs(results_dir: Path):
+    """Return dict[method][scenario] = list of JSON dicts for any scenario."""
+    data: dict = {}
+    for f in sorted(results_dir.glob("*.json")):
+        name = f.stem
+        for method in METHODS:
+            prefix = method + "_"
+            if not name.startswith(prefix):
+                continue
+            rest = name[len(prefix):]
+            idx = rest.rfind("_rep")
+            if idx < 0:
+                break
+            scenario = rest[:idx]
+            data.setdefault(method, {}).setdefault(scenario, [])
+            try:
+                data[method][scenario].append(json.loads(f.read_text()))
+            except Exception:
+                pass
+            break
+    return data
+
+
+def print_generic_summary(data: dict):
+    all_scenarios: list = sorted({s for m in data.values() for s in m})
+    if not all_scenarios:
+        print("No result files found.")
+        return
+
+    col_w = 12
+    label_w = 22
+
+    for metric_name, extractor in [
+        ("Delay (ms)", lambda r, i: (r.get("switches") or [{}])[i].get("switch_delay_ms")),
+        ("Stall (ms)", lambda r, i: (r.get("switches") or [{}])[i].get("stall_ms")),
+        ("AETR",       lambda r, i: r.get("aetr")),
+    ]:
+        print(f"\n  {metric_name}")
+        print("  " + f"{'Method/Scenario':<{label_w}}" + "".join(f"{s:>{col_w}}" for s in all_scenarios))
+        print("  " + "-" * (label_w + col_w * len(all_scenarios)))
+        for method in METHODS:
+            if method not in data:
+                continue
+            row_vals = []
+            for scen in all_scenarios:
+                runs = data[method].get(scen, [])
+                # collect value for switch index 0 across all reps
+                vals = []
+                for r in runs:
+                    sw = r.get("switches") or []
+                    if metric_name == "AETR":
+                        v = r.get("aetr")
+                    else:
+                        v = sw[0].get("switch_delay_ms" if "Delay" in metric_name else "stall_ms") if sw else None
+                    vals.append(v)
+                row_vals.append(avg(vals, decimals=4 if metric_name == "AETR" else 0))
+            print("  " + f"{method:<{label_w}}" + "".join(f"{str(v):>{col_w}}" for v in row_vals))
 
 
 def print_section(title, rows):
@@ -68,6 +133,12 @@ def print_section(title, rows):
 
 def main(results_dir: Path):
     data = load_runs(results_dir)
+
+    if not any(data[m][s] for m in METHODS for s in SCENARIOS):
+        print(f"\nGeneric summary: {results_dir}")
+        print_generic_summary(load_all_runs(results_dir))
+        return
+
 
     # ── Relative-position table (latency + freeze) ──────────────────────────────
     rp_scenarios_a2b = [s for s in SCENARIOS if s.startswith("rp_a2b")]
@@ -105,6 +176,17 @@ def main(results_dir: Path):
                 runs = data[method][scen]
                 stls = [r["switches"][0].get("stall_ms") for r in runs if r.get("switches")]
                 vals.append(avg(stls))
+            print("  " + f"{method:<{label_w}}" + "".join(f"{str(v):>{col_w}}" for v in vals))
+
+        print("\n  AETR")
+        print("  " + f"{'Method':<{label_w}}" + "".join(f"{h:>{col_w}}" for h in col_labels))
+        print("  " + "-" * (label_w + col_w * len(col_labels)))
+        for method in METHODS:
+            vals = []
+            for scen in rp_scens:
+                runs = data[method][scen]
+                aetrs = [r.get("aetr") for r in runs if r.get("aetr") is not None]
+                vals.append(avg(aetrs, decimals=4))
             print("  " + f"{method:<{label_w}}" + "".join(f"{str(v):>{col_w}}" for v in vals))
 
     # ── Bandwidth-condition table ───────────────────────────────────────────────

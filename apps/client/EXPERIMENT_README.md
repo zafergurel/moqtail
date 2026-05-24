@@ -83,7 +83,7 @@ Three terminal windows, all from the workspace root:
   --no-cert-validation \
   --method switch-message \
   --track-sequence "3,4" \
-  --switch-after 5 \
+  --switch-after 5000 \
   --jitter-buffer-ms 40 \
   --output-json /tmp/result.json
 
@@ -102,7 +102,7 @@ bash scripts/local_test.sh --build
 bash scripts/local_test.sh \
   --tracks "3:12500:0.25:0,4:20000:0.25:0" \
   --track-sequence "3,4" \
-  --switch-after 5 \
+  --switch-after 5000 \
   --jitter-buffer-ms 40 \
   --scenario "sync" \
   --reps 3
@@ -111,20 +111,20 @@ bash scripts/local_test.sh \
 #   Group 1 — sync
 bash scripts/local_test.sh \
   --tracks "3:12500:0.25:0,4:20000:0.25:0" \
-  --track-sequence "3,4" --switch-after 5 --jitter-buffer-ms 500 \
+  --track-sequence "3,4" --switch-after 5000 --jitter-buffer-ms 40 \
   --scenario "sync" --reps 3 --output results/local_test
 
 #   Group 2 — A ahead 500ms (B delayed)
 bash scripts/local_test.sh \
   --tracks "3:12500:0.25:0,4:20000:0.25:500" \
-  --track-sequence "3,4" --switch-after 5 --jitter-buffer-ms 500 \
+  --track-sequence "3,4" --switch-after 5000 --jitter-buffer-ms 40 \
   --scenario "a_ahead_500" --reps 3 --output results/local_test \
   --restart-pub
 
 #   Group 3 — B ahead 500ms (A delayed)
 bash scripts/local_test.sh \
   --tracks "3:12500:0.25:500,4:20000:0.25:0" \
-  --track-sequence "3,4" --switch-after 5 --jitter-buffer-ms 500 \
+  --track-sequence "3,4" --switch-after 5000 --jitter-buffer-ms 40 \
   --scenario "b_ahead_500" --reps 3 --output results/local_test \
   --restart-pub
 ```
@@ -139,7 +139,7 @@ Results land in the `--output` directory as `{method}_{scenario}_rep{n}.json`.
 --restart-pub           Restart publisher only; relay stays running
 --method <name>         Only run this method (repeatable; default: all three)
 --track-sequence <s>    Comma-separated track list e.g. "3,4"
---switch-after <secs>   Seconds per track before triggering switch  [15]
+--switch-after <ms>     ms per track before triggering switch      [15000]
 --jitter-buffer-ms <ms> Jitter buffer for stall calculation         [40]
 --reps <n>              Repetitions per method                      [3]
 --tracks <spec>         Track specs for publish-multi
@@ -251,7 +251,7 @@ ssh zafer@<relay-ip> "watch /sbin/tc -s -d class show dev eth0"
   --no-cert-validation \
   --track-sequence "3,4" \
   --method switch-message \
-  --switch-after 5 \
+  --switch-after 5000 \
   --jitter-buffer-ms 40 \
   --bandwidth-cap-bps 0 \
   --output-json /tmp/result.json
@@ -267,7 +267,7 @@ RUST_LOG=debug ./target/release/client \
   --no-cert-validation \
   --method joining-fetch \
   --track-sequence "3,4" \
-  --switch-after 5
+  --switch-after 5000
 ```
 
 ---
@@ -359,22 +359,21 @@ The relay injects the track's current `LargestObject` position into the Subscrib
 ```
                           switch_decision (t=0)
                                │
-Subscriber                     │           t_last_a        t_first_b
+Subscriber                     │           t_last_a      t_first_b_iframe
 receives:   ──A──A──A──A──A──A─┼─A─A─A─A──●───────────────●══B══B══B══►
                                 │           │               │
                                 │           │◄── gap ──────►│
-                                │           │  (includes    │
                                 │◄─────────────────────────►│
                                      switch_delay_ms
 ```
 
-| Field             | Formula                         | What it measures                                                                                                                                                  |
-| ----------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `switch_delay_ms` | `t_first_b − t_decision`        | Wall-clock delay: how long until first B **I-frame** arrived after the switch decision. Inherently includes any RTTs (control-message acks, fetch round trips).   |
-| `delivery_gap_ms` | `t_first_b − (t_last_a + 40ms)` | Playout gap: time between when the next frame was expected (after last A) and when first B actually arrived; negative = B arrived before A's slot ended (overlap) |
-| `stall_ms`        | see §6.2                        | Estimated viewer freeze due to missed I-frame deadline                                                                                                            |
+| Field             | Formula                                        | What it measures                                                                                                                                                                  |
+| ----------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `switch_delay_ms` | `t_first_b_iframe − t_decision`                | Wall-clock delay: how long until the first B **I-frame** (object_id=0) arrived after the switch decision. Inherently includes any RTTs (control-message acks, fetch round trips). |
+| `delivery_gap_ms` | `max(0, t_first_b_iframe − (t_last_a + 40ms))` | Playout gap: how long after A ended before the B I-frame arrived, minus one frame interval. Clamped to 0 — when B arrives early or on time there is no gap.                       |
+| `stall_ms`        | see §6.2                                       | Estimated viewer freeze due to missed I-frame deadline                                                                                                                            |
 
-**Important**: `t_last_a` is updated for every trailing A object that arrives after the decision. It is the receive time of the _last_ A object, not the decision time. This is why `delivery_gap_ms` ≠ `switch_delay_ms`.
+**Important**: `t_last_a` is updated for every trailing A object that arrives after the decision. It is the receive time of the _last_ A object, not the decision time. This is why `delivery_gap_ms` ≠ `switch_delay_ms`. `t_first_b_iframe` is the arrival time of the first object with `object_id == 0` on the B subscription (the I-frame); pre-boundary B objects are not counted.
 
 ### 6.2 Stall formula
 
@@ -416,11 +415,11 @@ t=0ms        t=140ms                          t=682ms
 
 ### 6.4 Metrics per method (expected behavior)
 
-| Method             | delivery_gap                                                             | stall                               | AETR        | Notes                                                                                                                                    |
-| ------------------ | ------------------------------------------------------------------------ | ----------------------------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| SWITCH message     | positive (waits for next boundary)                                       | 0 if gap ≤ JB; gap − JB if gap > JB | Low         | Gap = time from last A to B's first boundary                                                                                             |
-| Sub Update Forward | ≤ 0 (slight overlap)                                                     | 0                                   | Medium–High | Pre-subscribed B starts at its next boundary; A overlaps; AETR varies with group phase at switch time                                    |
-| Joining Fetch      | null when fetch is instant (no trailing A before I-frame); ≤ 0 otherwise | null / 0                            | Low–Medium  | Fetch covers partial group from relay cache; delivery_gap and stall are null when the fetch I-frame arrives before any trailing A object |
+| Method             | delivery_gap                                                             | stall                               | AETR                  | Notes                                                                                                                                                                                                                     |
+| ------------------ | ------------------------------------------------------------------------ | ----------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SWITCH message     | positive (waits for next boundary)                                       | 0 if gap ≤ JB; gap − JB if gap > JB | Low                   | Gap = time from last A to B's first boundary                                                                                                                                                                              |
+| Sub Update Forward | 0 (B arrives at or before next expected slot)                            | 0                                   | Medium–High           | Pre-subscribed B starts at its next boundary; A overlaps; AETR varies with group phase at switch time                                                                                                                     |
+| Joining Fetch      | null when fetch is instant (no trailing A before I-frame); ≤ 0 otherwise | null / 0                            | Low (A→B); High (B→A) | Fetch covers partial group from relay cache; delivery_gap and stall are null when the fetch I-frame arrives before any trailing A object. For B→A downswitches the entire B group is fetched as redundant data (AETR≈1.0) |
 
 ---
 
@@ -474,14 +473,14 @@ delay_A=500ms, delay_B=0 (B ahead scenario, "rp_a2b_b500"):
 
 ### 7.3 How delay affects each method
 
-| Scenario  | Method             | Expected behavior                                                                               |
-| --------- | ------------------ | ----------------------------------------------------------------------------------------------- |
-| A ahead δ | SWITCH message     | Waits δ ms for B's boundary → gap ≈ δ; stall occurs when δ > JB                                 |
-| A ahead δ | Sub Update Forward | Waits for B's next boundary regardless of δ; gap always ≤ 0 (pre-buffered)                      |
-| A ahead δ | Joining Fetch      | Fetch fills the partial group; gap = null; switch_delay ≈ 0ms (I-frame served from relay cache) |
-| B ahead δ | SWITCH message     | B's boundary just passed → B data cached → gap ≈ −δ (negative, no stall)                        |
-| B ahead δ | Sub Update Forward | Same as above: gap ≤ 0                                                                          |
-| B ahead δ | Joining Fetch      | Fetch fills partial group; gap = null                                                           |
+| Scenario  | Method             | Expected behavior                                                                                  |
+| --------- | ------------------ | -------------------------------------------------------------------------------------------------- |
+| A ahead δ | SWITCH message     | Waits δ ms for B's boundary → gap ≈ δ; stall occurs when δ > JB                                    |
+| A ahead δ | Sub Update Forward | Waits for B's next boundary regardless of δ; gap always ≤ 0 (pre-buffered)                         |
+| A ahead δ | Joining Fetch      | Fetch fills the partial group; gap = null; switch_delay ≈ 0ms (I-frame served from relay cache)    |
+| B ahead δ | SWITCH message     | B's boundary just passed → B data cached → gap = 0 (B arrived before next expected slot; no stall) |
+| B ahead δ | Sub Update Forward | Same as above: gap = 0                                                                             |
+| B ahead δ | Joining Fetch      | Fetch fills partial group; gap = null                                                              |
 
 ---
 
@@ -635,7 +634,10 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
       "aetr": 0.009416,
       "a_objects_post_decision": 4,
       "last_a_group": 26,
-      "first_b_group": 27
+      "first_b_group": 27,
+      "switched_b_group": 27,
+      "last_a_object_time_ms": 140,
+      "first_b_object_time_ms": 682
     }
   ]
 }
@@ -643,28 +645,31 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 
 ### Metrics reference
 
-| Field                     | Description                                                                                                                         |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `switch_delay_ms`         | `t_first_b − t_decision` (ms). Negative = B pre-buffered, arrived before decision.                                                  |
-| `delivery_gap_ms`         | `t_first_b − (t_last_a + 40ms)`. Signed playout gap. Negative = B arrived before A's slot ended.                                    |
-| `stall_ms`                | `0` if gap ≤ JB; `gap − JB` if gap > JB. Measured freeze time: how long the player waited for the I-frame beyond the jitter budget. |
-| `group_boundary_aligned`  | First B object had `object_id == 0` (I-frame).                                                                                      |
-| `control_messages`        | Switch-specific control messages sent.                                                                                              |
-| `redundant_bytes`         | Joining-Fetch warm-up bytes + pre-boundary B objects.                                                                               |
-| `trailing_a_bytes`        | A bytes received after switch decision.                                                                                             |
-| `useful_b_bytes`          | B bytes from first live group boundary onward.                                                                                      |
-| `excess_bytes`            | `redundant_bytes + trailing_a_bytes`.                                                                                               |
-| `total_bytes`             | `useful_b_bytes + excess_bytes`.                                                                                                    |
-| `aetr`                    | `excess_bytes / total_bytes` per switch. Top-level `aetr` is mean across all switches.                                              |
-| `a_objects_post_decision` | A objects that arrived after the decision.                                                                                          |
+| Field                     | Description                                                                                                                                                                    |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `switch_delay_ms`         | `t_first_b_iframe − t_decision` (ms). Time from switch decision to first B I-frame (object_id=0). Negative = I-frame arrived before decision (JoiningFetch pre-buffered case). |
+| `delivery_gap_ms`         | `max(0, t_first_b_iframe − (t_last_a + 40ms))`. Playout gap clamped to 0. 0 = B arrived in time or early.                                                                      |
+| `switched_b_group`        | Group number of the first B I-frame that was received (the actual group the decoder switches to).                                                                              |
+| `last_a_object_time_ms`   | Signed ms from switch decision to last A object received. Useful for diagnosing trailing-A overlap.                                                                            |
+| `first_b_object_time_ms`  | Signed ms from switch decision to first B object of any kind (may precede the I-frame for pre-boundary objects).                                                               |
+| `stall_ms`                | `0` if gap ≤ JB; `gap − JB` if gap > JB. Measured freeze time: how long the player waited for the I-frame beyond the jitter budget.                                            |
+| `group_boundary_aligned`  | First B object had `object_id == 0` (I-frame).                                                                                                                                 |
+| `control_messages`        | Switch-specific control messages sent.                                                                                                                                         |
+| `redundant_bytes`         | Joining-Fetch warm-up bytes + pre-boundary B objects.                                                                                                                          |
+| `trailing_a_bytes`        | A bytes received after switch decision.                                                                                                                                        |
+| `useful_b_bytes`          | B bytes from first live group boundary onward.                                                                                                                                 |
+| `excess_bytes`            | `redundant_bytes + trailing_a_bytes`.                                                                                                                                          |
+| `total_bytes`             | `useful_b_bytes + excess_bytes`.                                                                                                                                               |
+| `aetr`                    | `excess_bytes / total_bytes` per switch. Top-level `aetr` is mean across all switches.                                                                                         |
+| `a_objects_post_decision` | A objects that arrived after the decision.                                                                                                                                     |
 
 ### Switch method summary
 
-| Method             | CLI value            | Control msgs | Gap behavior                          | AETR   |
-| ------------------ | -------------------- | ------------ | ------------------------------------- | ------ |
-| SWITCH message     | `switch-message`     | 1            | Positive; = time to B's next boundary | Low    |
-| Sub Update Forward | `sub-update-forward` | 3            | ≤ 0; A/B overlap                      | Medium |
-| Joining Fetch      | `joining-fetch`      | 3–4          | null (fetch fills gap)                | High   |
+| Method             | CLI value            | Control msgs | Gap behavior                          | AETR                   |
+| ------------------ | -------------------- | ------------ | ------------------------------------- | ---------------------- |
+| SWITCH message     | `switch-message`     | 1            | Positive; = time to B's next boundary | Low                    |
+| Sub Update Forward | `sub-update-forward` | 3            | ≤ 0; A/B overlap                      | Medium                 |
+| Joining Fetch      | `joining-fetch`      | 3–4          | null (fetch fills gap)                | Low (A→B) / High (B→A) |
 
 ### `client switch-test` flags
 
@@ -672,7 +677,7 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 --track-sequence <s>        Comma-separated track list, e.g. "3,4"
 --track-a / --track-b       Shorthand for a single switch (ignored when --track-sequence is set)
 --method                    switch-message | sub-update-forward | joining-fetch
---switch-after <secs>       Seconds per track before triggering the next switch   [15]
+--switch-after <ms>         Milliseconds per track before triggering the next switch   [15000]
 --jitter-buffer-ms <ms>     Jitter budget; gap > JB triggers a GoP-length stall   [0]
 --bandwidth-cap-bps <bps>   Recorded in JSON only; does not apply tc               [0]
 --output-json <path>        Write result JSON to this path
