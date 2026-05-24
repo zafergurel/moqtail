@@ -2,7 +2,7 @@
 # local_test.sh — Track switching experiment (fully local, no SSH, no tc)
 #
 # Starts a local relay and a local publish-multi publisher (artificial bytes),
-# then iterates over all three switching methods for N repetitions.
+# then iterates over all four switching methods for N repetitions.
 # No bandwidth shaping is applied; this is a baseline / smoke-test run.
 #
 # Usage:
@@ -11,7 +11,7 @@
 # Options:
 #   --build                Build release binaries before running
 #   --skip-start           Assume relay + publisher are already running
-#   --method  <name>       Only run this method (repeatable; default: all three)
+#   --method  <name>       Only run this method (repeatable; default: all four)
 #   --track-sequence <s>   Comma-separated track sequence, e.g. "2,3,4"
 #                          When given, each run performs M switches (M = len-1).
 #                          Default: "2,3" (single switch, 720p → 480p)
@@ -31,9 +31,9 @@
 #
 # Examples:
 #   # Quick smoke test: one method, one rep, relay already running
-#   bash scripts/local_test.sh --skip-start --method switch-message --reps 1
+#   bash scripts/local_test.sh --skip-start --method switch-cold --reps 1
 #
-#   # Full run: build + 3 methods × 3 reps (54 switch events with default 3-track sequence)
+#   # Full run: build + 4 methods × 3 reps (72 switch events with default 3-track sequence)
 #   bash scripts/local_test.sh --build --track-sequence "2,3,4"
 #
 #   # Single-switch baseline
@@ -46,7 +46,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 
-ALL_METHODS=("switch-message" "sub-update-forward" "joining-fetch")
+ALL_METHODS=("switch-cold" "switch-warm" "sub-update-forward" "joining-fetch")
 # Default track sequence: single upswitch 480p→720p (lower number = lower bitrate)
 TRACK_SEQUENCE="3,4"
 SWITCH_AFTER=5000

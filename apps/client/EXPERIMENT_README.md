@@ -1,6 +1,6 @@
 # Track Switching Experiment
 
-Empirical comparison of three subscriber-initiated track-switching methods in MOQ Transport, for the paper _"Zero Gap, Zero Waste: Subscriber-Initiated, Relay-Executed Track Switching in MOQ Transport"_.
+Empirical comparison of four subscriber-initiated track-switching methods in MOQ Transport, for the paper _"Zero Gap, Zero Waste: Subscriber-Initiated, Relay-Executed Track Switching in MOQ Transport"_.
 
 ---
 
@@ -81,7 +81,7 @@ Three terminal windows, all from the workspace root:
   --namespace moqtail-experiment \
   --command switch-test \
   --no-cert-validation \
-  --method switch-message \
+  --method switch-cold \
   --track-sequence "3,4" \
   --switch-after 5000 \
   --jitter-buffer-ms 40 \
@@ -95,7 +95,7 @@ cat /tmp/result.json
 `scripts/local_test.sh` handles everything: starts relay and publisher, iterates over methods and repetitions, saves one JSON per run.
 
 ```bash
-# Full run: build release binaries, 3 methods × 3 reps
+# Full run: build release binaries, 4 methods × 3 reps
 bash scripts/local_test.sh --build
 
 # Custom tracks and scenario label
@@ -137,7 +137,7 @@ Results land in the `--output` directory as `{method}_{scenario}_rep{n}.json`.
 --build                 Build release binaries before running
 --skip-start            Skip relay and publisher startup (both already running)
 --restart-pub           Restart publisher only; relay stays running
---method <name>         Only run this method (repeatable; default: all three)
+--method <name>         Only run this method (repeatable; default: all four)
 --track-sequence <s>    Comma-separated track list e.g. "3,4"
 --switch-after <ms>     ms per track before triggering switch      [15000]
 --jitter-buffer-ms <ms> Jitter buffer for stall calculation         [40]
@@ -212,11 +212,11 @@ RELAY_PROJECT="/home/zafer/projects/moqtail"
 ### 3.3 Running the full experiment matrix
 
 ```bash
-# Full run: build, start, 144 runs (16 scenarios × 3 methods × 3 reps)
+# Full run: build, start, 192 runs (16 scenarios × 4 methods × 3 reps)
 bash scripts/experiment.sh --build --output results/paper_run_02
 
 # Smoke test: relay already running, one method, 1 rep
-bash scripts/experiment.sh --skip-start --method switch-message --reps 1
+bash scripts/experiment.sh --skip-start --method switch-cold --reps 1
 
 # Resume a partial run (skips existing non-empty files)
 bash scripts/experiment.sh --output results/paper_run_02
@@ -250,7 +250,7 @@ ssh zafer@<relay-ip> "watch /sbin/tc -s -d class show dev eth0"
   --command switch-test \
   --no-cert-validation \
   --track-sequence "3,4" \
-  --method switch-message \
+  --method switch-cold \
   --switch-after 5000 \
   --jitter-buffer-ms 40 \
   --bandwidth-cap-bps 0 \
@@ -297,9 +297,9 @@ PUBLISHER (publish-multi)          RELAY                  SUBSCRIBER (switch-tes
 
 Each track is published as a sequence of **groups** (one GoP = 25 objects × 40 ms = 1 s). Object 0 of every group is the I-frame; objects 1–24 are P-frames. The relay caches objects and forwards them to each subscriber based on subscription state (forward=true/false).
 
-### 5.2 The three switching methods
+### 5.2 The four switching methods
 
-**Method 1 — SWITCH message** (1 control message)
+**Method 1 — SWITCH cold** (1 control message)
 
 ```
 Subscriber                           Relay
@@ -310,9 +310,26 @@ Subscriber                           Relay
     │◄═══ B objects (from group N) ═══│  (first object is always object_id=0)
 ```
 
-The relay stops forwarding A almost immediately upon receiving SWITCH and begins B at B's next group boundary. A few trailing A objects may already be in-flight.
+The relay stops forwarding A almost immediately upon receiving SWITCH and begins B at B's next group boundary. A few trailing A objects may already be in-flight. If the relay has no cached B groups, it must wait for the publisher to deliver B's next boundary.
 
-**Method 2 — Sub Update Forward** (3 control messages)
+**Method 2 — SWITCH warm** (2 control messages)
+
+```
+Subscriber                           Relay
+    │                                  │
+    │  [switch_after − warm_lead secs] │
+    │──── SUBSCRIBE B (fwd=false) ────►│  relay starts caching B silently
+    │◄─── SubscribeOk(B_warm) ────────│
+    │                                  │
+    │  [warm_lead secs of A continue]  │
+    │──── SWITCH(A→B) ────────────────►│  relay switches; B already in cache
+    │◄─── SubscribeOk(B_switch) ──────│
+    │◄═══ B objects (served from cache)│  (gap ≈ 0 — no wait for publisher)
+```
+
+Identical to switch-cold except the subscriber pre-subscribes B with `forward=false` `switch_warm_lead_secs` before the SWITCH, giving the relay time to cache recent B groups. When SWITCH fires the relay can serve B from cache immediately.
+
+**Method 3 — Sub Update Forward** (3 control messages)
 
 ```
 Subscriber                           Relay
@@ -329,7 +346,7 @@ Subscriber                           Relay
 
 The relay delivers B starting from B's next group boundary after the REQUEST_UPDATE. The subscriber tears down A once the first live B group boundary arrives.
 
-**Method 3 — Joining Fetch** (3–4 control messages)
+**Method 4 — Joining Fetch** (3–4 control messages)
 
 ```
 Subscriber                                 Relay
@@ -393,7 +410,7 @@ These two metrics measure different things and can differ significantly:
 
 `stall` is typically **smaller** than `switch_delay` because trailing A objects advance `t_last_a` (shrinking the delivery gap relative to the decision time) and the jitter budget absorbs part of the remaining gap.
 
-Example — `a_ahead_500` scenario, `switch-message`, `JB=500ms`:
+Example — `a_ahead_500` scenario, `switch-cold`, `JB=500ms`:
 
 ```
 t=0ms        t=140ms                          t=682ms
@@ -417,7 +434,8 @@ t=0ms        t=140ms                          t=682ms
 
 | Method             | delivery_gap                                                             | stall                               | AETR                  | Notes                                                                                                                                                                                                                     |
 | ------------------ | ------------------------------------------------------------------------ | ----------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| SWITCH message     | positive (waits for next boundary)                                       | 0 if gap ≤ JB; gap − JB if gap > JB | Low                   | Gap = time from last A to B's first boundary                                                                                                                                                                              |
+| SWITCH cold        | positive (waits for next boundary)                                       | 0 if gap ≤ JB; gap − JB if gap > JB | Low                   | Gap = time from last A to B's first boundary; larger when relay has no cached B                                                                                                                                           |
+| SWITCH warm        | ≈ 0 (relay serves B from cache)                                          | 0                                   | Low                   | Pre-subscribe warms cache; gap collapses to ~RTT when cache hit                                                                                                                                                           |
 | Sub Update Forward | 0 (B arrives at or before next expected slot)                            | 0                                   | Medium–High           | Pre-subscribed B starts at its next boundary; A overlaps; AETR varies with group phase at switch time                                                                                                                     |
 | Joining Fetch      | null when fetch is instant (no trailing A before I-frame); ≤ 0 otherwise | null / 0                            | Low (A→B); High (B→A) | Fetch covers partial group from relay cache; delivery_gap and stall are null when the fetch I-frame arrives before any trailing A object. For B→A downswitches the entire B group is fetched as redundant data (AETR≈1.0) |
 
@@ -467,7 +485,7 @@ delay_A=500ms, delay_B=0 (B ahead scenario, "rp_a2b_b500"):
     Track B: running 10 000ms → group 10, object 0 (at boundary!)
 
   B's next group boundary: 0ms away (or 1000ms to the NEXT one)
-  B's most-recent boundary was just now → switch-message fires almost instantly
+  B's most-recent boundary was just now → switch-cold fires almost instantly
   and delivery_gap is negative (B's data was ~500ms pre-buffered at the relay)
 ```
 
@@ -475,10 +493,12 @@ delay_A=500ms, delay_B=0 (B ahead scenario, "rp_a2b_b500"):
 
 | Scenario  | Method             | Expected behavior                                                                                  |
 | --------- | ------------------ | -------------------------------------------------------------------------------------------------- |
-| A ahead δ | SWITCH message     | Waits δ ms for B's boundary → gap ≈ δ; stall occurs when δ > JB                                    |
+| A ahead δ | SWITCH cold        | Waits δ ms for B's boundary → gap ≈ δ; stall occurs when δ > JB                                    |
+| A ahead δ | SWITCH warm        | Cache pre-warmed; gap ≈ 0 regardless of δ                                                          |
 | A ahead δ | Sub Update Forward | Waits for B's next boundary regardless of δ; gap always ≤ 0 (pre-buffered)                         |
 | A ahead δ | Joining Fetch      | Fetch fills the partial group; gap = null; switch_delay ≈ 0ms (I-frame served from relay cache)    |
-| B ahead δ | SWITCH message     | B's boundary just passed → B data cached → gap = 0 (B arrived before next expected slot; no stall) |
+| B ahead δ | SWITCH cold        | B's boundary just passed → B data cached → gap = 0 (B arrived before next expected slot; no stall) |
+| B ahead δ | SWITCH warm        | Same as switch-cold (cache already hot from publisher delivery)                                    |
 | B ahead δ | Sub Update Forward | Same as above: gap = 0                                                                             |
 | B ahead δ | Joining Fetch      | Fetch fills partial group; gap = null                                                              |
 
@@ -502,7 +522,7 @@ import json, glob, statistics
 from pathlib import Path
 
 d = Path("results/local_test_20260523_005009")
-METHODS   = ["switch-message", "sub-update-forward", "joining-fetch"]
+METHODS   = ["switch-cold", "switch-warm", "sub-update-forward", "joining-fetch"]
 SCENARIOS = ["sync", "a_ahead_500", "b_ahead_500"]
 
 def avg(vals):
@@ -529,7 +549,7 @@ EOF
 ### 8.3 Inspect a single file
 
 ```bash
-cat results/local_test_20260523_005009/switch-message_sync_rep1.json | jq .
+cat results/local_test_20260523_005009/switch-cold_sync_rep1.json | jq .
 jq '.switches[]' results/**/*.json
 ```
 
@@ -546,7 +566,7 @@ jq -r '[.method, (.aetr | tostring)] | join("\t")' results/local_*/*.json
 ### 8.5 Per-method summary with jq
 
 ```bash
-for method in switch-message sub-update-forward joining-fetch; do
+for method in switch-cold switch-warm sub-update-forward joining-fetch; do
   echo "── $method ──────────────────────────"
   jq -r '.switches[] | [
       (.switch_delay_ms // "null"),
@@ -611,7 +631,7 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 
 ```json
 {
-  "method": "switch-message",
+  "method": "switch-cold",
   "bandwidth_cap_bps": 0,
   "frame_interval_ms": 40,
   "objects_per_group": 25,
@@ -667,7 +687,8 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 
 | Method             | CLI value            | Control msgs | Gap behavior                          | AETR                   |
 | ------------------ | -------------------- | ------------ | ------------------------------------- | ---------------------- |
-| SWITCH message     | `switch-message`     | 1            | Positive; = time to B's next boundary | Low                    |
+| SWITCH cold        | `switch-cold`        | 1            | Positive; = time to B's next boundary | Low                    |
+| SWITCH warm        | `switch-warm`        | 2            | ≈ 0 when relay cache hit              | Low                    |
 | Sub Update Forward | `sub-update-forward` | 3            | ≤ 0; A/B overlap                      | Medium                 |
 | Joining Fetch      | `joining-fetch`      | 3–4          | null (fetch fills gap)                | Low (A→B) / High (B→A) |
 
@@ -676,8 +697,9 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 ```
 --track-sequence <s>        Comma-separated track list, e.g. "3,4"
 --track-a / --track-b       Shorthand for a single switch (ignored when --track-sequence is set)
---method                    switch-message | sub-update-forward | joining-fetch
+--method                    switch-cold | switch-warm | sub-update-forward | joining-fetch
 --switch-after <ms>         Milliseconds per track before triggering the next switch   [15000]
+--switch-warm-lead-secs <s> Seconds before switch to pre-subscribe B (switch-warm only) [2]
 --jitter-buffer-ms <ms>     Jitter budget; gap > JB triggers a GoP-length stall   [0]
 --bandwidth-cap-bps <bps>   Recorded in JSON only; does not apply tc               [0]
 --output-json <path>        Write result JSON to this path

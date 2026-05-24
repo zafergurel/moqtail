@@ -83,9 +83,9 @@ fi
 
 # ── Experiment defaults ─────────────────────────────────────────────────────────
 
-ALL_METHODS=("switch-message" "sub-update-forward" "joining-fetch")
+ALL_METHODS=("switch-cold" "switch-warm" "sub-update-forward" "joining-fetch")
 SWITCH_AFTER=5000
-JITTER_BUFFER_MS=40
+JITTER_BUFFER_MS=200
 REPS=3
 TC_MARK=1
 
