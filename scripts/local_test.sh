@@ -20,13 +20,14 @@
 #   --switch-warm-lead-secs <s>  Seconds before switch to pre-subscribe B (switch-warm only) (default: 2)
 #   --jitter-buffer-ms <ms>  Jitter buffer for realtime freeze calculation (default: 200)
 #   --reps <n>             Repetitions per method (default: 3)
+#   --delays <list>        Comma-separated relative-position delays in ms (default: "0,100,400")
+#                          0 → sync scenario; N > 0 → a_ahead_N and b_ahead_N scenarios
 #   --tracks <spec>        Track specs for publish-multi, e.g. "1:20000,2:12500,3:5000"
 #                          Default: full 4-track video-only ladder
 #   --objects-per-group <n>  Objects per group (default: 25, i.e. 1s GOP at 25fps)
 #   --interval <ms>        Inter-object interval in ms (default: 40, i.e. 25fps)
 #   --group-count <n>      Total groups to publish (default: 1000 ≈ ~17 minutes)
 #   --relay-port <port>    Relay QUIC port (default: 4433)
-#   --scenario <name>      Scenario label used in output filenames (default: "local")
 #   --output <dir>         Results directory (default: results/local_YYYYMMDD_HHMMSS)
 #   --help
 #
@@ -34,11 +35,11 @@
 #   # Quick smoke test: one method, one rep, relay already running
 #   bash scripts/local_test.sh --skip-start --method switch-cold --reps 1
 #
-#   # Full run: build + 4 methods × 3 reps (72 switch events with default 3-track sequence)
+#   # Full run: build + 4 methods × 3 reps with default delays
 #   bash scripts/local_test.sh --build --track-sequence "2,3,4"
 #
-#   # Single-switch baseline
-#   bash scripts/local_test.sh --track-sequence "2,3" --reps 5
+#   # Single-switch, two specific delays only
+#   bash scripts/local_test.sh --track-sequence "3,4" --delays "0,100" --reps 5
 
 set -euo pipefail
 
@@ -50,7 +51,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ── Defaults ───────────────────────────────────────────────────────────────────
 
 ALL_METHODS=("switch-cold" "switch-warm" "sub-update-forward" "joining-fetch")
-# Default track sequence: single upswitch 480p→720p (lower number = lower bitrate)
+# Default track sequence: single upswitch 720p→1080p (lower number = lower bitrate)
 TRACK_SEQUENCE="3,4"
 SWITCH_AFTER=5000
 SWITCH_WARM_LEAD_SECS=2
@@ -60,12 +61,19 @@ RELAY_PORT=4433
 RELAY_URL="https://127.0.0.1:${RELAY_PORT}"
 NAMESPACE="moqtail-experiment"
 
+# Relative-position delays (ms). For each non-zero value D two scenarios are run:
+#   a_ahead_D — track A starts at t=0, track B starts D ms late
+#   b_ahead_D — track B starts at t=0, track A starts D ms late
+# 0 means a sync (no offset) scenario is included.
+DELAYS="0,100,400"
+
 # publish-multi defaults — video-only bitrate ladder (lower track = lower bitrate):
 #   track 1: 500 kbps (640×360)   → 2500 B/obj at 25fps
 #   track 2: 1 Mbps   (854×480)   → 5000 B/obj
 #   track 3: 2.5 Mbps (1280×720)  → 12500 B/obj
 #   track 4: 4 Mbps   (1920×1080) → 20000 B/obj
 PUB_TRACKS="1:2500,2:5000,3:12500,4:20000"
+P_RATIO="0.25"
 PUB_OBJECTS_PER_GROUP=25
 PUB_INTERVAL_MS=40
 PUB_GROUP_COUNT=1000
@@ -86,7 +94,6 @@ SKIP_START=false
 RESTART_SERVICES=true
 SELECTED_METHODS=()
 OUTPUT_DIR=""
-SCENARIO="local"
 
 usage() {
   grep '^#' "$0" | sed 's/^# \{0,1\}//' | tail -n +2
@@ -104,12 +111,12 @@ while [[ $# -gt 0 ]]; do
     --switch-warm-lead-secs) SWITCH_WARM_LEAD_SECS="$2";        shift 2 ;;
     --jitter-buffer-ms)    JITTER_BUFFER_MS="$2";               shift 2 ;;
     --reps)                REPS="$2";                           shift 2 ;;
+    --delays)              DELAYS="$2";                         shift 2 ;;
     --tracks)              PUB_TRACKS="$2";                     shift 2 ;;
     --objects-per-group)   PUB_OBJECTS_PER_GROUP="$2";          shift 2 ;;
     --interval)            PUB_INTERVAL_MS="$2";                shift 2 ;;
     --group-count)         PUB_GROUP_COUNT="$2";                shift 2 ;;
     --relay-port)          RELAY_PORT="$2"; RELAY_URL="https://127.0.0.1:${RELAY_PORT}"; shift 2 ;;
-    --scenario)            SCENARIO="$2";                       shift 2 ;;
     --output)              OUTPUT_DIR="$2";                     shift 2 ;;
     --help|-h)             usage ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -119,6 +126,11 @@ done
 [ ${#SELECTED_METHODS[@]} -eq 0 ] && METHODS=("${ALL_METHODS[@]}") || METHODS=("${SELECTED_METHODS[@]}")
 [ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$ROOT_DIR/results/local_$(date +%Y%m%d_%H%M%S)"
 
+# Derive first and last track from TRACK_SEQUENCE for delay injection
+IFS=',' read -ra _seq <<< "$TRACK_SEQUENCE"
+TRACK_A="${_seq[0]}"
+TRACK_B="${_seq[${#_seq[@]}-1]}"
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
@@ -126,14 +138,25 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 write_metadata() {
   local meta_file="$OUTPUT_DIR/experiment-metadata.json"
-  local methods_json
+  local methods_json scenarios_json
   methods_json=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:]))" "${METHODS[@]}")
 
-  # Derive track_a / track_b from first and last elements of TRACK_SEQUENCE
-  local _track_a _track_b
-  IFS=',' read -ra _seq <<< "$TRACK_SEQUENCE"
-  _track_a="${_seq[0]}"
-  _track_b="${_seq[${#_seq[@]}-1]}"
+  local _delays="$DELAYS"
+  local _sequence="$TRACK_SEQUENCE"
+  scenarios_json=$(python3 - <<PYEOF2
+import json
+delays = [int(d.strip()) for d in "$_delays".split(',')]
+sequence = "$_sequence"
+scenarios = []
+for d in delays:
+    if d == 0:
+        scenarios.append({"label": "sync", "sequence": sequence, "bw_bps": 0, "delay_a_ms": 0, "delay_b_ms": 0})
+    else:
+        scenarios.append({"label": f"a_ahead_{d}", "sequence": sequence, "bw_bps": 0, "delay_a_ms": 0, "delay_b_ms": d})
+        scenarios.append({"label": f"b_ahead_{d}", "sequence": sequence, "bw_bps": 0, "delay_a_ms": d, "delay_b_ms": 0})
+print(json.dumps(scenarios))
+PYEOF2
+  )
 
   python3 - <<PYEOF
 import json
@@ -148,16 +171,14 @@ meta = {
     "jitter_buffer_ms":      $JITTER_BUFFER_MS,
     "reps":             $REPS,
     "methods":          $methods_json,
-    "track_a":          "$_track_a",
-    "track_b":          "$_track_b",
+    "track_a":          "$TRACK_A",
+    "track_b":          "$TRACK_B",
     "track_sequence":   "$TRACK_SEQUENCE",
+    "delays":           "$DELAYS",
     "objects_per_group": $PUB_OBJECTS_PER_GROUP,
     "interval_ms":      $PUB_INTERVAL_MS,
     "group_count":      $PUB_GROUP_COUNT,
-    "scenarios": [
-        {"label": "$SCENARIO", "sequence": "$TRACK_SEQUENCE",
-         "bw_bps": 0, "delay_a_ms": 0, "delay_b_ms": 0}
-    ],
+    "scenarios":        $scenarios_json,
     "command":          "$INVOCATION",
 }
 Path("$meta_file").write_text(json.dumps(meta, indent=2) + "\n")
@@ -188,7 +209,6 @@ start_relay() {
   log "Starting local relay (port $RELAY_PORT) → $RELAY_LOG"
   "$RELAY_BIN" --port "$RELAY_PORT" >"$RELAY_LOG" 2>&1 &
   echo $! >"$RELAY_PID_FILE"
-  RELAY_STARTED=true
   sleep 2
   log "Relay PID $(cat "$RELAY_PID_FILE")"
 }
@@ -209,7 +229,6 @@ start_publisher() {
   fi
 
   log "Stopping any lingering local publisher..."
-  # kill any previous publish-multi client (best-effort)
   pkill -f "client.*publish-multi" 2>/dev/null || true
   sleep 1
 
@@ -241,20 +260,40 @@ stop_publisher() {
   fi
 }
 
+# ── Publisher track builder ─────────────────────────────────────────────────────
+
+# Injects p_ratio and per-track delays into PUB_TRACKS.
+# TRACK_A gets delay_a_ms; TRACK_B gets delay_b_ms; all others get 0.
+build_pub_tracks_with_delays() {
+  local delay_a=$1 delay_b=$2
+  local result="" spec name bytes delay
+  IFS=',' read -ra specs <<< "$PUB_TRACKS"
+  for spec in "${specs[@]}"; do
+    IFS=':' read -r name bytes _ <<< "$spec"
+    delay=0
+    [ "$name" = "$TRACK_A" ] && delay=$delay_a
+    [ "$name" = "$TRACK_B" ] && delay=$delay_b
+    [ -n "$result" ] && result+=","
+    result+="${name}:${bytes}:${P_RATIO}:${delay}"
+  done
+  echo "$result"
+}
+
 # ── Single run ─────────────────────────────────────────────────────────────────
 
 run_one() {
-  local method=$1 rep=$2
-  local outfile="$OUTPUT_DIR/${method}_${SCENARIO}_rep${rep}.json"
+  local method=$1 scenario=$2 pub_tracks=$3 rep=$4
+  local outfile="$OUTPUT_DIR/${method}_${scenario}_rep${rep}.json"
 
   if "$RESTART_SERVICES"; then
     stop_publisher
     stop_relay
     start_relay
+    PUB_TRACKS="$pub_tracks"
     start_publisher
   fi
 
-  log "--- $method rep $rep ---"
+  log "--- $method $scenario rep $rep ---"
 
   "$CLIENT_BIN" \
     --server "$RELAY_URL" \
@@ -269,7 +308,7 @@ run_one() {
     --bandwidth-cap-bps 0 \
     --output-json "$outfile" \
     && log "Saved: $outfile" \
-    || log "WARNING: switch-test exited with error ($method rep $rep)"
+    || log "WARNING: switch-test exited with error ($method $scenario rep $rep)"
 
   sleep 2
 }
@@ -286,10 +325,27 @@ trap cleanup EXIT INT TERM
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 main() {
+  # Build delay scenario list from DELAYS
+  declare -a DELAY_GROUPS=()
+  local d
+  IFS=',' read -ra _delays <<< "$DELAYS"
+  for d in "${_delays[@]}"; do
+    d="${d// /}"
+    if [ "$d" -eq 0 ]; then
+      DELAY_GROUPS+=("sync|0|0")
+    else
+      DELAY_GROUPS+=("a_ahead_${d}|0|${d}")
+      DELAY_GROUPS+=("b_ahead_${d}|${d}|0")
+    fi
+  done
+
+  local total=$(( ${#DELAY_GROUPS[@]} * ${#METHODS[@]} * REPS ))
+  local done_count=0
+
   log "=== local_test.sh ==="
   log "Methods:          ${METHODS[*]}"
-  log "Scenario:         $SCENARIO"
   log "Track sequence:   $TRACK_SEQUENCE"
+  log "Delays:           $DELAYS"
   log "Tracks:           $PUB_TRACKS"
   log "Switch after:     ${SWITCH_AFTER}ms"
   log "Warm lead:        ${SWITCH_WARM_LEAD_SECS}s"
@@ -310,18 +366,32 @@ main() {
   if ! "$SKIP_START" && ! "$RESTART_SERVICES"; then
     # Services shared across all runs — start once here.
     start_relay
-    start_publisher
   fi
 
-  local total=$(( ${#METHODS[@]} * REPS ))
-  local done_count=0
   log "Running $total experiment runs..."
 
-  for method in "${METHODS[@]}"; do
-    for rep in $(seq 1 "$REPS"); do
-      run_one "$method" "$rep"
-      (( done_count++ )) || true
-      log "Progress: $done_count / $total"
+  local group_entry scenario delay_a delay_b pub_tracks
+  for group_entry in "${DELAY_GROUPS[@]}"; do
+    IFS='|' read -r scenario delay_a delay_b <<< "$group_entry"
+
+    log ""
+    log "=== Delay group: $scenario (delay_A=${delay_a}ms, delay_B=${delay_b}ms) ==="
+
+    pub_tracks=$(build_pub_tracks_with_delays "$delay_a" "$delay_b")
+
+    if ! "$RESTART_SERVICES"; then
+      # Restart publisher once per group so delay config takes effect.
+      stop_publisher
+      PUB_TRACKS="$pub_tracks"
+      start_publisher
+    fi
+
+    for method in "${METHODS[@]}"; do
+      for rep in $(seq 1 "$REPS"); do
+        run_one "$method" "$scenario" "$pub_tracks" "$rep"
+        (( done_count++ )) || true
+        log "Progress: $done_count / $total"
+      done
     done
   done
 
