@@ -193,8 +193,11 @@ RELAY_PROJECT="/home/zafer/projects/moqtail"
 ### 3.3 Running the full experiment matrix
 
 ```bash
-# Full run: build, start, 144 runs (16 scenarios × 3 methods × 3 reps)
+# Full run: build, start (default: 0,1000,2000 ms delays × 3 methods × 3 reps = 54 runs)
 bash scripts/experiment.sh --build --output results/paper_run_02
+
+# Custom delays (sub-group offsets: 100, 400, 700 ms)
+bash scripts/experiment.sh --build --delays 0,100,400,700 --output results/paper_run_02
 
 # Smoke test: relay already running, one method, 1 rep
 bash scripts/experiment.sh --skip-start --method switch --reps 1
@@ -203,7 +206,25 @@ bash scripts/experiment.sh --skip-start --method switch --reps 1
 bash scripts/experiment.sh --output results/paper_run_02
 ```
 
-### 3.4 Manual tc bandwidth shaping
+### 3.4 `experiment.sh` flags
+
+```
+--build                    Build release binaries before running
+--skip-start               Skip relay startup (assume it is already running)
+--no-restart-services      Do NOT restart relay+publisher before each run
+--method <name>            Only run this method (repeatable; default: all three)
+--reps <n>                 Repetitions per condition                          [3]
+--delays <list>            Comma-separated relative-position delays in ms     [0,1000,2000]
+                           0 → sync RP + BW scenarios; N → a_ahead_N and b_ahead_N RP pairs
+--switch-after <ms>        ms per track before triggering the switch          [4400]
+--jitter-buffer-ms <ms>    Jitter buffer for stall calculation                [500]
+--objects-per-group <n>    Objects per group                                  [25]
+--interval <ms>            Inter-object interval                              [40]
+--group-count <n>          Total groups to publish                            [5000]
+--output <dir>             Results directory
+```
+
+### 3.5 Manual tc bandwidth shaping
 
 ```bash
 # On the relay host — limit outbound UDP to subscriber to 4.5 Mbps

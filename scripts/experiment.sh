@@ -15,41 +15,38 @@
 #   --build                    Build release binaries on relay and client locally
 #   --skip-start               Skip the initial relay startup (assume it is already running)
 #   --no-restart-services      Do NOT restart relay+publisher before each run (default: restart each run)
-#   --method  <name>           Only run this method (repeatable; default: all four)
+#   --method  <name>           Only run this method (repeatable; default: all three)
 #   --reps <n>                 Repetitions per condition (default: 3)
-#   --switch-after <ms>        Milliseconds per track before triggering the switch (default: 5000)
-#   --jitter-buffer-ms <ms>    Jitter buffer for realtime freeze calculation (default: 200)
+#   --delays <list>            Comma-separated relative-position delays in ms (default: 0,1000,2000)
+#                              0 → sync baseline with BW scenarios; N → a_ahead_N and b_ahead_N RP scenarios
+#   --switch-after <ms>        Milliseconds per track before triggering the switch (default: 4400)
+#   --jitter-buffer-ms <ms>    Jitter buffer for realtime freeze calculation (default: 500)
 #   --objects-per-group <n>    Objects per group (default: 25, i.e. 1s GOP at 25fps)
 #   --interval <ms>            Inter-object interval in ms (default: 40, i.e. 25fps)
 #   --group-count <n>          Total groups to publish (default: 5000 ≈ ~83 minutes)
 #   --output <dir>             Results directory (default: results/YYYYMMDD_HHMMSS)
 #   --help
 #
-# Scenario matrix (16 scenarios × 3 methods × 3 reps = 144 runs):
+# Scenario matrix (generated from --delays; default 0,1000,2000):
 #
-#   Relative-position group (unlimited BW, track A = 3 / 2.5 Mbps, track B = 4 / 4 Mbps):
-#     rp_a2b_a100   A→B  A ahead by 100 ms  (B starts 100 ms late)
-#     rp_a2b_a400   A→B  A ahead by 400 ms
-#     rp_a2b_a700   A→B  A ahead by 700 ms
-#     rp_a2b_b100   A→B  B ahead by 100 ms  (A starts 100 ms late)
-#     rp_a2b_b400   A→B  B ahead by 400 ms
-#     rp_a2b_b700   A→B  B ahead by 700 ms
-#     rp_b2a_a100   B→A  A ahead by 100 ms
-#     rp_b2a_a400   B→A  A ahead by 400 ms
-#     rp_b2a_a700   B→A  A ahead by 700 ms
-#     rp_b2a_b100   B→A  B ahead by 100 ms
-#     rp_b2a_b400   B→A  B ahead by 400 ms
-#     rp_b2a_b700   B→A  B ahead by 700 ms
-#
-#   Bandwidth-condition group (both tracks in sync, no offset):
+#   delay=0 → sync relative-position + bandwidth-condition scenarios:
+#     rp_a2b_sync   A→B  sync (no offset), unlimited BW
+#     rp_b2a_sync   B→A  sync (no offset), unlimited BW
 #     bw_a2b_4500k  A→B  4.5 Mbps  (just above track B)
 #     bw_a2b_7000k  A→B  7.0 Mbps  (comfortable)
 #     bw_b2a_3000k  B→A  3.0 Mbps  (B=4 Mbps exceeds link; A=2.5 Mbps fits)
 #     bw_b2a_7000k  B→A  7.0 Mbps  (comfortable)
 #
+#   delay=N → relative-position scenarios (A→B and B→A, unlimited BW):
+#     rp_a2b_aN     A→B  A ahead by N ms  (B starts N ms late)
+#     rp_b2a_aN     B→A  A ahead by N ms
+#     rp_a2b_bN     A→B  B ahead by N ms  (A starts N ms late)
+#     rp_b2a_bN     B→A  B ahead by N ms
+#
 # Examples:
 #   bash scripts/experiment.sh --build
 #   bash scripts/experiment.sh --method switch --reps 1
+#   bash scripts/experiment.sh --delays 0,1000,2000 --build
 
 set -euo pipefail
 
@@ -87,9 +84,10 @@ fi
 # ── Experiment defaults ─────────────────────────────────────────────────────────
 
 ALL_METHODS=("switch" "sub-update-forward" "joining-fetch")
-SWITCH_AFTER=5000
-JITTER_BUFFER_MS=200
+SWITCH_AFTER=4400
+JITTER_BUFFER_MS=500
 REPS=3
+DELAYS="0,1000,2000"
 TC_MARK=1
 
 # Track A = track 3 (2.5 Mbps), Track B = track 4 (4 Mbps)
@@ -104,28 +102,7 @@ PUB_OBJECTS_PER_GROUP=25
 PUB_INTERVAL_MS=40
 PUB_GROUP_COUNT=5000
 
-# ── Publisher config groups ─────────────────────────────────────────────────────
-# Each entry: "pub_label delay_a_ms delay_b_ms scenario1 scenario2 ..."
-# Scenario format: "label|sequence|bw_bps"
-#   label    — used in output filename: {method}_{label}_rep{n}.json
-#   sequence — track sequence for --track-sequence (e.g. "3,4" = A→B)
-#   bw_bps   — tc bandwidth cap; 0 = no limit
-
-declare -a PUB_GROUPS=(
-  # ── Synchronized (no offset): bandwidth-condition scenarios ──────────────────
-  "sync|0|0|bw_a2b_4500k:3,4:4500000|bw_a2b_7000k:3,4:7000000|bw_b2a_3000k:4,3:3000000|bw_b2a_7000k:4,3:7000000"
-  # ── A ahead (B starts late): B's delay = offset ──────────────────────────────
-  "a_ahead_100|0|100|rp_a2b_a100:3,4:0|rp_b2a_a100:4,3:0"
-  "a_ahead_400|0|400|rp_a2b_a400:3,4:0|rp_b2a_a400:4,3:0"
-  "a_ahead_700|0|700|rp_a2b_a700:3,4:0|rp_b2a_a700:4,3:0"
-  # ── B ahead (A starts late): A's delay = offset ──────────────────────────────
-  "b_ahead_100|100|0|rp_a2b_b100:3,4:0|rp_b2a_b100:4,3:0"
-  "b_ahead_400|400|0|rp_a2b_b400:3,4:0|rp_b2a_b400:4,3:0"
-  "b_ahead_700|700|0|rp_a2b_b700:3,4:0|rp_b2a_b700:4,3:0"
-)
-
-# Derived total per selected methods
-TOTAL_SCENARIOS=16
+# PUB_GROUPS and TOTAL_SCENARIOS are built dynamically after flag parsing.
 
 # ── Paths ───────────────────────────────────────────────────────────────────────
 
@@ -155,6 +132,7 @@ while [[ $# -gt 0 ]]; do
     --no-restart-services) RESTART_SERVICES=false;              shift ;;
     --method)              SELECTED_METHODS+=("$2");             shift 2 ;;
     --reps)              REPS="$2";                           shift 2 ;;
+    --delays)            DELAYS="$2";                         shift 2 ;;
     --switch-after)          SWITCH_AFTER="$2";                shift 2 ;;
     --jitter-buffer-ms)      JITTER_BUFFER_MS="$2";           shift 2 ;;
     --objects-per-group) PUB_OBJECTS_PER_GROUP="$2";          shift 2 ;;
@@ -168,6 +146,28 @@ done
 
 [ ${#SELECTED_METHODS[@]} -eq 0 ] && METHODS=("${ALL_METHODS[@]}") || METHODS=("${SELECTED_METHODS[@]}")
 [ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="$ROOT_DIR/results/$(date +%Y%m%d_%H%M%S)"
+
+# ── Build scenario matrix from --delays ─────────────────────────────────────────
+# Each PUB_GROUPS entry: "pub_label|delay_a_ms|delay_b_ms|label:sequence:bw_bps|..."
+
+declare -a PUB_GROUPS=()
+IFS=',' read -ra _delay_list <<< "$DELAYS"
+for _d in "${_delay_list[@]}"; do
+  if [ "$_d" -eq 0 ]; then
+    PUB_GROUPS+=("sync|0|0|rp_a2b_sync:3,4:0|rp_b2a_sync:4,3:0|bw_a2b_4500k:3,4:4500000|bw_a2b_7000k:3,4:7000000|bw_b2a_3000k:4,3:3000000|bw_b2a_7000k:4,3:7000000")
+  else
+    PUB_GROUPS+=("a_ahead_${_d}|0|${_d}|rp_a2b_a${_d}:3,4:0|rp_b2a_a${_d}:4,3:0")
+    PUB_GROUPS+=("b_ahead_${_d}|${_d}|0|rp_a2b_b${_d}:3,4:0|rp_b2a_b${_d}:4,3:0")
+  fi
+done
+unset _delay_list _d
+
+TOTAL_SCENARIOS=0
+for _g in "${PUB_GROUPS[@]}"; do
+  IFS='|' read -ra _p <<< "$_g"
+  (( TOTAL_SCENARIOS += ${#_p[@]} - 3 )) || true
+done
+unset _g _p
 
 # ── Resume / fresh prompt ───────────────────────────────────────────────────────
 
@@ -237,6 +237,7 @@ meta = {
     "relay_host_ip":    "$RELAY_HOST_IP",
     "relay_port":       $RELAY_PORT,
     "subscriber_ip":    "$subscriber_ip",
+    "delays":           "$DELAYS",
     "switch_after_ms":  $SWITCH_AFTER,
     "jitter_buffer_ms": $JITTER_BUFFER_MS,
     "reps":             $REPS,
@@ -554,6 +555,7 @@ main() {
   log "Relay:            $RELAY_SSH  ($RELAY_HOST_IP:$RELAY_PORT)"
   log "Publisher:        ${PUB_SSH:-local}"
   log "Methods:          ${METHODS[*]}"
+  log "Delays:           $DELAYS"
   log "Switch after:     ${SWITCH_AFTER}ms"
   log "Jitter buffer:    ${JITTER_BUFFER_MS}ms"
   log "Reps:             $REPS"
