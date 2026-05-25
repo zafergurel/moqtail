@@ -12,7 +12,7 @@
 #   --build                Build release binaries before running
 #   --skip-start           Skip the initial relay+publisher startup (assume they are already running)
 #   --no-restart-services  Do NOT restart relay+publisher before each run (default: restart each run)
-#   --method  <name>       Only run this method (repeatable; default: all four)
+#   --method  <name>       Only run this method (repeatable; default: all three methods)
 #   --track-sequence <s>   Comma-separated track sequence, e.g. "2,3,4"
 #                          When given, each run performs M switches (M = len-1).
 #                          Default: "3,4" (single upswitch, 720p → 1080p)

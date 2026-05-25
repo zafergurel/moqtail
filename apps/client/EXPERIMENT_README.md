@@ -310,24 +310,37 @@ Subscriber                           Relay
 
 The relay delivers B starting from B's next group boundary after the REQUEST_UPDATE. The subscriber tears down A once the first fresh B I-frame arrives (see §6.1 for freshness definition).
 
-**Method 3 — Joining Fetch** (3–4 control messages)
+**Method 3 — Joining Fetch** (3–5 control messages)
 
 ```
 Subscriber                                 Relay
     │──── SUBSCRIBE B (prio=200, fwd=true) ──►│
     │◄─── SubscribeOk(B) + LargestObject ─────│  relay reports B's current position
     │                                          │
-    │  [if LargestObject.object > 0]           │
+    │  [path A: B mid-group, group ≥ A]        │
     │──── FETCH(joining_start=0, type=Relative)►│  fetch I-frame … LargestObject
     │◄─── FetchOk ─────────────────────────────│
     │◄═══ fetch objects (I-frame … LargestObject) ══│
-    │                                          │
     │◄═══ live B from next group boundary ════│  (first object_id=0 is first decodable)
+    │──── REQUEST_UPDATE(A, fwd=false) ───────►│  stop A
+    │──── REQUEST_UPDATE(B, prio=128) ────────►│  raise B to normal priority
+    │                                          │
+    │  [path B: B behind A]                    │
+    │──── UNSUBSCRIBE(probe) ─────────────────►│  cancel probe (no reply from relay)
+    │──── SUBSCRIBE B (AbsoluteStart=A_group) ►│  re-subscribe from A's current group
+    │◄─── SubscribeOk(B) ──────────────────────│
+    │◄═══ live B from A's current group ══════│  wait for group to arrive at relay
     │──── REQUEST_UPDATE(A, fwd=false) ───────►│  stop A
     │──── REQUEST_UPDATE(B, prio=128) ────────►│  raise B to normal priority
 ```
 
-The relay injects the track's current `LargestObject` position into the SubscribeOk. If B is mid-group (`LargestObject.object > 0`), the client issues a Relative Joining Fetch with `joining_start=0`, asking the relay to deliver all objects in the current group from the I-frame through LargestObject. The live subscription picks up from LargestObject+1 onward. If B happens to be at a group boundary (`LargestObject.object == 0`), the fetch is skipped and the live subscription delivers the I-frame directly (3 control messages instead of 4). Fetch objects are counted as `redundant_bytes`.
+The relay injects the track's current `LargestObject` position into the SubscribeOk. The client then follows one of three paths based on B's group position relative to `decision_a_group`:
+
+- **B group ≥ A, mid-group (`LargestObject.object > 0`):** issue a Relative Joining Fetch with `joining_start=0`, asking the relay to deliver all objects in the current group from the I-frame through LargestObject. The live subscription picks up from LargestObject+1 onward. Fetch objects are counted as `redundant_bytes`. (4 control messages)
+
+- **B at a group boundary (`LargestObject.object == 0`):** no fetch needed; the live subscription delivers the I-frame directly. (3 control messages)
+
+- **B behind A (`LargestObject.group < decision_a_group`):** the probe subscription is cancelled via UNSUBSCRIBE (relay sends no response), and the client issues a new SUBSCRIBE with `AbsoluteStart(decision_a_group, 0)`, asking the relay to start delivering B from A's current group. The client waits for the relay to forward that group (B must publish it first). Stall ≈ B's network delay; AETR ≈ number of groups B is behind. (5 control messages)
 
 **No TRACK_STATUS round trip needed:** The relay already knows B's position when it processes the SUBSCRIBE (it stores `largest_location` per track) and includes it in SubscribeOk. The client gets the information it needs in the same round trip as the subscription itself.
 
@@ -335,17 +348,25 @@ The relay injects the track's current `LargestObject` position into the Subscrib
 
 ## 6. How metrics are computed
 
-### 6.1 Freshness and the switch point
+### 6.1 B I-frame acceptance and the switch point
 
-A B I-frame at group `g_b` is considered **fresh** if `g_b > decision_a_group`, where `decision_a_group` is the last A group seen at the moment the switch decision fires. B I-frames at or below this threshold carry content the player has already committed to displaying and are counted as `redundant_bytes`.
+A B I-frame at group `g_b` is accepted when `g_b > last_a_group_at(now)`, where `last_a_group_at(now)` is computed from presentation timestamps via `PlayerSimulator`:
+
+```
+last_a_group_at(now) = floor((elapsed_ms - JB) / gop_ms) + first_group
+```
+
+`elapsed_ms` = wall-clock time since the first A I-frame was received, `JB` = jitter buffer, `gop_ms = objects_per_group × frame_interval_ms`, `first_group` = group number of the first A I-frame. This is the last A group whose I-frame has entered the player's jitter buffer by `now`.
+
+If no A I-frame has been received yet (base not set), the threshold falls back to `decision_a_group`. B I-frames at or below the threshold carry content the player has already committed to displaying and are counted as `redundant_bytes`.
 
 This check is applied consistently across all three methods:
 
-- **SWITCH**: A stops flowing immediately after the decision; the first B I-frame at `decision_a_group + 1` is accepted.
-- **Sub Update Forward**: A continues flowing post-decision; B I-frames at or below `decision_a_group` are discarded. The first group above the threshold starts the switch. A is torn down at that point.
-- **Joining Fetch**: Both fetch objects and live B objects are subject to the same freshness check.
+- **SWITCH**: A stops flowing immediately after the decision; the first B I-frame whose group exceeds the PT-computed last played A group is accepted.
+- **Sub Update Forward**: A continues flowing post-decision and advances the player model. The first B I-frame above the current threshold starts the switch. A is torn down at that point.
+- **Joining Fetch**: Both fetch objects and live B objects are subject to the same acceptance check.
 
-`latest_played_a_group` is recorded as a diagnostic field (highest A group whose I-frame has been in the jitter buffer ≥ JB ms) but is **not** used as the freshness threshold, because A and B advance at the same rate: if B is permanently Δ ms behind A and Δ ≥ JB, using the played threshold would create an infinite chase where B is never accepted.
+`latest_played_a_group` is recorded as the PT-computed last-played A group at the moment B is accepted.
 
 ### 6.2 Timing definitions
 
@@ -360,59 +381,62 @@ receives:   ──A──A──A──A──A──A─┼─A─A─A─A─�
                                      switch_delay_ms
 ```
 
-| Field             | Formula                                        | What it measures                                                                                                                                                  |
-| ----------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `switch_delay_ms` | `t_first_b_iframe − t_decision`                | Wall-clock delay: how long until the first **fresh** B I-frame (object_id=0, group > decision_a_group) arrived after the switch decision.                         |
-| `delivery_gap_ms` | `max(0, t_first_b_iframe − (t_last_a + 40ms))` | Playout gap: how long after A ended before the fresh B I-frame arrived, minus one frame interval. Clamped to 0 — when B arrives early or on time there is no gap. |
-| `stall_ms`        | see §6.3                                       | Estimated viewer freeze due to missed I-frame deadline                                                                                                            |
+| Field                 | Formula                                        | What it measures                                                                                                |
+| --------------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `switch_delay_ms`     | `t_first_fresh_b − t_decision`                 | Wall-clock delay until the first accepted B I-frame arrived after the switch decision.                          |
+| `stall_ms`            | `max(0, b_started_at_ms − a_stopped_at_ms)`    | Estimated viewer freeze (ms). See §6.3.                                                                         |
+| `skipped_duration_ms` | `skipped_gops × gop_ms`                        | Content skipped when B's group is more than 1 ahead of the last-played A group (content jump).                  |
+| `a_stopped_at_ms`     | `PT(last_a_group + 1, 0)` relative to `t_base` | Presentation timestamp (ms) when A playback ends (start of the GoP after the last played A group).              |
+| `b_started_at_ms`     | `max(PT(b_group, 0), recv_offset + JB)`        | Presentation timestamp (ms) when B playback begins (either PT-based or receive-time-based, whichever is later). |
 
-**Important**: `t_last_a` is updated for every trailing A object that arrives after the decision. It is the receive time of the _last_ A object, not the decision time. This is why `delivery_gap_ms` ≠ `switch_delay_ms`. `t_first_b_iframe` is the arrival time of the first **fresh** B I-frame (object_id=0, group > decision_a_group); stale or pre-boundary B objects are not counted.
+`t_first_fresh_b` is the arrival time of the first accepted B I-frame. `PT(group, object)` is the presentation timestamp relative to the base time `t_base` (receive time of the first A I-frame), computed as `(group − first_group) × gop_ms + object × frame_ms + JB`.
 
 ### 6.3 Stall formula
 
 ```
-stall_ms = 0                    if delivery_gap ≤ jitter_buffer
-         = delivery_gap − JB    if delivery_gap > jitter_buffer
+a_stopped_at  = PT(last_a_group + 1, 0)
+              = (last_a_group + 1 − first_group) × gop_ms + JB    [ms from t_base]
+
+b_started_at  = max(PT(b_group, 0), recv_offset + JB)
+              where recv_offset = t_first_fresh_b − t_base
+
+stall_ms      = max(0, b_started_at − a_stopped_at)
 ```
 
-If the I-frame arrived within the jitter budget the player absorbs it silently (no freeze). If it arrived late, the player was frozen for exactly `delivery_gap − JB` ms waiting for the I-frame — no more, no less. The P-frames of the GoP all follow the I-frame in order, so the decoder resumes decoding as soon as the I-frame arrives.
+`a_stopped_at` is when the player would run out of A content — the presentation timestamp of the first frame of the GoP after the last committed A group. `b_started_at` is when B playback can actually begin — either the B I-frame's own presentation timestamp, or the receive-time-derived deadline (whichever is later). The difference is the freeze duration. If B is ready before A runs out, `stall_ms = 0`.
+
+`skipped_gops = max(0, b_group − last_a_group − 1)` counts GoPs of content that were neither played from A nor from B (a content jump). `skipped_duration_ms = skipped_gops × gop_ms`.
 
 ### 6.4 Relationship between switch_delay and stall
 
-These two metrics measure different things and can differ significantly:
+These two metrics measure different things:
 
-- `switch_delay` = `t_first_b − t_decision` — wall-clock time from decision to first fresh B object
-- `stall` = `max(0, delivery_gap − JB)` — how long the player actually froze
+- `switch_delay` = `t_first_b − t_decision` — wall-clock time from decision to first accepted B I-frame
+- `stall` = `max(0, b_started_at − a_stopped_at)` — how long the player actually froze, derived from presentation timestamps
 
-`stall` is typically **smaller** than `switch_delay` because trailing A objects advance `t_last_a` (shrinking the delivery gap relative to the decision time) and the jitter budget absorbs part of the remaining gap.
+`stall` can be zero even when `switch_delay` is large, because A content arriving after the decision extends playback (pushing `a_stopped_at` later) and the jitter buffer absorbs part of any remaining gap.
 
-Example — `a_ahead_400` scenario, `switch`, `JB=200ms`:
+Example — `a_ahead_400` scenario, `switch`, `JB=200ms`, `gop_ms=1000ms`:
 
 ```
-t=0ms        t=140ms                          t=982ms
-  │              │                               │
-  │ decision     │ last A object arrives         │ first fresh B I-frame arrives
-  │              │                               │
-──┼──A──A──A──A──●                               ●══B══B══...
-  │              │◄────── delivery_gap ─────────►│
-  │              │   982ms - 140ms - 40ms = 802ms│
-  │◄──────────────────────────────────────────── │
-        switch_delay = 982ms
+t=0ms         (decision, last_a_group=9)             t=982ms
+  │                                                      │
+  │ decision                                             │ first fresh B I-frame (group 11)
+  │                                                      │
+  a_stopped_at = PT(10, 0) = (10-9)×1000 + 200 = 1200ms from t_base
+  b_started_at = max(PT(11, 0), recv_offset + JB) = max(2200, 982+200) = 2200ms
+  stall_ms = 2200 - 1200 = 1000ms
 ```
 
-- `switch_delay` = 982ms — "B arrived 982ms after the decision."
-- `delivery_gap` = 802ms — "B arrived 802ms after the expected next-frame slot."
-- `stall` = 802 − 200 = **602ms** — "the I-frame was 602ms late; the player froze."
-
-**In summary**: `switch_delay` answers "how long did the switch take?" `stall` answers "how long did the viewer's player actually freeze?"
+**In summary**: `switch_delay` answers "how long did the switch take (network perspective)?" `stall` answers "how long did the viewer's player actually freeze (playout perspective)?"
 
 ### 6.5 Metrics per method (expected behavior)
 
-| Method             | delivery_gap                                                         | stall                               | AETR                  | Notes                                                                                                                                                                                                              |
-| ------------------ | -------------------------------------------------------------------- | ----------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| SWITCH             | Positive when A ahead of B (waits for fresh boundary)                | 0 if gap ≤ JB; gap − JB if gap > JB | Low                   | Gap = time from last A to first fresh B boundary; stall occurs when B is behind A by more than JB                                                                                                                  |
-| Sub Update Forward | ≤ 0 when B is ahead; positive when A is ahead                        | 0 in most cases                     | Medium–High           | Pre-subscribed B starts at its next fresh boundary; A overlaps; AETR varies with group phase at switch time                                                                                                        |
-| Joining Fetch      | null when fetch I-frame arrives before any trailing A; ≤ 0 otherwise | null / 0                            | Low (A→B); High (B→A) | Fetch covers partial group from relay cache; delivery_gap and stall are null when the fetch I-frame arrives before any trailing A. For B→A downswitches the entire B group is fetched as redundant data (AETR≈1.0) |
+| Method             | stall                                                                                  | skipped_duration_ms                  | AETR                                                       | Notes                                                                                                                                                                                                                                                                                             |
+| ------------------ | -------------------------------------------------------------------------------------- | ------------------------------------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SWITCH             | 0 if B group follows last-played A; > 0 otherwise                                      | 0 if B is 1 group ahead; > 0 if more | Low                                                        | A stops flowing; B accepted at first group > last_a_group_at(now). Stall when B is more than JB behind in PT.                                                                                                                                                                                     |
+| Sub Update Forward | 0 in most cases (A keeps advancing player model)                                       | Usually 0                            | Medium–High                                                | A overlaps post-decision and advances the player model; B accepted when its group exceeds the live threshold. AETR varies with group phase.                                                                                                                                                       |
+| Joining Fetch      | 0 when sync/B-ahead (fetch fills partial group); ≈ B's delay when B ≥ 1 group behind A | Usually 0                            | Low (sync/B-ahead); ≈ N groups when B is N groups behind A | Three paths: (1) B mid-group same/ahead group → fetch fills partial group, stall≈0; (2) B at boundary → no fetch; (3) B ≥ 1 group behind A → probe cancelled, re-subscribed from A's current group; stall ≈ B delay, AETR ≈ N. For B→A downswitches in path 1, entire B group fetched (AETR≈1.0). |
 
 ---
 
@@ -460,14 +484,15 @@ delay_A=400ms, delay_B=0 (B ahead scenario, "b_ahead_400"):
 
 ### 7.3 How delay affects each method
 
-| Scenario  | Method             | Expected behavior                                                                            |
-| --------- | ------------------ | -------------------------------------------------------------------------------------------- |
-| A ahead δ | SWITCH             | Waits for first B group > decision_a_group → gap ≈ δ; stall when δ > JB                      |
-| A ahead δ | Sub Update Forward | Waits for fresh B boundary; gap ≤ 0 when B pre-buffered, positive when A significantly ahead |
-| A ahead δ | Joining Fetch      | Fetch fills the partial group; switch_delay dominated by waiting for fresh live B group      |
-| B ahead δ | SWITCH             | B's boundary just passed → B data cached → gap ≈ 0; no stall                                 |
-| B ahead δ | Sub Update Forward | Same: gap ≈ 0                                                                                |
-| B ahead δ | Joining Fetch      | Fetch fills partial group; gap = null                                                        |
+| Scenario           | Method             | Expected behavior                                                                                         |
+| ------------------ | ------------------ | --------------------------------------------------------------------------------------------------------- |
+| A ahead δ          | SWITCH             | Waits for first B group > decision_a_group → gap ≈ δ; stall when δ > JB                                   |
+| A ahead δ          | Sub Update Forward | Waits for fresh B boundary; gap ≤ 0 when B pre-buffered, positive when A significantly ahead              |
+| A ahead δ < gop_ms | Joining Fetch      | B sub-group behind; fetch fills partial group; stall ≈ 0                                                  |
+| A ahead δ ≥ gop_ms | Joining Fetch      | B ≥ 1 group behind; probe cancelled, re-subscribed from A's current group; stall ≈ δ, AETR ≈ ⌊δ / gop_ms⌋ |
+| B ahead δ          | SWITCH             | B's boundary just passed → B data cached → gap ≈ 0; no stall                                              |
+| B ahead δ          | Sub Update Forward | Same: gap ≈ 0                                                                                             |
+| B ahead δ          | Joining Fetch      | Fetch fills partial group; gap = null                                                                     |
 
 ---
 
@@ -609,19 +634,24 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
       "track_from": "3",
       "track_to": "4",
       "switch_delay_ms": 982,
-      "delivery_gap_ms": 403,
       "stall_ms": 203,
+      "a_stopped_at_ms": 1200.0,
+      "b_started_at_ms": 1403.0,
+      "skipped_gops": 0,
+      "skipped_duration_ms": 0,
       "group_boundary_aligned": true,
       "control_messages": 1,
       "redundant_bytes": 0,
-      "trailing_a_bytes": 156254,
+      "pre_switch_a_bytes": 156254,
+      "trailing_a_bytes": 0,
       "useful_b_bytes": 4571402,
-      "excess_bytes": 156254,
+      "b_gop_payload_bytes": 499997,
+      "excess_bytes": 0,
       "total_bytes": 4727656,
-      "aetr": 0.033051,
+      "aetr": 0.0,
       "a_objects_post_decision": 14,
       "decision_a_group": 9,
-      "latest_played_a_group": null,
+      "latest_played_a_group": 9,
       "last_a_group": 9,
       "first_b_group": 10,
       "switched_b_group": 10,
@@ -634,25 +664,30 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 
 ### Metrics reference
 
-| Field                     | Description                                                                                                                                         |
-| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `switch_delay_ms`         | `t_first_fresh_b_iframe − t_decision` (ms). Negative = I-frame arrived before decision (JoiningFetch pre-buffered case).                            |
-| `delivery_gap_ms`         | `max(0, t_first_fresh_b_iframe − (t_last_a + 40ms))`. Playout gap clamped to 0.                                                                     |
-| `stall_ms`                | `0` if gap ≤ JB; `gap − JB` if gap > JB. Estimated freeze: how long the player waited for the I-frame beyond the jitter budget.                     |
-| `decision_a_group`        | A's last group at the moment the switch decision fires. Used as the freshness threshold: B I-frames at or below this group are stale and discarded. |
-| `latest_played_a_group`   | Highest A I-frame group where `arrival_ts + JB ≤ now` at the time of acceptance. Diagnostic only — not used as the freshness gate.                  |
-| `switched_b_group`        | Group number of the first fresh B I-frame (the actual group the decoder switches to).                                                               |
-| `last_a_object_time_ms`   | Signed ms from switch decision to last A object received. Useful for diagnosing trailing-A overlap.                                                 |
-| `first_b_object_time_ms`  | Signed ms from switch decision to first B object of any kind (may precede the I-frame for pre-boundary or stale objects).                           |
-| `group_boundary_aligned`  | First accepted B object had `object_id == 0` (I-frame).                                                                                             |
-| `control_messages`        | Switch-specific control messages sent.                                                                                                              |
-| `redundant_bytes`         | Stale or pre-boundary B objects (group ≤ decision_a_group, or object_id > 0 before first I-frame).                                                  |
-| `trailing_a_bytes`        | A bytes received after switch decision.                                                                                                             |
-| `useful_b_bytes`          | B bytes from first fresh group boundary onward.                                                                                                     |
-| `excess_bytes`            | `redundant_bytes + trailing_a_bytes`.                                                                                                               |
-| `total_bytes`             | `useful_b_bytes + excess_bytes`.                                                                                                                    |
-| `aetr`                    | `excess_bytes / total_bytes` per switch. Top-level `aetr` is mean across all switches.                                                              |
-| `a_objects_post_decision` | A objects that arrived after the decision.                                                                                                          |
+| Field                     | Description                                                                                                                                  |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `switch_delay_ms`         | `t_first_accepted_b_iframe − t_decision` (ms).                                                                                               |
+| `stall_ms`                | `max(0, b_started_at_ms − a_stopped_at_ms)`. Estimated freeze using presentation timestamps (see §6.3).                                      |
+| `a_stopped_at_ms`         | PT when A playback ends: `(last_a_group + 1 − first_group) × gop_ms + JB` (ms from t_base).                                                  |
+| `b_started_at_ms`         | PT when B playback begins: `max(PT(b_group,0), recv_offset + JB)` (ms from t_base).                                                          |
+| `skipped_gops`            | `max(0, b_group − last_a_group − 1)`. GoPs of content skipped when B is more than 1 group ahead of the last played A group.                  |
+| `skipped_duration_ms`     | `skipped_gops × gop_ms`. Duration of content jump in ms.                                                                                     |
+| `decision_a_group`        | Last A group seen at switch decision time. Fallback freshness threshold when PT base is not yet set.                                         |
+| `latest_played_a_group`   | PT-computed last-played A group at the moment B I-frame is accepted.                                                                         |
+| `switched_b_group`        | Group number of the first accepted B I-frame.                                                                                                |
+| `last_a_object_time_ms`   | Signed ms from switch decision to last A object received.                                                                                    |
+| `first_b_object_time_ms`  | Signed ms from switch decision to first B object of any kind.                                                                                |
+| `group_boundary_aligned`  | First accepted B object had `object_id == 0` (I-frame).                                                                                      |
+| `control_messages`        | Switch-specific control messages sent.                                                                                                       |
+| `redundant_bytes`         | Stale or pre-boundary B objects (group ≤ threshold, or object_id > 0 before first I-frame).                                                  |
+| `pre_switch_a_bytes`      | A bytes received after the decision but before the first accepted B I-frame. Not counted in AETR (these are needed for playback continuity). |
+| `trailing_a_bytes`        | A bytes received **after** the first accepted B I-frame. Counted as excess in AETR.                                                          |
+| `useful_b_bytes`          | B bytes from first accepted group boundary onward.                                                                                           |
+| `excess_bytes`            | `redundant_bytes + trailing_a_bytes`.                                                                                                        |
+| `total_bytes`             | `useful_b_bytes + excess_bytes`.                                                                                                             |
+| `b_gop_payload_bytes`     | Payload size of one complete accepted B group. Used as the AETR denominator.                                                                 |
+| `aetr`                    | `excess_bytes / b_gop_payload_bytes` per switch. Top-level `aetr` is mean across all switches.                                               |
+| `a_objects_post_decision` | A objects that arrived after the decision.                                                                                                   |
 
 ### Switch method summary
 

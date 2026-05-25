@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use crate::connection::MoqConnection;
-use crate::stats::{SwitchRecord, SwitchStats};
+use crate::stats::{BAcceptance, PlayerSimulator, SwitchRecord, SwitchStats};
 use anyhow::Result;
+
+use moqtail::model::common::location::Location;
 use moqtail::model::common::tuple::{Tuple, TupleField};
 use moqtail::model::control::constant::FetchType;
 use moqtail::model::control::control_message::ControlMessage;
@@ -22,10 +24,12 @@ use moqtail::model::control::fetch::Fetch;
 use moqtail::model::control::request_update::RequestUpdate;
 use moqtail::model::control::subscribe::Subscribe;
 use moqtail::model::control::switch::Switch;
+use moqtail::model::control::unsubscribe::Unsubscribe;
 use moqtail::model::parameter::message_parameter::MessageParameter;
 use moqtail::transport::data_stream_handler::{FetchRequest, RecvDataStream};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::Duration;
@@ -86,6 +90,124 @@ struct ObjectEvent {
   received_at: Instant,
 }
 
+// ─── Event log ───────────────────────────────────────────────────────────────
+
+struct EventLogInner {
+  entries: Vec<(Instant, String)>,
+  alias_labels: HashMap<u64, String>,
+  t0: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct EventLog {
+  inner: Arc<Mutex<EventLogInner>>,
+}
+
+impl EventLog {
+  fn new() -> Self {
+    Self {
+      inner: Arc::new(Mutex::new(EventLogInner {
+        entries: Vec::new(),
+        alias_labels: HashMap::new(),
+        t0: None,
+      })),
+    }
+  }
+
+  /// Set the log's time origin to the first I-frame arrival. All timestamps
+  /// in the CSV will be relative to this instant (negative = arrived before
+  /// the first I-frame, and therefore before playback could start).
+  fn set_t0(&self, t: Instant) {
+    let mut g = self.inner.lock().unwrap();
+    if g.t0.is_none() {
+      g.t0 = Some(t);
+    }
+  }
+
+  fn register_alias(&self, alias: u64, label: &str) {
+    self
+      .inner
+      .lock()
+      .unwrap()
+      .alias_labels
+      .insert(alias, label.to_string());
+  }
+
+  fn record_object(&self, alias: u64, group: u64, object: u64, ts: Instant) {
+    let mut g = self.inner.lock().unwrap();
+    let label = g
+      .alias_labels
+      .get(&alias)
+      .cloned()
+      .unwrap_or_else(|| alias.to_string());
+    g.entries
+      .push((ts, format!("object,{},{},{}", label, group, object)));
+  }
+
+  fn record(&self, ts: Instant, line: impl Into<String>) {
+    self.inner.lock().unwrap().entries.push((ts, line.into()));
+  }
+
+  fn flush(&self, path: &str) -> std::io::Result<()> {
+    let g = self.inner.lock().unwrap();
+    let mut entries = g.entries.clone();
+    let t0 = g.t0.unwrap_or_else(|| {
+      entries
+        .first()
+        .map(|(ts, _)| *ts)
+        .unwrap_or_else(Instant::now)
+    });
+    drop(g);
+    entries.sort_by_key(|(ts, _)| *ts);
+
+    // Compute signed wall-clock ms for each entry.
+    let with_ms: Vec<(i128, &str)> = entries
+      .iter()
+      .map(|(ts, line)| {
+        let ms: i128 = if *ts >= t0 {
+          ts.duration_since(t0).as_millis() as i128
+        } else {
+          -(t0.duration_since(*ts).as_millis() as i128)
+        };
+        (ms, line.as_str())
+      })
+      .collect();
+
+    // Build PT lookup: key = "{label},{group},{object},{wall_ms}" -> pt_value string.
+    // pt line format: pt,{label},{group},{object},{pt_ms}
+    let mut pt_lookup: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (ms, line) in &with_ms {
+      if let Some(rest) = line.strip_prefix("pt,") {
+        let mut it = rest.rsplitn(2, ',');
+        if let (Some(pt_val), Some(prefix)) = (it.next(), it.next()) {
+          pt_lookup.insert(format!("{},{}", prefix, ms), pt_val.to_string());
+        }
+      }
+    }
+
+    // Emit lines: skip pt rows; append PT to matching object rows.
+    let mut content = String::new();
+    for (ms, line) in &with_ms {
+      if line.starts_with("pt,") {
+        continue;
+      }
+      if let Some(rest) = line.strip_prefix("object,") {
+        // key = "{label},{group},{object},{wall_ms}"
+        let key = format!("{},{}", rest, ms);
+        if let Some(pt) = pt_lookup.get(&key) {
+          content.push_str(&format!("object,{},{},{}\n", rest, ms, pt));
+        } else {
+          content.push_str(&format!("object,{},{}\n", rest, ms));
+        }
+      } else {
+        content.push_str(&format!("{},{}\n", line, ms));
+      }
+    }
+
+    std::fs::write(path, content)
+  }
+}
+
 /// Running state across switches.
 struct SwitchState {
   /// Track alias of the currently active subscription.
@@ -127,12 +249,14 @@ async fn receiver_task(
   conn: Arc<wtransport::Connection>,
   pending_fetches: Arc<RwLock<BTreeMap<u64, FetchRequest>>>,
   tx: mpsc::UnboundedSender<ObjectEvent>,
+  elog: EventLog,
 ) {
   loop {
     match conn.accept_uni().await {
       Ok(stream) => {
         let tx_clone = tx.clone();
         let pf_clone = pending_fetches.clone();
+        let elog_clone = elog.clone();
         tokio::spawn(async move {
           let stream_handler = RecvDataStream::new(stream, pf_clone);
           let mut handler = &stream_handler;
@@ -140,12 +264,19 @@ async fn receiver_task(
             let (next_handler, object) = handler.next_object().await;
             match object {
               Some(obj) => {
+                let received_at = Instant::now();
+                elog_clone.record_object(
+                  obj.track_alias,
+                  obj.location.group,
+                  obj.location.object,
+                  received_at,
+                );
                 let event = ObjectEvent {
                   track_alias: obj.track_alias,
                   group: obj.location.group,
                   object: obj.location.object,
                   payload_size: obj.payload.as_ref().map_or(0, |p| p.len()),
-                  received_at: Instant::now(),
+                  received_at,
                 };
                 if tx_clone.send(event).is_err() {
                   return;
@@ -215,6 +346,178 @@ async fn send_request_update(
     .map_err(|e| anyhow::anyhow!("RequestUpdate send failed: {:?}", e))
 }
 
+// ─── Phase-3 event helpers ────────────────────────────────────────────────────
+
+fn handle_a_object(
+  ev: &ObjectEvent,
+  record: &mut SwitchRecord,
+  player: &mut PlayerSimulator,
+  elog: &EventLog,
+  first_b_seen: bool,
+) {
+  record.last_a_object_time = Some(ev.received_at);
+  record.last_a_group = Some(ev.group);
+  record.last_a_object = Some(ev.object);
+  record.a_objects_post_decision += 1;
+  if first_b_seen {
+    record.trailing_a_bytes += ev.payload_size as u64;
+  } else {
+    record.pre_switch_a_bytes += ev.payload_size as u64;
+  }
+  if ev.object == 0 && player.set_base_if_unset(ev.group, ev.received_at) {
+    elog.set_t0(ev.received_at);
+  }
+  if let Some(pt) = player.pt_ms(ev.group, ev.object, false) {
+    elog.record(
+      ev.received_at,
+      format!("pt,A,{},{},{:.1}", ev.group, ev.object, pt),
+    );
+  }
+}
+
+/// Handle a single object from a B or Fetch source.
+///
+/// `pt_label`: event-log label — `"B"` for live B, `"F"` for fetch objects.
+/// `initial_pt_for_b`: `false` → log A-timeline PT before reset_base (fetch);
+///                     `true`  → returns None before reset_base, so no-op until acceptance (live B).
+///
+/// Returns `true` when a B I-frame is accepted so the caller can trigger
+/// method-specific async side-effects (stop-A, elevate-B, set deadline).
+fn process_b_object(
+  ev: &ObjectEvent,
+  player: &mut PlayerSimulator,
+  record: &mut SwitchRecord,
+  elog: &EventLog,
+  overdue_target: &mut Option<u64>,
+  first_b_seen: &mut bool,
+  pt_label: &str,
+  initial_pt_for_b: bool,
+) -> bool {
+  if let Some(pt) = player.pt_ms(ev.group, ev.object, initial_pt_for_b) {
+    elog.record(
+      ev.received_at,
+      format!("pt,{},{},{},{:.1}", pt_label, ev.group, ev.object, pt),
+    );
+  }
+  if record.first_b_object_time.is_none() {
+    record.first_b_object_time = Some(ev.received_at);
+    record.first_b_group = Some(ev.group);
+  }
+  if *first_b_seen {
+    record.useful_b_bytes += ev.payload_size as u64;
+    if record.b_gop_payload_bytes.is_none() {
+      if ev.object == 0 {
+        record.b_gop_payload_bytes = Some(record.b_cur_gop_bytes);
+      } else {
+        record.b_cur_gop_bytes += ev.payload_size as u64;
+      }
+    }
+    return false;
+  }
+  if ev.object != 0 {
+    record.redundant_bytes += ev.payload_size as u64;
+    record.b_objects_pre_active += 1;
+    return false;
+  }
+  let result = if let Some(tg) = *overdue_target {
+    if ev.group >= tg {
+      BAcceptance::Overdue
+    } else {
+      BAcceptance::Stale
+    }
+  } else {
+    player.check_b_iframe(ev.group, ev.received_at)
+  };
+  match result {
+    BAcceptance::Fresh(threshold) => {
+      let (last_played_a_group, last_played_a_object) = threshold;
+      record.latest_played_a_group = Some(last_played_a_group);
+      record.latest_played_a_object = Some(last_played_a_object);
+      player.reset_base(ev.group, ev.received_at);
+      if let Some((a_ms, b_ms, stall, sg, sd)) = player.compute_switch_metrics(
+        last_played_a_group,
+        last_played_a_object,
+        ev.group,
+        ev.received_at,
+      ) {
+        record.a_stopped_at_ms = Some(a_ms);
+        record.b_started_at_ms = Some(b_ms);
+        record.skipped_gops = sg;
+        record.skipped_duration_ms = sd;
+        info!(
+          "{}: PT metrics a_stopped={:.1} b_started={:.1} stall={}ms skipped_gops={}",
+          pt_label, a_ms, b_ms, stall, sg
+        );
+      }
+      if let Some(pt) = player.pt_ms(ev.group, 0, true) {
+        elog.record(
+          ev.received_at,
+          format!("pt,{},{},0,{:.1}", pt_label, ev.group, pt),
+        );
+      }
+      record.actual_switch_time = Some(ev.received_at);
+      record.switched_b_group = Some(ev.group);
+      record.group_boundary_aligned = Some(true);
+      record.b_cur_gop_bytes = ev.payload_size as u64;
+      *first_b_seen = true;
+      elog.record(ev.received_at, format!("fresh_b_iframe,{}", ev.group));
+      record.useful_b_bytes += ev.payload_size as u64;
+      true
+    }
+    BAcceptance::Overdue => {
+      let last_played_a_group = record
+        .last_a_group
+        .unwrap_or(record.decision_a_group.unwrap_or(0));
+      let last_played_a_object = record
+        .last_a_object
+        .unwrap_or(record.decision_a_object.unwrap_or(0));
+      record.latest_played_a_group = Some(last_played_a_group);
+      record.latest_played_a_object = Some(last_played_a_object);
+      player.reset_base(ev.group, ev.received_at);
+      if let Some((a_ms, b_ms, stall, sg, sd)) = player.compute_switch_metrics(
+        last_played_a_group,
+        last_played_a_object,
+        ev.group,
+        ev.received_at,
+      ) {
+        record.a_stopped_at_ms = Some(a_ms);
+        record.b_started_at_ms = Some(b_ms);
+        record.skipped_gops = sg;
+        record.skipped_duration_ms = sd;
+        info!(
+          "{}: PT metrics a_stopped={:.1} b_started={:.1} stall={}ms skipped_gops={}",
+          pt_label, a_ms, b_ms, stall, sg
+        );
+      }
+      if let Some(pt) = player.pt_ms(ev.group, 0, true) {
+        elog.record(
+          ev.received_at,
+          format!("pt,{},{},0,{:.1}", pt_label, ev.group, pt),
+        );
+      }
+      record.actual_switch_time = Some(ev.received_at);
+      record.switched_b_group = Some(ev.group);
+      record.group_boundary_aligned = Some(true);
+      record.b_cur_gop_bytes = ev.payload_size as u64;
+      *first_b_seen = true;
+      elog.record(ev.received_at, format!("fresh_b_iframe,{}", ev.group));
+      record.useful_b_bytes += ev.payload_size as u64;
+      true
+    }
+    BAcceptance::OverduePending(tg) => {
+      *overdue_target = Some(tg);
+      record.b_objects_pre_active += 1;
+      record.redundant_bytes += ev.payload_size as u64;
+      false
+    }
+    BAcceptance::Stale => {
+      record.b_objects_pre_active += 1;
+      record.redundant_bytes += ev.payload_size as u64;
+      false
+    }
+  }
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
@@ -243,10 +546,13 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
   .await?;
 
   // Start the background receiver task.
+  let elog = EventLog::new();
+  elog.register_alias(initial_alias, "A");
   let (tx, mut rx) = mpsc::unbounded_channel::<ObjectEvent>();
   let conn_clone = connection.clone();
   let pf_clone = pending_fetches.clone();
-  tokio::spawn(async move { receiver_task(conn_clone, pf_clone, tx).await });
+  let elog_rt = elog.clone();
+  tokio::spawn(async move { receiver_task(conn_clone, pf_clone, tx, elog_rt).await });
 
   let mut state = SwitchState::new(initial_alias);
   let mut stats = SwitchStats::new(
@@ -277,6 +583,7 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
           from_track,
           to_track,
           &config,
+          &elog,
         )
         .await?
       }
@@ -284,6 +591,7 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
       SwitchMethod::SubUpdateForward => {
         // Pre-subscribe the target track with forward=false.
         let b_req_id = state.take_req_id();
+        elog.record(Instant::now(), "subscribe_b");
         let b_alias = subscribe_track(
           &mut control_stream,
           &config.namespace,
@@ -293,6 +601,8 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
           false,
         )
         .await?;
+        elog.record(Instant::now(), "subscribe_ok_b");
+        elog.register_alias(b_alias, "B");
         run_sub_update_forward_phase(
           &mut control_stream,
           &mut rx,
@@ -302,6 +612,7 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
           from_track,
           to_track,
           &config,
+          &elog,
         )
         .await?
       }
@@ -315,14 +626,16 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
           from_track,
           to_track,
           &config,
+          &elog,
         )
         .await?
       }
     };
 
-    // Advance state for the next switch.
+    // Advance state for the next switch: the new current track becomes "A".
     state.current_alias = phase.new_alias;
     state.current_req_id = phase.new_req_id;
+    elog.register_alias(phase.new_alias, "A");
     stats.switches.push(phase.record);
   }
 
@@ -334,103 +647,21 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
   if let Some(ref path) = config.output_json {
     std::fs::write(path, &json)?;
     info!("Stats written to {}", path);
+    let log_path = path.replace(".json", "_events.csv");
+    if let Err(e) = elog.flush(&log_path) {
+      warn!("Failed to write event log: {:?}", e);
+    } else {
+      info!("Event log written to {}", log_path);
+    }
   }
 
   connection.close(0u32.into(), b"Done");
   Ok(())
 }
 
-// ─── Freshness tracker ───────────────────────────────────────────────────────
-//
-// Determines whether an incoming B I-frame carries content the player has not
-// yet displayed.  A B I-frame at group g is "fresh" iff g > threshold, where:
-//
-//   threshold = latest_played_a_group  (if any A I-frame crossed JB)
-//             | decision_a_group       (fallback: A's last group at decision)
-//             | 0
-//
-// latest_played_a_group advances whenever an A I-frame that arrived more than
-// jitter_buffer_ms ago is detected — meaning the player has committed to
-// displaying it.
-
-struct FreshnessTracker {
-  jitter_buffer_ms: u64,
-  decision_a_group: Option<u64>,
-  last_a_iframe_group: Option<u64>,
-  last_a_iframe_ts: Option<Instant>,
-  latest_played_a_group: Option<u64>,
-}
-
-impl FreshnessTracker {
-  fn new(jitter_buffer_ms: u64, decision_a_group: Option<u64>) -> Self {
-    Self {
-      jitter_buffer_ms,
-      decision_a_group,
-      last_a_iframe_group: None,
-      last_a_iframe_ts: None,
-      latest_played_a_group: None,
-    }
-  }
-
-  /// Call when an A I-frame (object == 0) arrives.
-  fn on_a_iframe(&mut self, group: u64, received_at: Instant) {
-    // Check whether the previous A I-frame has now been played before we
-    // overwrite it.
-    self.try_advance_played();
-    self.last_a_iframe_group = Some(group);
-    self.last_a_iframe_ts = Some(received_at);
-    info!(
-      "freshness: new A I-frame recorded group={}, latest_played_a_group={:?}",
-      group, self.latest_played_a_group
-    );
-  }
-
-  /// Advance latest_played_a_group if the tracked A I-frame has been in the
-  /// jitter buffer long enough to be considered played.
-  fn try_advance_played(&mut self) {
-    if let (Some(ts), Some(grp)) = (self.last_a_iframe_ts, self.last_a_iframe_group)
-      && ts.elapsed().as_millis() as u64 >= self.jitter_buffer_ms
-      && self.latest_played_a_group.is_none_or(|p| grp > p)
-    {
-      self.latest_played_a_group = Some(grp);
-      info!(
-        "freshness: A I-frame played — latest_played_a_group advances to {}",
-        grp
-      );
-    }
-  }
-
-  /// Returns true if a B I-frame at `b_group` is fresh enough to decode.
-  ///
-  /// Threshold is fixed at `decision_a_group` — the content position A had
-  /// committed to when the switch was decided.  We do NOT advance it with
-  /// `latest_played_a_group` because A and B advance at the same rate: if B
-  /// is permanently Δ ms behind A and Δ ≥ JB, every B group g arrives after
-  /// A group g is "played", so the threshold would chase B indefinitely and
-  /// the switch would never complete.  `latest_played_a_group` is still
-  /// tracked for reporting purposes.
-  fn is_b_iframe_fresh(&mut self, b_group: u64) -> bool {
-    self.try_advance_played();
-    let threshold = self.decision_a_group.unwrap_or(0);
-    let fresh = b_group > threshold;
-    if fresh {
-      info!(
-        "freshness: B I-frame FRESH — group={} > threshold={} (latest_played={:?})",
-        b_group, threshold, self.latest_played_a_group
-      );
-    } else {
-      info!(
-        "freshness: B I-frame STALE — group={} <= threshold={}, discarding",
-        b_group, threshold
-      );
-    }
-    fresh
-  }
-
-  fn apply_to_record(&self, record: &mut SwitchRecord) {
-    record.latest_played_a_group = self.latest_played_a_group;
-  }
-}
+// B I-frame acceptance and PT-based stall/skip metrics are handled by
+// PlayerSimulator (stats.rs).  A B I-frame is accepted when its group ID
+// exceeds the last A group the player has committed to at that instant.
 
 // ─── Method A: SWITCH ────────────────────────────────────────────────────────
 
@@ -441,23 +672,33 @@ async fn run_switch_phase(
   from_track: &str,
   to_track: &str,
   config: &SwitchTestConfig,
+  elog: &EventLog,
 ) -> Result<PhaseResult> {
   let mut record = SwitchRecord::new(from_track, to_track);
   let current_alias = state.current_alias;
   let current_req_id = state.current_req_id;
+  let mut player = PlayerSimulator::new(&config.playout);
 
   // Phase 1: receive current track objects for switch_after_ms.
   let deadline = tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms);
   loop {
     tokio::select! {
       _ = tokio::time::sleep_until(deadline) => {
-        record.switch_decision_time = Some(Instant::now());
+        let now = Instant::now();
+        record.switch_decision_time = Some(now);
+        elog.record(now, "switch_decision");
         break
       },
       ev = rx.recv() => match ev {
         Some(ev) if ev.track_alias == current_alias => {
           record.last_a_object_time = Some(ev.received_at);
           record.last_a_group = Some(ev.group);
+          record.last_a_object = Some(ev.object);
+          if ev.object == 0
+            && player.set_base_if_unset(ev.group, ev.received_at) { elog.set_t0(ev.received_at); }
+          if let Some(pt) = player.pt_ms(ev.group, ev.object, false) {
+            elog.record(ev.received_at, format!("pt,A,{},{},{:.1}", ev.group, ev.object, pt));
+          }
         }
         Some(_) => {}
         None => break,
@@ -465,10 +706,10 @@ async fn run_switch_phase(
     }
   }
   record.decision_a_group = record.last_a_group;
-  let mut freshness = FreshnessTracker::new(config.playout.jitter_buffer_ms, record.last_a_group);
+  record.decision_a_object = record.last_a_object;
   info!(
-    "switch: decision fired, decision_a_group={:?}",
-    record.decision_a_group
+    "switch: decision fired, decision_a_group={:?}, decision_a_object={:?}",
+    record.decision_a_group, record.decision_a_object
   );
 
   // Phase 2: send SWITCH message.
@@ -491,6 +732,7 @@ async fn run_switch_phase(
     tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms.max(10_000));
   let mut b_alias: Option<u64> = None;
   let mut first_b_seen = false;
+  let mut overdue_target: Option<u64> = None;
 
   loop {
     tokio::select! {
@@ -498,32 +740,10 @@ async fn run_switch_phase(
       ev = rx.recv() => match ev {
         Some(ev) => {
           if ev.track_alias == current_alias {
-            record.last_a_object_time = Some(ev.received_at);
-            record.trailing_a_bytes += ev.payload_size as u64;
-            record.a_objects_post_decision += 1;
-            if ev.object == 0 {
-              freshness.on_a_iframe(ev.group, ev.received_at);
-            }
+            handle_a_object(&ev, &mut record, &mut player, elog, first_b_seen);
           } else if b_alias == Some(ev.track_alias) {
-            if record.first_b_object_time.is_none() {
-              record.first_b_object_time = Some(ev.received_at);
-              record.first_b_group = Some(ev.group);
-            }
-            if !first_b_seen {
-              if ev.object == 0 && freshness.is_b_iframe_fresh(ev.group) {
-                record.actual_switch_time = Some(ev.received_at);
-                record.switched_b_group = Some(ev.group);
-                record.group_boundary_aligned = Some(true);
-                first_b_seen = true;
-                info!("switch: accepted fresh B I-frame, switched_b_group={}", ev.group);
-                record.useful_b_bytes += ev.payload_size as u64;
-              } else {
-                record.redundant_bytes += ev.payload_size as u64;
-                record.b_objects_pre_active += 1;
-              }
-            } else {
-              record.useful_b_bytes += ev.payload_size as u64;
-            }
+            process_b_object(&ev, &mut player, &mut record, elog,
+                             &mut overdue_target, &mut first_b_seen, "B", true);
           }
         }
         None => break,
@@ -531,6 +751,8 @@ async fn run_switch_phase(
       msg = cs.next_message() => match msg {
         Ok(ControlMessage::SubscribeOk(m)) => {
           info!("switch: SubscribeOk for {}, alias={}", to_track, m.track_alias);
+          elog.record(Instant::now(), "subscribe_ok_b");
+          elog.register_alias(m.track_alias, "B");
           b_alias = Some(m.track_alias);
         }
         Ok(other) => info!("switch: unexpected ctrl msg: {:?}", other),
@@ -539,7 +761,6 @@ async fn run_switch_phase(
     }
   }
 
-  freshness.apply_to_record(&mut record);
   let new_alias = b_alias.unwrap_or(current_alias);
   Ok(PhaseResult {
     record,
@@ -559,24 +780,34 @@ async fn run_sub_update_forward_phase(
   from_track: &str,
   to_track: &str,
   config: &SwitchTestConfig,
+  elog: &EventLog,
 ) -> Result<PhaseResult> {
   let mut record = SwitchRecord::new(from_track, to_track);
   record.control_messages += 1; // SUBSCRIBE B already sent
   let current_alias = state.current_alias;
   let current_req_id = state.current_req_id;
+  let mut player = PlayerSimulator::new(&config.playout);
 
   // Phase 1: receive A objects for switch_after_ms.
   let deadline = tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms);
   loop {
     tokio::select! {
       _ = tokio::time::sleep_until(deadline) => {
-        record.switch_decision_time = Some(Instant::now());
+        let now = Instant::now();
+        record.switch_decision_time = Some(now);
+        elog.record(now, "switch_decision");
         break
       },
       ev = rx.recv() => match ev {
         Some(ev) if ev.track_alias == current_alias => {
           record.last_a_object_time = Some(ev.received_at);
           record.last_a_group = Some(ev.group);
+          record.last_a_object = Some(ev.object);
+          if ev.object == 0
+            && player.set_base_if_unset(ev.group, ev.received_at) { elog.set_t0(ev.received_at); }
+          if let Some(pt) = player.pt_ms(ev.group, ev.object, false) {
+            elog.record(ev.received_at, format!("pt,A,{},{},{:.1}", ev.group, ev.object, pt));
+          }
         }
         Some(_) => {}
         None => break,
@@ -584,14 +815,15 @@ async fn run_sub_update_forward_phase(
     }
   }
   record.decision_a_group = record.last_a_group;
-  let mut freshness = FreshnessTracker::new(config.playout.jitter_buffer_ms, record.last_a_group);
+  record.decision_a_object = record.last_a_object;
   info!(
-    "sub-update-forward: decision fired, decision_a_group={:?}",
-    record.decision_a_group
+    "sub-update-forward: decision fired, decision_a_group={:?}, decision_a_object={:?}",
+    record.decision_a_group, record.decision_a_object
   );
 
   // Phase 2: enable B (forward=true).
   let ru_req_b = state.take_req_id();
+  elog.record(Instant::now(), "enable_b");
   send_request_update(
     cs,
     ru_req_b,
@@ -602,12 +834,14 @@ async fn run_sub_update_forward_phase(
   record.control_messages += 1;
 
   // Phase 3: drain A and B concurrently.
-  // A keeps flowing and advancing the freshness threshold.
+  // A keeps flowing and advancing the player model.
   // Tear down A only when the first FRESH B I-frame arrives.
   let post_deadline =
     tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms.max(10_000));
   let mut first_b_seen = false;
+  let mut a_stopped = false;
   let mut post_b_deadline: Option<tokio::time::Instant> = None;
+  let mut overdue_target: Option<u64> = None;
 
   loop {
     let maybe_post = post_b_deadline;
@@ -620,48 +854,26 @@ async fn run_sub_update_forward_phase(
       ev = rx.recv() => match ev {
         Some(ev) => {
           if ev.track_alias == current_alias {
-            record.last_a_object_time = Some(ev.received_at);
-            record.trailing_a_bytes += ev.payload_size as u64;
-            record.a_objects_post_decision += 1;
-            if ev.object == 0 {
-              freshness.on_a_iframe(ev.group, ev.received_at);
-            }
+            handle_a_object(&ev, &mut record, &mut player, elog, first_b_seen);
           } else if ev.track_alias == b_alias {
-            if record.first_b_object_time.is_none() {
-              record.first_b_object_time = Some(ev.received_at);
-              record.first_b_group = Some(ev.group);
-            }
-            if !first_b_seen {
-              if ev.object == 0 && freshness.is_b_iframe_fresh(ev.group) {
-                // Fresh B I-frame — decoder can start here.
-                record.actual_switch_time = Some(ev.received_at);
-                record.switched_b_group = Some(ev.group);
-                record.group_boundary_aligned = Some(true);
-                first_b_seen = true;
-                info!(
-                  "sub-update-forward: accepted fresh B I-frame, switched_b_group={}",
-                  ev.group
-                );
-
-                // Tear down A now that B has a decodable I-frame.
-                let ru_req_a = state.take_req_id();
-                if let Err(e) = send_request_update(
-                  cs, ru_req_a, current_req_id,
-                  vec![MessageParameter::new_forward(false)],
-                ).await {
-                  warn!("sub_update_forward: RequestUpdate A failed: {:?}", e);
-                  break;
-                }
-                record.control_messages += 1;
-                post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
-                record.useful_b_bytes += ev.payload_size as u64;
-              } else {
-                // Stale I-frame or pre-boundary object — not yet decodable.
-                record.b_objects_pre_active += 1;
-                record.redundant_bytes += ev.payload_size as u64;
+            if ev.object == 0 && !a_stopped {
+              let ru_req_a = state.take_req_id();
+              elog.record(Instant::now(), "stop_a");
+              if let Err(e) = send_request_update(
+                cs, ru_req_a, current_req_id,
+                vec![MessageParameter::new_forward(false)],
+              ).await {
+                warn!("sub_update_forward: RequestUpdate A failed: {:?}", e);
+                break;
               }
-            } else {
-              record.useful_b_bytes += ev.payload_size as u64;
+              record.control_messages += 1;
+              a_stopped = true;
+              record.a_stopped_at_ms = player.pt_ms(ev.group, 0, false);
+              info!("sub-update-forward: sent RequestUpdate to stop A at {:?}", ev.received_at);
+            }
+            if process_b_object(&ev, &mut player, &mut record, elog,
+                                &mut overdue_target, &mut first_b_seen, "B", true) {
+              post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
             }
           }
         }
@@ -675,7 +887,6 @@ async fn run_sub_update_forward_phase(
     }
   }
 
-  freshness.apply_to_record(&mut record);
   Ok(PhaseResult {
     record,
     new_alias: b_alias,
@@ -693,10 +904,12 @@ async fn run_joining_fetch_phase(
   from_track: &str,
   to_track: &str,
   config: &SwitchTestConfig,
+  elog: &EventLog,
 ) -> Result<PhaseResult> {
   let mut record = SwitchRecord::new(from_track, to_track);
   let current_alias = state.current_alias;
   let current_req_id = state.current_req_id;
+  let mut player = PlayerSimulator::new(&config.playout);
 
   info!(
     "joining-fetch: Phase1 start, current_alias={}, switch_after_ms={}",
@@ -708,8 +921,10 @@ async fn run_joining_fetch_phase(
   loop {
     tokio::select! {
       _ = tokio::time::sleep_until(deadline) => {
-        record.switch_decision_time = Some(Instant::now());
+        let now = Instant::now();
+        record.switch_decision_time = Some(now);
         record.decision_a_group = record.last_a_group;
+        elog.record(now, "switch_decision");
         info!(
           "joining-fetch: decision fired, last_a_group={:?}, decision_a_group={:?}",
           record.last_a_group, record.decision_a_group
@@ -720,6 +935,12 @@ async fn run_joining_fetch_phase(
         Some(ev) if ev.track_alias == current_alias => {
           record.last_a_object_time = Some(ev.received_at);
           record.last_a_group = Some(ev.group);
+          record.last_a_object = Some(ev.object);
+          if ev.object == 0
+            && player.set_base_if_unset(ev.group, ev.received_at) { elog.set_t0(ev.received_at); }
+          if let Some(pt) = player.pt_ms(ev.group, ev.object, false) {
+            elog.record(ev.received_at, format!("pt,A,{},{},{:.1}", ev.group, ev.object, pt));
+          }
         }
         Some(ev) => {
           info!(
@@ -735,10 +956,7 @@ async fn run_joining_fetch_phase(
       }
     }
   }
-  let mut freshness =
-    FreshnessTracker::new(config.playout.jitter_buffer_ms, record.decision_a_group);
-
-  // Phase 2: send Subscribe-B, await SubscribeOk, optionally send FETCH.
+  // Phase 2: send Subscribe-B (probe), await SubscribeOk, determine strategy.
   let b_req_id = state.take_req_id();
   let subscribe = Subscribe::new_latest_object(
     b_req_id,
@@ -749,72 +967,133 @@ async fn run_joining_fetch_phase(
       MessageParameter::new_forward(true),
     ],
   );
+  elog.record(Instant::now(), "subscribe_b");
   cs.send(&ControlMessage::Subscribe(Box::new(subscribe)))
     .await
     .map_err(|e| anyhow::anyhow!("Subscribe send failed: {:?}", e))?;
   record.control_messages += 1;
 
-  let b_alias = match cs.next_message().await {
-    Ok(ControlMessage::SubscribeOk(m)) => {
-      let alias = m.track_alias;
-      info!(
-        "JoiningFetch: SubscribeOk for {}, alias={}",
-        to_track, alias
-      );
+  let decision_a_group = record.decision_a_group.unwrap_or(0);
 
-      let largest = m.subscribe_parameters.iter().find_map(|p| {
-        if let MessageParameter::LargestObject { location } = p {
-          Some(location.clone())
-        } else {
-          None
-        }
-      });
-
-      if let Some(loc) = largest {
-        if loc.object > 0 {
-          // B is mid-group: issue a Joining Fetch to deliver [I-frame … LargestObject].
-          let fetch_req_id = state.take_req_id();
-          let fetch = Fetch::new_joining(
-            fetch_req_id,
-            FetchType::RelativeFetch,
-            b_req_id,
-            0,
-            vec![MessageParameter::new_subscriber_priority(200)],
-          )
-          .map_err(|e| anyhow::anyhow!("Fetch::new_joining: {}", e))?;
-          cs.send(&ControlMessage::Fetch(Box::new(fetch.clone())))
-            .await
-            .map_err(|e| anyhow::anyhow!("Fetch send failed: {:?}", e))?;
-          pending_fetches
-            .write()
-            .await
-            .insert(fetch_req_id, FetchRequest::new(fetch_req_id, 0, fetch, 0));
-          record.control_messages += 1;
-          loop {
-            match cs.next_message().await {
-              Ok(ControlMessage::FetchOk(m)) => {
-                info!("JoiningFetch FetchOk: {:?}", m);
-                break;
-              }
-              Ok(ControlMessage::RequestOk(m)) => info!("JoiningFetch RequestOk: {:?}", m),
-              Ok(ControlMessage::RequestError(e)) => {
-                anyhow::bail!("JoiningFetch RequestError: {:?}", e)
-              }
-              Ok(m) => warn!("JoiningFetch: unexpected msg after Fetch: {:?}", m),
-              Err(e) => anyhow::bail!("JoiningFetch: error reading FetchOk: {:?}", e),
-            }
-          }
-        } else {
-          info!("JoiningFetch: B at group boundary, no fetch needed");
-        }
-      } else {
-        info!("JoiningFetch: no LargestObject in SubscribeOk");
-      }
-
-      alias
-    }
+  let probe_ok = match cs.next_message().await {
+    Ok(ControlMessage::SubscribeOk(m)) => m,
     Ok(m) => anyhow::bail!("Expected SubscribeOk for {}, got {:?}", to_track, m),
     Err(e) => anyhow::bail!("Error waiting SubscribeOk for {}: {:?}", to_track, e),
+  };
+  let probe_alias = probe_ok.track_alias;
+  elog.record(Instant::now(), "subscribe_ok_b");
+  elog.register_alias(probe_alias, "B");
+  info!(
+    "JoiningFetch: SubscribeOk for {}, alias={}",
+    to_track, probe_alias
+  );
+
+  let largest = probe_ok.subscribe_parameters.iter().find_map(|p| {
+    if let MessageParameter::LargestObject { location } = p {
+      Some(location.clone())
+    } else {
+      None
+    }
+  });
+
+  // Decide strategy based on B's current position relative to A.
+  let (b_alias, active_b_req_id) = if let Some(loc) = largest {
+    if loc.group < decision_a_group {
+      // B is behind A: unsubscribe the probe and re-subscribe from the start of
+      // A's current group. The relay will deliver once B reaches that group.
+      info!(
+        "JoiningFetch: B group {} < A group {}, re-subscribing from A's group start (no fetch)",
+        loc.group, decision_a_group
+      );
+      cs.send(&ControlMessage::Unsubscribe(Box::new(Unsubscribe::new(
+        b_req_id,
+      ))))
+      .await
+      .map_err(|e| anyhow::anyhow!("Unsubscribe send failed: {:?}", e))?;
+      record.control_messages += 1;
+
+      let future_req_id = state.take_req_id();
+      let subscribe_future = Subscribe::new_absolute_start(
+        future_req_id,
+        Tuple::from_utf8_path(&config.namespace),
+        TupleField::from_utf8(to_track),
+        Location {
+          group: decision_a_group,
+          object: 0,
+        },
+        vec![
+          MessageParameter::new_subscriber_priority(128),
+          MessageParameter::new_forward(true),
+        ],
+      );
+      elog.record(Instant::now(), "subscribe_b_future");
+      cs.send(&ControlMessage::Subscribe(Box::new(subscribe_future)))
+        .await
+        .map_err(|e| anyhow::anyhow!("Subscribe (future) send failed: {:?}", e))?;
+      record.control_messages += 1;
+
+      match cs.next_message().await {
+        Ok(ControlMessage::SubscribeOk(m)) => {
+          let future_alias = m.track_alias;
+          elog.register_alias(future_alias, "B");
+          info!("JoiningFetch: SubscribeOk (future) alias={}", future_alias);
+          (future_alias, future_req_id)
+        }
+        Ok(m) => anyhow::bail!(
+          "Expected SubscribeOk (future) for {}, got {:?}",
+          to_track,
+          m
+        ),
+        Err(e) => anyhow::bail!(
+          "Error waiting SubscribeOk (future) for {}: {:?}",
+          to_track,
+          e
+        ),
+      }
+    } else if loc.object > 0 {
+      // B is mid-group and at or ahead of A: issue a Joining Fetch to deliver
+      // [I-frame … LargestObject] so live B can start from the group boundary.
+      let fetch_req_id = state.take_req_id();
+      elog.register_alias(0, "F");
+      let fetch = Fetch::new_joining(
+        fetch_req_id,
+        FetchType::AbsoluteFetch,
+        b_req_id,
+        record.last_a_group.unwrap_or(loc.group),
+        vec![MessageParameter::new_subscriber_priority(50)],
+      )
+      .map_err(|e| anyhow::anyhow!("Fetch::new_joining: {}", e))?;
+      elog.record(Instant::now(), "fetch_sent");
+      cs.send(&ControlMessage::Fetch(Box::new(fetch.clone())))
+        .await
+        .map_err(|e| anyhow::anyhow!("Fetch send failed: {:?}", e))?;
+      pending_fetches
+        .write()
+        .await
+        .insert(fetch_req_id, FetchRequest::new(fetch_req_id, 0, fetch, 0));
+      record.control_messages += 1;
+      loop {
+        match cs.next_message().await {
+          Ok(ControlMessage::FetchOk(m)) => {
+            info!("JoiningFetch FetchOk: {:?}", m);
+            break;
+          }
+          Ok(ControlMessage::RequestOk(m)) => info!("JoiningFetch RequestOk: {:?}", m),
+          Ok(ControlMessage::RequestError(e)) => {
+            anyhow::bail!("JoiningFetch RequestError: {:?}", e)
+          }
+          Ok(m) => warn!("JoiningFetch: unexpected msg after Fetch: {:?}", m),
+          Err(e) => anyhow::bail!("JoiningFetch: error reading FetchOk: {:?}", e),
+        }
+      }
+      (probe_alias, b_req_id)
+    } else {
+      info!("JoiningFetch: B at group boundary, no fetch needed");
+      (probe_alias, b_req_id)
+    }
+  } else {
+    info!("JoiningFetch: no LargestObject in SubscribeOk");
+    (probe_alias, b_req_id)
   };
 
   // Phase 3: collect B until first fresh I-frame, then 5-second tail.
@@ -824,7 +1103,9 @@ async fn run_joining_fetch_phase(
   let post_deadline =
     tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms.max(10_000));
   let mut first_b_seen = false;
+  let mut a_stopped = false;
   let mut post_b_deadline: Option<tokio::time::Instant> = None;
+  let mut overdue_target: Option<u64> = None;
 
   loop {
     let maybe_post = post_b_deadline;
@@ -837,105 +1118,64 @@ async fn run_joining_fetch_phase(
       ev = rx.recv() => match ev {
         Some(ev) => {
           if ev.track_alias == current_alias {
-            // Trailing A object — also advances the freshness threshold.
-            record.last_a_object_time = Some(ev.received_at);
-            record.last_a_group = Some(ev.group);
-            if ev.object == 0 {
-              freshness.on_a_iframe(ev.group, ev.received_at);
-            }
-            if first_b_seen {
-              record.trailing_a_bytes += ev.payload_size as u64;
-              record.a_objects_post_decision += 1;
-            }
+            handle_a_object(&ev, &mut record, &mut player, elog, first_b_seen);
           } else if ev.track_alias == 0 {
             // Fetch object.
-            if record.first_b_object_time.is_none() {
-              record.first_b_object_time = Some(ev.received_at);
-              record.first_b_group = Some(ev.group);
-            }
-            if !first_b_seen {
-              if ev.object == 0 && freshness.is_b_iframe_fresh(ev.group) {
-                record.actual_switch_time = Some(ev.received_at);
-                record.switched_b_group = Some(ev.group);
-                record.group_boundary_aligned = Some(true);
-                first_b_seen = true;
-                info!(
-                  "joining-fetch: accepted fresh fetch I-frame, switched_b_group={}",
-                  ev.group
-                );
-
-                let ru_a_req = state.take_req_id();
-                if let Err(e) = send_request_update(
-                  cs, ru_a_req, current_req_id,
-                  vec![MessageParameter::new_forward(false)],
-                ).await {
-                  warn!("joining_fetch: RequestUpdate A failed: {:?}", e);
-                  break;
-                }
-                record.control_messages += 1;
-
-                let ru_b_req = state.take_req_id();
-                if let Err(e) = send_request_update(
-                  cs, ru_b_req, b_req_id,
-                  vec![MessageParameter::new_subscriber_priority(128)],
-                ).await {
-                  warn!("joining_fetch: RequestUpdate B failed: {:?}", e);
-                  break;
-                }
-                record.control_messages += 1;
-                post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
-                record.useful_b_bytes += ev.payload_size as u64;
-              } else {
-                record.b_objects_pre_active += 1;
-                record.redundant_bytes += ev.payload_size as u64;
+            if ev.object == 0 && !a_stopped {
+              let ru_a_req = state.take_req_id();
+              elog.record(Instant::now(), "stop_a");
+              if let Err(e) = send_request_update(
+                cs, ru_a_req, current_req_id,
+                vec![MessageParameter::new_forward(false)],
+              ).await {
+                warn!("joining_fetch: RequestUpdate A failed: {:?}", e);
+                break;
               }
-            } else {
-              record.useful_b_bytes += ev.payload_size as u64;
+              record.control_messages += 1;
+              a_stopped = true;
+              info!("joining-fetch: sent RequestUpdate to stop A at {:?}", ev.received_at);
+            }
+            if process_b_object(&ev, &mut player, &mut record, elog,
+                                &mut overdue_target, &mut first_b_seen, "F", false) {
+              let ru_b_req = state.take_req_id();
+              if let Err(e) = send_request_update(
+                cs, ru_b_req, active_b_req_id,
+                vec![MessageParameter::new_subscriber_priority(128)],
+              ).await {
+                warn!("joining_fetch: RequestUpdate B failed: {:?}", e);
+                break;
+              }
+              record.control_messages += 1;
+              post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
             }
           } else if ev.track_alias == b_alias {
             // Live B object.
-            if record.first_b_object_time.is_none() {
-              record.first_b_object_time = Some(ev.received_at);
-              record.first_b_group = Some(ev.group);
-            }
-            if !first_b_seen {
-              if ev.object == 0 && freshness.is_b_iframe_fresh(ev.group) {
-                record.actual_switch_time = Some(ev.received_at);
-                record.switched_b_group = Some(ev.group);
-                record.group_boundary_aligned = Some(true);
-                first_b_seen = true;
-                info!(
-                  "joining-fetch: accepted fresh live B I-frame, switched_b_group={}",
-                  ev.group
-                );
-
-                let ru_a_req = state.take_req_id();
-                if let Err(e) = send_request_update(
-                  cs, ru_a_req, current_req_id,
-                  vec![MessageParameter::new_forward(false)],
-                ).await {
-                  warn!("joining_fetch: RequestUpdate A failed: {:?}", e);
-                  break;
-                }
-                record.control_messages += 1;
-
-                let ru_b_req = state.take_req_id();
-                if let Err(e) = send_request_update(
-                  cs, ru_b_req, b_req_id,
-                  vec![MessageParameter::new_subscriber_priority(128)],
-                ).await {
-                  warn!("joining_fetch: RequestUpdate B failed: {:?}", e);
-                  break;
-                }
-                record.control_messages += 1;
-                post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
-                record.useful_b_bytes += ev.payload_size as u64;
-              } else {
-                record.b_objects_pre_active += 1;
-                record.redundant_bytes += ev.payload_size as u64;
+            if ev.object == 0 && !a_stopped {
+              let ru_a_req = state.take_req_id();
+              elog.record(Instant::now(), "stop_a");
+              if let Err(e) = send_request_update(
+                cs, ru_a_req, current_req_id,
+                vec![MessageParameter::new_forward(false)],
+              ).await {
+                warn!("joining_fetch: RequestUpdate A failed: {:?}", e);
+                break;
               }
-            } else {
-              record.useful_b_bytes += ev.payload_size as u64;
+              record.control_messages += 1;
+              a_stopped = true;
+              record.a_stopped_at_ms = player.pt_ms(ev.group, 0, false);
+            }
+            if process_b_object(&ev, &mut player, &mut record, elog,
+                                &mut overdue_target, &mut first_b_seen, "B", true) {
+              let ru_b_req = state.take_req_id();
+              if let Err(e) = send_request_update(
+                cs, ru_b_req, active_b_req_id,
+                vec![MessageParameter::new_subscriber_priority(128)],
+              ).await {
+                warn!("joining_fetch: RequestUpdate B failed: {:?}", e);
+                break;
+              }
+              record.control_messages += 1;
+              post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
             }
           }
         }
@@ -948,11 +1188,9 @@ async fn run_joining_fetch_phase(
       }
     }
   }
-
-  freshness.apply_to_record(&mut record);
   Ok(PhaseResult {
     record,
     new_alias: b_alias,
-    new_req_id: b_req_id,
+    new_req_id: active_b_req_id,
   })
 }

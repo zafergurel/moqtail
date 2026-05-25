@@ -133,6 +133,10 @@ def short_label(label: str) -> str:
     for prefix in ("rp_a2b_", "rp_b2a_", "bw_"):
         if label.startswith(prefix):
             return label[len(prefix):]
+    if label.startswith("a_ahead_"):
+        return "a_" + label[len("a_ahead_"):]
+    if label.startswith("b_ahead_"):
+        return "b_" + label[len("b_ahead_"):]
     return label
 
 
@@ -147,9 +151,10 @@ def _print_table(title, method_rows, col_labels, col_w, label_w):
 def _metric_rows(data, methods, labels, jitter_ms):
     """Yield (title, method_rows) for Delay, Stall, and AETR."""
     for title, key, decimals in [
-        ("  Delay (ms)  [- = timed out]", "switch_delay_ms", 0),
-        (f"  Stall (ms)  [J={jitter_ms}ms]",  "stall_ms",          0),
-        ("  AETR",                             "aetr",              4),
+        ("  Delay (ms)  [- = timed out]", "switch_delay_ms",    0),
+        (f"  Stall (ms)  [J={jitter_ms}ms]",  "stall_ms",       0),
+        ("  Skipped (ms)",                "skipped_duration_ms", 0),
+        ("  AETR",                         "aetr",               4),
     ]:
         rows = []
         for method in methods:
@@ -196,14 +201,16 @@ def print_generic_summary(data: dict, methods):
     if not all_scenarios:
         print("No result files found.")
         return
+    col_labels = [short_label(s) for s in all_scenarios]
     col_w, label_w = 12, 22
     for title, key, decimals in [
-        ("  Delay (ms)", "switch_delay_ms", 0),
-        ("  Stall (ms)", "stall_ms",         0),
-        ("  AETR",       "aetr",             4),
+        ("  Delay (ms)",   "switch_delay_ms",    0),
+        ("  Stall (ms)",   "stall_ms",            0),
+        ("  Skipped (ms)", "skipped_duration_ms", 0),
+        ("  AETR",         "aetr",                4),
     ]:
         print(f"\n{title}")
-        print("  " + f"{'Method':<{label_w}}" + "".join(f"{s:>{col_w}}" for s in all_scenarios))
+        print("  " + f"{'Method':<{label_w}}" + "".join(f"{s:>{col_w}}" for s in col_labels))
         print("  " + "-" * (label_w + col_w * len(all_scenarios)))
         for method in methods:
             if method not in data:
