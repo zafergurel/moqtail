@@ -19,6 +19,8 @@
 #   --reps <n>                 Repetitions per condition (default: 3)
 #   --delays <list>            Comma-separated relative-position delays in ms (default: 0,1000,2000)
 #                              0 → sync baseline with BW scenarios; N → a_ahead_N and b_ahead_N RP scenarios
+#   --downstream-delays <list> Comma-separated one-way relay→subscriber delays in ms (default: disabled)
+#                              Generates delay_a2b_Xms and delay_b2a_Xms scenarios for each X
 #   --switch-after <ms>        Milliseconds per track before triggering the switch (default: 4400)
 #   --jitter-buffer-ms <ms>    Jitter buffer for realtime freeze calculation (default: 500)
 #   --objects-per-group <n>    Objects per group (default: 25, i.e. 1s GOP at 25fps)
@@ -88,6 +90,8 @@ SWITCH_AFTER=4400
 JITTER_BUFFER_MS=500
 REPS=3
 DELAYS="0,1000,2000"
+DOWNSTREAM_DELAYS=""   # comma-separated one-way relay→subscriber delays in ms; empty = skip
+DOWNSTREAM_ONLY=false  # when true, skip RP-sync and BW scenarios; only run downstream-delay scenarios
 TC_MARK=1
 
 # Track A = track 3 (2.5 Mbps), Track B = track 4 (4 Mbps)
@@ -133,6 +137,8 @@ while [[ $# -gt 0 ]]; do
     --method)              SELECTED_METHODS+=("$2");             shift 2 ;;
     --reps)              REPS="$2";                           shift 2 ;;
     --delays)            DELAYS="$2";                         shift 2 ;;
+    --downstream-delays) DOWNSTREAM_DELAYS="$2";             shift 2 ;;
+    --downstream-only)   DOWNSTREAM_ONLY=true;               shift ;;
     --switch-after)          SWITCH_AFTER="$2";                shift 2 ;;
     --jitter-buffer-ms)      JITTER_BUFFER_MS="$2";           shift 2 ;;
     --objects-per-group) PUB_OBJECTS_PER_GROUP="$2";          shift 2 ;;
@@ -154,10 +160,23 @@ declare -a PUB_GROUPS=()
 IFS=',' read -ra _delay_list <<< "$DELAYS"
 for _d in "${_delay_list[@]}"; do
   if [ "$_d" -eq 0 ]; then
-    PUB_GROUPS+=("sync|0|0|rp_a2b_sync:3,4:0|rp_b2a_sync:4,3:0|bw_a2b_4500k:3,4:4500000|bw_a2b_7000k:3,4:7000000|bw_b2a_3000k:4,3:3000000|bw_b2a_7000k:4,3:7000000")
-  else
-    PUB_GROUPS+=("a_ahead_${_d}|0|${_d}|rp_a2b_a${_d}:3,4:0|rp_b2a_a${_d}:4,3:0")
-    PUB_GROUPS+=("b_ahead_${_d}|${_d}|0|rp_a2b_b${_d}:3,4:0|rp_b2a_b${_d}:4,3:0")
+    if "$DOWNSTREAM_ONLY"; then
+      _entry="sync|0|0"
+    else
+      _entry="sync|0|0|rp_a2b_sync:3,4:0:0|rp_b2a_sync:4,3:0:0|bw_a2b_4500k:3,4:4500000:0|bw_a2b_7000k:3,4:7000000:0|bw_b2a_3000k:4,3:3000000:0|bw_b2a_7000k:4,3:7000000:0"
+    fi
+    if [ -n "$DOWNSTREAM_DELAYS" ]; then
+      IFS=',' read -ra _dl_list <<< "$DOWNSTREAM_DELAYS"
+      for _dl in "${_dl_list[@]}"; do
+        _entry+="|delay_a2b_${_dl}ms:3,4:0:${_dl}|delay_b2a_${_dl}ms:4,3:0:${_dl}"
+      done
+      unset _dl_list _dl
+    fi
+    PUB_GROUPS+=("$_entry")
+    unset _entry
+  elif ! "$DOWNSTREAM_ONLY"; then
+    PUB_GROUPS+=("a_ahead_${_d}|0|${_d}|rp_a2b_a${_d}:3,4:0:0|rp_b2a_a${_d}:4,3:0:0")
+    PUB_GROUPS+=("b_ahead_${_d}|${_d}|0|rp_a2b_b${_d}:3,4:0:0|rp_b2a_b${_d}:4,3:0:0")
   fi
 done
 unset _delay_list _d
@@ -216,9 +235,10 @@ write_metadata() {
     local _da="${_gp[1]}" _db="${_gp[2]}"
     local _i
     for (( _i=3; _i<${#_gp[@]}; _i++ )); do
-      local _lbl _seq _bw
-      IFS=':' read -r _lbl _seq _bw <<< "${_gp[$_i]}"
-      printf '%s|%s|%s|%s|%s\n' "$_lbl" "$_seq" "$_bw" "$_da" "$_db" >> "$tmp_scen"
+      local _lbl _seq _bw _dl
+      IFS=':' read -r _lbl _seq _bw _dl <<< "${_gp[$_i]}"
+      _dl="${_dl:-0}"
+      printf '%s|%s|%s|%s|%s|%s\n' "$_lbl" "$_seq" "$_bw" "$_da" "$_db" "$_dl" >> "$tmp_scen"
     done
   done
 
@@ -227,9 +247,12 @@ import json, sys
 from pathlib import Path
 scenarios = []
 for line in open(sys.argv[1]).read().strip().splitlines():
-    lbl, seq, bw, da, db = line.split('|')
+    parts = line.split('|')
+    lbl, seq, bw, da, db = parts[:5]
+    dl = parts[5] if len(parts) > 5 else '0'
     scenarios.append({"label": lbl, "sequence": seq,
-                       "bw_bps": int(bw), "delay_a_ms": int(da), "delay_b_ms": int(db)})
+                       "bw_bps": int(bw), "delay_a_ms": int(da), "delay_b_ms": int(db),
+                       "downstream_delay_ms": int(dl)})
 meta = {
     "source":           "experiment.sh",
     "timestamp":        "$(date +%Y%m%d_%H%M%S)",
@@ -400,10 +423,10 @@ stop_publisher() {
 # ── tc bandwidth shaping (on relay host, toward subscriber) ─────────────────────
 
 apply_tc() {
-  local bw=$1 subscriber_ip=$2
-  log "tc: ${bw} bps toward $subscriber_ip (mark=$TC_MARK)"
-  if ! relay_ssh "sudo bash $RELAY_PROJECT/scripts/tc/set_bandwidth.sh $bw $subscriber_ip $TC_MARK" 2>/dev/null; then
-    log "WARNING: tc failed (sudo not configured?) — running without bandwidth shaping"
+  local bw=$1 downstream_delay=$2 subscriber_ip=$3
+  log "tc: bw=${bw}bps delay=${downstream_delay}ms toward $subscriber_ip (mark=$TC_MARK)"
+  if ! relay_ssh "sudo bash $RELAY_PROJECT/scripts/tc/set_bandwidth.sh $bw $subscriber_ip $TC_MARK $downstream_delay" 2>/dev/null; then
+    log "WARNING: tc failed (sudo not configured?) — running without shaping"
     return 0
   fi
   sleep 3
@@ -412,7 +435,7 @@ apply_tc() {
 clear_tc() {
   local subscriber_ip=$1
   log "tc: clearing rule (mark=$TC_MARK)..."
-  relay_ssh "sudo bash $RELAY_PROJECT/scripts/tc/set_bandwidth.sh 0 $subscriber_ip $TC_MARK del 2>/dev/null; true"
+  relay_ssh "sudo bash $RELAY_PROJECT/scripts/tc/set_bandwidth.sh 0 $subscriber_ip $TC_MARK 0 del 2>/dev/null; true"
   sleep 1
 }
 
@@ -462,7 +485,7 @@ PYEOF
 }
 
 run_one() {
-  local method=$1 scenario=$2 sequence=$3 bw=$4 rep=$5 subscriber_ip=$6
+  local method=$1 scenario=$2 sequence=$3 bw=$4 downstream_delay=$5 rep=$6 subscriber_ip=$7
   local label="${method}_${scenario}"
   local outfile="$OUTPUT_DIR/${label}_rep${rep}.json"
 
@@ -480,8 +503,8 @@ run_one() {
 
   log "--- $label rep $rep ---"
 
-  if [ "$bw" -gt 0 ]; then
-    apply_tc "$bw" "$subscriber_ip"
+  if [ "$bw" -gt 0 ] || [ "$downstream_delay" -gt 0 ]; then
+    apply_tc "$bw" "$downstream_delay" "$subscriber_ip"
   fi
 
   if "$CLIENT_BIN" \
@@ -501,7 +524,7 @@ run_one() {
     log "WARNING: subscriber exited with error for $label rep $rep"
   fi
 
-  if [ "$bw" -gt 0 ]; then
+  if [ "$bw" -gt 0 ] || [ "$downstream_delay" -gt 0 ]; then
     clear_tc "$subscriber_ip"
   fi
 
@@ -529,15 +552,16 @@ run_pub_group() {
     start_publisher
   fi
 
-  local scenario_spec scenario_label sequence bw
+  local scenario_spec scenario_label sequence bw downstream_delay
   for scenario_spec in "$@"; do
-    IFS=':' read -r scenario_label sequence bw <<< "$scenario_spec"
+    IFS=':' read -r scenario_label sequence bw downstream_delay <<< "$scenario_spec"
+    downstream_delay="${downstream_delay:-0}"
     for method in "${METHODS[@]}"; do
       for rep in $(seq 1 "$REPS"); do
         if ! "$RESTART_SERVICES"; then
           ensure_healthy
         fi
-        run_one "$method" "$scenario_label" "$sequence" "$bw" "$rep" "$subscriber_ip"
+        run_one "$method" "$scenario_label" "$sequence" "$bw" "$downstream_delay" "$rep" "$subscriber_ip"
         (( done_count++ )) || true
         log "Progress: $done_count / $total"
       done

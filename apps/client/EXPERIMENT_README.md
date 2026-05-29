@@ -8,7 +8,7 @@ Empirical comparison of three subscriber-initiated track-switching methods in MO
 
 1. [Build](#1-build)
 2. [Local testing](#2-local-testing)
-3. [Multi-machine testing](#3-multi-machine-testing)
+3. [Multi-machine testing](#3-multi-machine-testing) — including [downstream delay scenarios](#36-downstream-delay-scenarios)
 4. [Running a single switch manually](#4-running-a-single-switch-manually)
 5. [How the system works](#5-how-the-system-works)
 6. [How metrics are computed](#6-how-metrics-are-computed)
@@ -216,6 +216,9 @@ bash scripts/experiment.sh --output results/paper_run_02
 --reps <n>                 Repetitions per condition                          [3]
 --delays <list>            Comma-separated relative-position delays in ms     [0,1000,2000]
                            0 → sync RP + BW scenarios; N → a_ahead_N and b_ahead_N RP pairs
+--downstream-delays <list> One-way relay→subscriber delays in ms             [disabled]
+                           Generates delay_a2b_Xms and delay_b2a_Xms scenarios for each X
+                           Applied via tc netem on relay egress; no upstream delay is added
 --switch-after <ms>        ms per track before triggering the switch          [4400]
 --jitter-buffer-ms <ms>    Jitter buffer for stall calculation                [500]
 --objects-per-group <n>    Objects per group                                  [25]
@@ -224,20 +227,55 @@ bash scripts/experiment.sh --output results/paper_run_02
 --output <dir>             Results directory
 ```
 
-### 3.5 Manual tc bandwidth shaping
+### 3.5 Manual tc shaping
+
+`set_bandwidth.sh` now accepts an optional `delay_ms` argument (one-way downstream latency via `netem`):
 
 ```bash
-# On the relay host — limit outbound UDP to subscriber to 4.5 Mbps
+# Limit outbound UDP to subscriber to 4.5 Mbps, no added delay
 ssh zafer@<relay-ip> \
   "sudo bash scripts/tc/set_bandwidth.sh 4500000 <subscriber-ip> 1"
 
+# 500 ms one-way delay, no bandwidth cap
+ssh zafer@<relay-ip> \
+  "sudo bash scripts/tc/set_bandwidth.sh 0 <subscriber-ip> 1 500"
+
+# 4.5 Mbps + 200 ms delay combined
+ssh zafer@<relay-ip> \
+  "sudo bash scripts/tc/set_bandwidth.sh 4500000 <subscriber-ip> 1 200"
+
 # Remove the rule
 ssh zafer@<relay-ip> \
-  "sudo bash scripts/tc/set_bandwidth.sh 0 <subscriber-ip> 1 del"
+  "sudo bash scripts/tc/set_bandwidth.sh 0 <subscriber-ip> 1 0 del"
 
 # Watch tc live
 ssh zafer@<relay-ip> "watch /sbin/tc -s -d class show dev eth0"
 ```
+
+### 3.6 Downstream delay scenarios
+
+Use `--downstream-delays` to inject one-way relay→subscriber latency (via `tc netem` on the relay egress). No delay is added in the upstream direction.
+
+```bash
+# Sync tracks only, 0 ms and 500 ms downstream delay, 3 reps
+bash scripts/experiment.sh --delays 0 --downstream-delays "0,500" --reps 3
+
+# Combined with RP and BW scenarios
+bash scripts/experiment.sh --delays "0,1000,2000" --downstream-delays "0,500" --reps 3
+```
+
+Generated scenario labels for `--downstream-delays "0,500"`:
+
+| Label             | Switch direction | d_relay         |
+| ----------------- | ---------------- | --------------- |
+| `delay_a2b_0ms`   | A→B              | 0 ms (baseline) |
+| `delay_a2b_500ms` | A→B              | 500 ms          |
+| `delay_b2a_0ms`   | B→A              | 0 ms (baseline) |
+| `delay_b2a_500ms` | B→A              | 500 ms          |
+
+Results appear in a dedicated **Downstream delay** section in `results.md`, separate from the RP and BW sections.
+
+**Why this matters:** subscriber-driven methods (Active-Passive, Joining Fetch) execute feedback loops — the subscriber must receive relay data before issuing further control messages — so every downstream delivery leg adds `d_relay` to the observed switching delay. The relay-executed SWITCH message requires no such feedback: both the decision timestamp and the B I-frame arrival shift equally by `d_relay`, leaving switching delay unchanged.
 
 ---
 

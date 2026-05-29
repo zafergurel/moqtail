@@ -130,7 +130,7 @@ def _load_all_runs_auto(results_dir: Path):
 # ── Rendering helpers ──────────────────────────────────────────────────────────
 
 def short_label(label: str) -> str:
-    for prefix in ("rp_a2b_", "rp_b2a_", "bw_"):
+    for prefix in ("rp_a2b_", "rp_b2a_", "bw_", "delay_a2b_", "delay_b2a_"):
         if label.startswith(prefix):
             return label[len(prefix):]
     if label.startswith("a_ahead_"):
@@ -193,6 +193,20 @@ def print_bw_section(data, methods, bw_scens, jitter_ms):
     print(f"{'='*70}")
     for title, rows in _metric_rows(data, methods, labels, jitter_ms):
         _print_table(title, rows, col_labels, col_w, label_w)
+
+
+def print_downstream_delay_section(data, methods, dl_a2b_scens, dl_b2a_scens, jitter_ms):
+    col_w, label_w = 12, 22
+    for direction, scens in [("A→B", dl_a2b_scens), ("B→A", dl_b2a_scens)]:
+        if not scens:
+            continue
+        labels = [s["label"] for s in scens]
+        col_labels = [short_label(l) for l in labels]
+        print(f"\n{'='*70}")
+        print(f"  Downstream delay: {direction}")
+        print(f"{'='*70}")
+        for title, rows in _metric_rows(data, methods, labels, jitter_ms):
+            _print_table(title, rows, col_labels, col_w, label_w)
 
 
 def print_generic_summary(data: dict, methods):
@@ -259,15 +273,25 @@ def main(results_dir: Path):
     data = _load_runs_for(results_dir, methods, [s["label"] for s in scenarios])
 
     rp_a2b   = [s for s in scenarios
-                if s["bw_bps"] == 0 and s["sequence"].split(",")[0] == track_a]
+                if s["bw_bps"] == 0
+                and s.get("downstream_delay_ms", 0) == 0
+                and s["sequence"].split(",")[0] == track_a
+                and not s["label"].startswith("delay_")]
     rp_b2a   = [s for s in scenarios
-                if s["bw_bps"] == 0 and s["sequence"].split(",")[0] == track_b]
+                if s["bw_bps"] == 0
+                and s.get("downstream_delay_ms", 0) == 0
+                and s["sequence"].split(",")[0] == track_b
+                and not s["label"].startswith("delay_")]
     bw_scens = [s for s in scenarios if s["bw_bps"] > 0]
+    dl_a2b   = [s for s in scenarios if s["label"].startswith("delay_a2b_")]
+    dl_b2a   = [s for s in scenarios if s["label"].startswith("delay_b2a_")]
 
     if rp_a2b or rp_b2a:
         print_rp_section(data, methods, rp_a2b, rp_b2a, jitter_ms)
     if bw_scens:
         print_bw_section(data, methods, bw_scens, jitter_ms)
+    if dl_a2b or dl_b2a:
+        print_downstream_delay_section(data, methods, dl_a2b, dl_b2a, jitter_ms)
 
 
 if __name__ == "__main__":

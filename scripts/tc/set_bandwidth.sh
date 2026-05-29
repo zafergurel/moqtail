@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
 usage() {
-  echo "Usage: ./set_bandwidth.sh <rate (bps)> <client_ip> <mark> [op]"
-  echo "  rate: bandwidth in bps (e.g. 2000000 for 2 Mbps)"
-  echo "  op:   set (default) or del"
+  echo "Usage: ./set_bandwidth.sh <rate_bps> <client_ip> <mark> [delay_ms] [op]"
+  echo "  rate_bps : bandwidth cap in bps (0 = no limit)"
+  echo "  delay_ms : one-way downstream delay in ms (default 0)"
+  echo "  op       : set (default) or del"
   exit 1
 }
 
@@ -12,7 +13,6 @@ CURRENT_DIR=$(dirname "$SCRIPT")
 
 echo "Current dir: $CURRENT_DIR"
 
-# load environment variables like INTERFACE
 if [ -f "$CURRENT_DIR/.env" ]; then
   source $CURRENT_DIR/.env
 fi
@@ -31,17 +31,18 @@ PROTO="udp"
 RATE="$1"
 DEST_ADDRESS="$2"
 MARK="$3"
-OP=${4:-"set"}
+DELAY_MS="${4:-0}"
+OP="${5:-set}"
 
 if [ -z "$RATE" ] || [ -z "$DEST_ADDRESS" ] || [ -z "$MARK" ]; then
   usage
 fi
 
 if [[ $OP == "set" ]]; then
-  echo "Setting bandwidth limit"
-  $CURRENT_DIR/tc_qdisc.sh $RATE $INTERFACE $DEST_ADDRESS $PORT $PROTO $MARK
+  echo "Applying tc: rate=${RATE}bps delay=${DELAY_MS}ms"
+  $CURRENT_DIR/tc_qdisc.sh $RATE $INTERFACE $DEST_ADDRESS $PORT $PROTO $MARK $DELAY_MS
 elif [[ $OP == "del" ]]; then
-  echo "Deleting bandwidth limit"
+  echo "Deleting tc rule"
   $CURRENT_DIR/delete_iptable_rule.sh $DEST_ADDRESS $MARK
 else
   usage
