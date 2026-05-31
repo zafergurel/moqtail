@@ -444,6 +444,10 @@ fn process_b_object(
       // player has theoretically consumed by now.
       let last_a_grp = record.last_a_group.unwrap_or(last_played_a_group);
       let last_a_obj = record.last_a_object.unwrap_or(last_played_a_object);
+      elog.record(
+        ev.received_at,
+        format!("last_a_at_switch,{},{}", last_a_grp, last_a_obj),
+      );
       player.reset_base(ev.group, ev.received_at);
       if let Some((a_ms, b_ms, stall, sg, sd)) =
         player.compute_switch_metrics(last_a_grp, last_a_obj, ev.group, ev.received_at)
@@ -481,6 +485,13 @@ fn process_b_object(
         .unwrap_or(record.decision_a_object.unwrap_or(0));
       record.latest_played_a_group = Some(last_played_a_group);
       record.latest_played_a_object = Some(last_played_a_object);
+      elog.record(
+        ev.received_at,
+        format!(
+          "last_a_at_switch,{},{}",
+          last_played_a_group, last_played_a_object
+        ),
+      );
       player.reset_base(ev.group, ev.received_at);
       if let Some((a_ms, b_ms, stall, sg, sd)) = player.compute_switch_metrics(
         last_played_a_group,
