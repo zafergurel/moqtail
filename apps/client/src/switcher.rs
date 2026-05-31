@@ -133,15 +133,17 @@ impl EventLog {
       .insert(alias, label.to_string());
   }
 
-  fn record_object(&self, alias: u64, group: u64, object: u64, ts: Instant) {
+  fn record_object(&self, alias: u64, group: u64, object: u64, payload_size: usize, ts: Instant) {
     let mut g = self.inner.lock().unwrap();
     let label = g
       .alias_labels
       .get(&alias)
       .cloned()
       .unwrap_or_else(|| alias.to_string());
-    g.entries
-      .push((ts, format!("object,{},{},{}", label, group, object)));
+    g.entries.push((
+      ts,
+      format!("object,{},{},{},{}", label, group, object, payload_size),
+    ));
   }
 
   fn record(&self, ts: Instant, line: impl Into<String>) {
@@ -186,14 +188,17 @@ impl EventLog {
     }
 
     // Emit lines: skip pt rows; append PT to matching object rows.
+    // Stored format: "object,{label},{group},{object},{payload_bytes}"
+    // Output format: "object,{label},{group},{object},{payload_bytes},{wall_ms}[,{pt_ms}]"
     let mut content = String::new();
     for (ms, line) in &with_ms {
       if line.starts_with("pt,") {
         continue;
       }
       if let Some(rest) = line.strip_prefix("object,") {
-        // key = "{label},{group},{object},{wall_ms}"
-        let key = format!("{},{}", rest, ms);
+        // pt lookup key uses only label,group,object (first 3 fields), not payload_bytes.
+        let lgo: String = rest.splitn(4, ',').take(3).collect::<Vec<_>>().join(",");
+        let key = format!("{},{}", lgo, ms);
         if let Some(pt) = pt_lookup.get(&key) {
           content.push_str(&format!("object,{},{},{}\n", rest, ms, pt));
         } else {
@@ -269,6 +274,7 @@ async fn receiver_task(
                   obj.track_alias,
                   obj.location.group,
                   obj.location.object,
+                  obj.payload.as_ref().map_or(0, |p| p.len()),
                   received_at,
                 );
                 let event = ObjectEvent {
@@ -433,13 +439,15 @@ fn process_b_object(
       let (last_played_a_group, last_played_a_object) = threshold;
       record.latest_played_a_group = Some(last_played_a_group);
       record.latest_played_a_object = Some(last_played_a_object);
+      // Use last *received* A object (not theoretical threshold) so that
+      // a_stopped_at reflects all buffered A content, not just what the
+      // player has theoretically consumed by now.
+      let last_a_grp = record.last_a_group.unwrap_or(last_played_a_group);
+      let last_a_obj = record.last_a_object.unwrap_or(last_played_a_object);
       player.reset_base(ev.group, ev.received_at);
-      if let Some((a_ms, b_ms, stall, sg, sd)) = player.compute_switch_metrics(
-        last_played_a_group,
-        last_played_a_object,
-        ev.group,
-        ev.received_at,
-      ) {
+      if let Some((a_ms, b_ms, stall, sg, sd)) =
+        player.compute_switch_metrics(last_a_grp, last_a_obj, ev.group, ev.received_at)
+      {
         record.a_stopped_at_ms = Some(a_ms);
         record.b_started_at_ms = Some(b_ms);
         record.skipped_gops = sg;

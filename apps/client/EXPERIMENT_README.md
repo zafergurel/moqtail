@@ -275,7 +275,15 @@ Generated scenario labels for `--downstream-delays "0,500"`:
 
 Results appear in a dedicated **Downstream delay** section in `results.md`, separate from the RP and BW sections.
 
-**Why this matters:** subscriber-driven methods (Active-Passive, Joining Fetch) execute feedback loops — the subscriber must receive relay data before issuing further control messages — so every downstream delivery leg adds `d_relay` to the observed switching delay. The relay-executed SWITCH message requires no such feedback: both the decision timestamp and the B I-frame arrival shift equally by `d_relay`, leaving switching delay unchanged.
+**Why this matters:** each method's switching delay increases by approximately `n × d_relay`, where `n` is the number of downstream delivery legs needed before the switch completes:
+
+| Method         | Downstream legs                                          | delay increase at 500ms |
+| -------------- | -------------------------------------------------------- | ----------------------- |
+| SWITCH         | 1 (B data delivery)                                      | ~+700ms                 |
+| Active-Passive | 1 (B data delivery; SubscribeOk arrives before decision) | ~+270ms                 |
+| Joining Fetch  | 2 (SubscribeOk + FETCH/live data)                        | ~+800–1350ms            |
+
+SWITCH's key advantage is not delay immunity but maintaining **AETR=0.00 regardless of `d_relay`**, while Active-Passive and Joining Fetch accumulate excess traffic that grows with the longer switch window.
 
 ---
 

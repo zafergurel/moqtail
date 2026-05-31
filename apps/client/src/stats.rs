@@ -247,8 +247,9 @@ impl PlayerSimulator {
   ) -> Option<(f64, f64, u64, u64, u64)> {
     let t_base = self.t_base?;
 
-    // a_stopped_at = PT of first frame that A would have shown after its last group
-    let a_stopped_at = self.pt_offset_ms(last_a_group, last_a_object, false)?;
+    // a_stopped_at = end of the last A frame's display window = PT(last_a_object) + frame_interval
+    let a_stopped_at =
+      self.pt_offset_ms(last_a_group, last_a_object, false)? + self.frame_interval_ms as f64;
 
     // b_started_at = max(PT(b_group, 0), recv_offset + JB)
     let b_pt = self.pt_offset_ms(b_group, 0, true)?;
