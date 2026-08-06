@@ -1,0 +1,41 @@
+{
+  "method": "joining-fetch",
+  "bandwidth_cap_bps": 3000000,
+  "frame_interval_ms": 40,
+  "objects_per_group": 25,
+  "jitter_buffer_ms": 500,
+  "aetr": 3.23077,
+  "switches": [
+    {
+      "track_from": "4",
+      "track_to": "3",
+      "switch_delay_ms": 5664,
+      "stall_ms": 4689,
+      "skipped_gops": 0,
+      "skipped_duration_ms": 0,
+      "group_boundary_aligned": true,
+      "control_messages": 4,
+      "redundant_bytes": 937521,
+      "pre_switch_a_bytes": 982137,
+      "trailing_a_bytes": 0,
+      "useful_b_bytes": 1819236,
+      "b_gop_payload_bytes": 290185,
+      "excess_bytes": 937521,
+      "total_bytes": 2756757,
+      "aetr": 3.231,
+      "a_objects_post_decision": 49,
+      "decision_a_group": 10,
+      "decision_a_object": null,
+      "latest_played_a_group": 12,
+      "latest_played_a_object": 11,
+      "last_a_group": 12,
+      "last_a_object": 11,
+      "first_b_group": 10,
+      "switched_b_group": 13,
+      "a_stopped_at_ms": 4980.0,
+      "b_started_at_ms": 9669.0,
+      "last_a_object_time_ms": 4656,
+      "first_b_object_time_ms": 1006
+    }
+  ]
+}

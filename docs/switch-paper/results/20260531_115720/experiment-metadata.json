@@ -1,0 +1,167 @@
+{
+  "source": "experiment.sh",
+  "timestamp": "20260531_115720",
+  "relay_host": "zafer@192.168.1.22",
+  "relay_host_ip": "192.168.1.22",
+  "relay_port": 4433,
+  "subscriber_ip": "192.168.1.23",
+  "delays": "0,1000,2000",
+  "switch_after_ms": 4400,
+  "jitter_buffer_ms": 500,
+  "reps": 3,
+  "methods": ["switch", "sub-update-forward", "joining-fetch"],
+  "track_a": "3",
+  "track_b": "4",
+  "track_a_payload": 12500,
+  "track_b_payload": 20000,
+  "objects_per_group": 25,
+  "interval_ms": 40,
+  "group_count": 5000,
+  "scenarios": [
+    {
+      "label": "rp_a2b_sync",
+      "sequence": "3,4",
+      "bw_bps": 0,
+      "delay_a_ms": 0,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "rp_b2a_sync",
+      "sequence": "4,3",
+      "bw_bps": 0,
+      "delay_a_ms": 0,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "bw_a2b_4500k",
+      "sequence": "3,4",
+      "bw_bps": 4500000,
+      "delay_a_ms": 0,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "bw_a2b_7000k",
+      "sequence": "3,4",
+      "bw_bps": 7000000,
+      "delay_a_ms": 0,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "bw_b2a_3000k",
+      "sequence": "4,3",
+      "bw_bps": 3000000,
+      "delay_a_ms": 0,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "bw_b2a_7000k",
+      "sequence": "4,3",
+      "bw_bps": 7000000,
+      "delay_a_ms": 0,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "delay_a2b_0ms",
+      "sequence": "3,4",
+      "bw_bps": 0,
+      "delay_a_ms": 0,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "delay_b2a_0ms",
+      "sequence": "4,3",
+      "bw_bps": 0,
+      "delay_a_ms": 0,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "delay_a2b_500ms",
+      "sequence": "3,4",
+      "bw_bps": 0,
+      "delay_a_ms": 0,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 500
+    },
+    {
+      "label": "delay_b2a_500ms",
+      "sequence": "4,3",
+      "bw_bps": 0,
+      "delay_a_ms": 0,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 500
+    },
+    {
+      "label": "rp_a2b_a1000",
+      "sequence": "3,4",
+      "bw_bps": 0,
+      "delay_a_ms": 0,
+      "delay_b_ms": 1000,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "rp_b2a_a1000",
+      "sequence": "4,3",
+      "bw_bps": 0,
+      "delay_a_ms": 0,
+      "delay_b_ms": 1000,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "rp_a2b_b1000",
+      "sequence": "3,4",
+      "bw_bps": 0,
+      "delay_a_ms": 1000,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "rp_b2a_b1000",
+      "sequence": "4,3",
+      "bw_bps": 0,
+      "delay_a_ms": 1000,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "rp_a2b_a2000",
+      "sequence": "3,4",
+      "bw_bps": 0,
+      "delay_a_ms": 0,
+      "delay_b_ms": 2000,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "rp_b2a_a2000",
+      "sequence": "4,3",
+      "bw_bps": 0,
+      "delay_a_ms": 0,
+      "delay_b_ms": 2000,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "rp_a2b_b2000",
+      "sequence": "3,4",
+      "bw_bps": 0,
+      "delay_a_ms": 2000,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 0
+    },
+    {
+      "label": "rp_b2a_b2000",
+      "sequence": "4,3",
+      "bw_bps": 0,
+      "delay_a_ms": 2000,
+      "delay_b_ms": 0,
+      "downstream_delay_ms": 0
+    }
+  ],
+  "command": "scripts/experiment.sh --delays 0,1000,2000 --downstream-delays 0,500 --reps 3"
+}
