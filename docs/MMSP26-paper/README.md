@@ -1,4 +1,4 @@
-# Track Switching Evaluation — Supplementary Material
+# MMSP26 Paper - Supplementary Material
 
 Sequence diagrams and result plots for:
 
