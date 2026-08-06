@@ -45,6 +45,34 @@ I-frame of the target track arrived within the observation window.
 
 Vector PDF versions (`fig_delay_rp.pdf`, `fig_aetr_rp.pdf`) sit alongside the PNGs.
 
+## MOQtail's implementation of the `SWITCH` message
+
+The paper describes the relay-executed switch as four steps, the second of which opens a
+`PUBLISH` stream for the target track. MOQtail implements that step differently, and the
+paper notes this only in passing — the reasoning is here.
+
+MOQtail implemented `SWITCH` **before** the `PUBLISH`-based delivery was proposed in
+[moq-transport#1378](https://github.com/moq-wg/moq-transport/pull/1378). Rather than
+opening a new `PUBLISH` stream for the target track, the relay synthesizes a `SUBSCRIBE`
+message internally from the `SWITCH` message's fields and routes it through the standard
+subscription pipeline. Objects then reach the subscriber over the per-track delivery
+mechanism already established for that session.
+
+**Why this does not affect any measured result.** The two approaches differ only in which
+control message opens the delivery stream. Everything the paper measures is downstream of
+that choice:
+
+| Measured quantity        | Why it is unaffected                                                                        |
+| ------------------------ | ------------------------------------------------------------------------------------------- |
+| Switching delay          | The relay selects the switching point with the same boundary logic in both cases            |
+| Stall / skipped duration | Both derive from which group the target track resumes at, which is the same switching point |
+| AETR                     | The same objects are placed on the wire, so the byte counts are identical                   |
+
+What would differ is the control-plane encoding of the delivery setup, which none of the
+four metrics observes. When the mechanism settles in the draft — the proposal may still
+change, or may not be adopted — MOQtail will implement the standardized form; this is
+listed as future work in the paper.
+
 ## Measured data
 
 `results/20260531_115720/` is the complete run behind every number in the paper —
