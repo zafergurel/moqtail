@@ -58,7 +58,7 @@ NAMESPACE="${NAMESPACE:-moqtail-watch-party-live}"
 
 # ── Experiment defaults ────────────────────────────────────────────────────────
 
-ALL_METHODS=("switch-message" "sub-update-forward")
+ALL_METHODS=("switch" "sub-update-forward")
 # Bandwidth ladder (bps). 0 = unlimited baseline (no tc rule applied).
 ALL_BANDWIDTHS=(0 5000000 3000000 2000000 1500000 1000000)
 # Track sequence: lower index = lower bitrate (matches ffmpeg.sh ordering)

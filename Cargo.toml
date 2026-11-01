@@ -1,8 +1,5 @@
 [workspace]
-members = ["apps/relay", "apps/client", "libs/moqtail-rs", "libs/moqtail-ssts"]
-# apps/moqtail-pub is out until it is ported to per-request streams (it still
-# answers SUBSCRIBEs on the shared control stream that draft removed).
-exclude = ["apps/moqtail-pub"]
+members = ["apps/relay", "apps/client", "libs/moqtail-rs", "libs/moqtail-ssts", "apps/moqtail-pub"]
 resolver = "2"
 
 [workspace.dependencies]

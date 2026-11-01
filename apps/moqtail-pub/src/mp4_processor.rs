@@ -49,6 +49,11 @@ pub struct Mp4StreamProcessor {
   last_group_frame_count: u32,
   last_prft_box: Bytes,
   track_object_counters: HashMap<u32, u64>,
+  // Group ID per track: counts that track's keyframes, so tracks whose
+  // keyframes are synchronized share group IDs.
+  track_group_ids: HashMap<u32, u64>,
+  // Group of the latest video keyframe; tracks without keyframes (audio) use it.
+  last_group_id: u64,
 }
 
 #[derive(Debug)]
@@ -79,6 +84,8 @@ impl Mp4StreamProcessor {
       last_group_frame_count: 0,
       last_prft_box: Bytes::new(),
       track_object_counters: HashMap::new(),
+      track_group_ids: HashMap::new(),
+      last_group_id: 0,
     }
   }
 
@@ -378,9 +385,16 @@ impl Mp4StreamProcessor {
       self.keyframe_count += 1;
       self.last_group_frame_count = 1;
 
-      // Reset object counters for all tracks when keyframe is detected
-      self.track_object_counters.clear();
-      info!("Reset object counters for all tracks due to keyframe");
+      let group_id = self
+        .track_group_ids
+        .entry(self.last_track_id)
+        .and_modify(|g| *g += 1)
+        .or_insert(1);
+      let group_id = *group_id;
+      self.last_group_id = group_id;
+
+      // A keyframe starts a new group for its own track only
+      self.track_object_counters.remove(&self.last_track_id);
 
       self
         .tx
@@ -390,8 +404,8 @@ impl Mp4StreamProcessor {
           TrackEvent::Keyframe(FrameData::new(
             self.last_track_id.to_string(),
             self.last_moof.clone().freeze(),
-            self.keyframe_count,
-            1, // Keyframe always gets object_id = 1 after reset
+            group_id,
+            0, // a group's first object (the keyframe) is object 0
           )),
           TrackEvent::TimeEvent(TimeEvent::new(
             self.last_track_id,
@@ -430,7 +444,7 @@ impl Mp4StreamProcessor {
       .track_object_counters
       .entry(self.last_track_id)
       .and_modify(|counter| *counter += 1)
-      .or_insert(1);
+      .or_insert(0);
     let object_id = *current_object_id;
 
     // Create payload with moof + mdat
@@ -449,7 +463,11 @@ impl Mp4StreamProcessor {
       .send(vec![TrackEvent::Frame(FrameData::new(
         self.last_track_id.to_string(),
         payload.freeze(),
-        self.keyframe_count,
+        self
+          .track_group_ids
+          .get(&self.last_track_id)
+          .copied()
+          .unwrap_or(self.last_group_id),
         object_id,
       ))])
       .unwrap();
