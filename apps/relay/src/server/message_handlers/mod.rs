@@ -14,64 +14,65 @@
 
 use bytes::Bytes;
 use moqtail::{
-  model::{control::control_message::ControlMessage, error::TerminationCode},
+  model::{
+    common::reason_phrase::ReasonPhrase,
+    control::{control_message::ControlMessage, request_error::RequestError},
+    error::{RequestErrorCode, TerminationCode},
+  },
   transport::control_stream_handler::ControlStreamHandler,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::server::{
   client::MOQTClient,
   session_context::{PendingRequest, SessionContext},
 };
-use std::sync::{Arc, atomic::Ordering};
-mod fetch_handler;
-mod max_request_id_handler;
+use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
+pub(crate) mod fetch_handler;
+pub(crate) mod parameters;
 mod publish_handler;
-mod publish_namespace_handler;
-mod subscribe_handler;
+pub(crate) mod publish_namespace_handler;
+pub(crate) mod subscribe_handler;
 pub(crate) mod subscribe_namespace_handler;
+pub(crate) mod subscribe_tracks_handler;
 mod track_status_handler;
 use super::utils;
 
 pub struct MessageHandler {}
 
+/// Closes the session of a publisher that sent REQUEST_UPDATE on a request stream the
+/// relay opened to it. Only the sender of a request may update it, and on these
+/// streams that is the relay.
+pub(crate) fn close_on_unexpected_request_update(publisher: &MOQTClient, request: &str) {
+  warn!(
+    "REQUEST_UPDATE from publisher {} on an upstream {} stream; closing its session",
+    publisher.connection_id, request
+  );
+  publisher.connection.close(
+    TerminationCode::ProtocolViolation.to_u32(),
+    b"Unexpected REQUEST_UPDATE on request bi-stream",
+  );
+}
+
 impl MessageHandler {
   pub async fn handle(
     client: Arc<MOQTClient>,
-    control_stream_handler: &mut ControlStreamHandler,
+    stream_handler: &mut ControlStreamHandler,
     msg: ControlMessage,
     context: Arc<SessionContext>,
+    // Request ID of the First-marked message that opened this request stream,
+    // or None on the control stream.
+    opening_request_id: Option<u64>,
   ) -> Result<(), TerminationCode> {
-    // Check request ID if the message is a request
-    let request_id = match &msg {
-      ControlMessage::PublishNamespace(msg) => Some(msg.request_id),
-      ControlMessage::Publish(msg) => Some(msg.request_id),
-      ControlMessage::Fetch(msg) => Some(msg.request_id),
-      ControlMessage::Subscribe(msg) => Some(msg.request_id),
-      ControlMessage::RequestUpdate(msg) => Some(msg.request_id),
-      ControlMessage::TrackStatus(msg) => Some(msg.request_id),
-      ControlMessage::Switch(msg) => Some(msg.request_id),
-      _ => None,
-    };
-
-    if let Some(request_id) = request_id {
-      let max_request_id = context.max_request_id.load(Ordering::Relaxed);
-      if request_id >= max_request_id {
-        warn!(
-          "request id ({}) is greater than max request id ({})",
-          request_id, max_request_id
-        );
-        return Err(TerminationCode::TooManyRequests);
-      }
-    }
-
     let handling_result = match &msg {
       ControlMessage::PublishNamespace(_) => {
         publish_namespace_handler::handle(
           client.clone(),
-          control_stream_handler,
+          stream_handler,
           msg,
           context.clone(),
+          opening_request_id,
         )
         .await
       }
@@ -79,39 +80,76 @@ impl MessageHandler {
         warn!("SUBSCRIBE_NAMESPACE received on control stream — must use a dedicated bi-stream");
         Err(TerminationCode::ProtocolViolation)
       }
-      ControlMessage::MaxRequestId(_) => {
-        max_request_id_handler::handle(client.clone(), control_stream_handler, msg, context.clone())
-          .await
-      }
-      ControlMessage::Subscribe(_)
-      | ControlMessage::SubscribeOk(_)
-      | ControlMessage::Unsubscribe(_)
-      | ControlMessage::Switch(_) => {
-        subscribe_handler::handle(client.clone(), control_stream_handler, msg, context.clone())
-          .await
+      ControlMessage::Subscribe(_) => {
+        subscribe_handler::handle(
+          client.clone(),
+          stream_handler,
+          msg,
+          context.clone(),
+          opening_request_id,
+        )
+        .await
       }
 
       ControlMessage::TrackStatus(_) => {
-        track_status_handler::handle(control_stream_handler, msg, context.clone()).await
+        track_status_handler::handle(stream_handler, msg, context.clone()).await
       }
-      ControlMessage::Fetch(_) | ControlMessage::FetchCancel(_) | ControlMessage::FetchOk(_) => {
-        fetch_handler::handle(client.clone(), control_stream_handler, msg, context.clone()).await
+      ControlMessage::Fetch(_) => {
+        fetch_handler::handle(
+          client.clone(),
+          stream_handler,
+          msg,
+          context.clone(),
+          opening_request_id,
+        )
+        .await
       }
-      ControlMessage::Publish(_)
-      | ControlMessage::PublishDone(_)
-      | ControlMessage::PublishOk(_) => {
-        publish_handler::handle(client.clone(), control_stream_handler, msg, context.clone()).await
+      ControlMessage::Publish(_) | ControlMessage::PublishDone(_) => {
+        publish_handler::handle(
+          client.clone(),
+          stream_handler,
+          msg,
+          context.clone(),
+          opening_request_id,
+        )
+        .await
       }
 
-      ControlMessage::RequestOk(_)
-      | ControlMessage::RequestError(_)
-      | ControlMessage::RequestUpdate(_) => {
-        // 1. Extract the target ID and the directionality (response vs update)
-        let (target_req_id, is_response_to_relay) = match &msg {
-          ControlMessage::RequestOk(m) => (m.request_id, true),
-          ControlMessage::RequestError(m) => (m.request_id, true),
-          ControlMessage::RequestUpdate(m) => (m.existing_request_id, false),
-          _ => unreachable!(),
+      // A response belongs on a request's own bidi stream, never on the control
+      // stream. On a request stream it is the peer answering something the relay
+      // asked there — REQUEST_UPDATE raising a publisher's Forward State is the
+      // one that arrives here — and the request is already resolved by the time
+      // it lands, so there is nothing left to do but let the stream continue.
+      ControlMessage::RequestOk(_) | ControlMessage::RequestError(_) => match opening_request_id {
+        Some(request_id) => {
+          debug!(
+            "{:?} answering relay request {} on its own stream",
+            msg.get_type(),
+            request_id
+          );
+          Ok(())
+        }
+        None => {
+          warn!(
+            "{:?} on the control stream; closing session",
+            msg.get_type()
+          );
+          Err(TerminationCode::ProtocolViolation)
+        }
+      },
+
+      ControlMessage::SubscribeOk(_) | ControlMessage::FetchOk(_) => {
+        warn!(
+          "{:?} on the control stream; closing session",
+          msg.get_type()
+        );
+        Err(TerminationCode::ProtocolViolation)
+      }
+
+      ControlMessage::RequestUpdate(_) => {
+        let Some(target_req_id) = opening_request_id else {
+          warn!("REQUEST_UPDATE on the control stream; closing session");
+          return Err(TerminationCode::ProtocolViolation);
         };
 
         enum Route {
@@ -119,80 +157,93 @@ impl MessageHandler {
           Publish,
           PublishNamespace,
           Subscribe,
-          SubscribeNamespace,
-          TrackStatus,
+          /// SUBSCRIBE_NAMESPACE and SUBSCRIBE_TRACKS are updated the same way.
+          PrefixSubscription,
           NotFound,
         }
 
-        // 2. Helper closure to map a PendingRequest to a Route
+        // Map a PendingRequest to a Route
         let determine_route = |req: Option<&PendingRequest>| match req {
           Some(PendingRequest::Fetch(_)) => Route::Fetch,
           Some(PendingRequest::Publish { .. }) => Route::Publish,
           Some(PendingRequest::PublishNamespace { .. }) => Route::PublishNamespace,
           Some(PendingRequest::Subscribe(_)) => Route::Subscribe,
-          Some(PendingRequest::SubscribeNamespace { .. }) => Route::SubscribeNamespace,
-          Some(PendingRequest::TrackStatus(_)) => Route::TrackStatus,
+          Some(PendingRequest::SubscribeNamespace { .. }) => Route::PrefixSubscription,
+          Some(PendingRequest::SubscribeTracks { .. }) => Route::PrefixSubscription,
           Some(PendingRequest::RequestUpdate { .. }) => Route::NotFound,
           None => Route::NotFound,
         };
 
-        // 3. Lock the appropriate map, determine the route, and immediately drop the lock
-        let route = if is_response_to_relay {
-          let map = context.relay_pending_requests.read().await;
-          determine_route(map.get(&target_req_id))
-        } else {
+        let route = {
           let map = client.inbound_requests.read().await;
           determine_route(map.get(&target_req_id))
         };
 
-        // 4. Route to the appropriate handler (defined only once!)
+        // Route to the appropriate handler (defined only once!)
         match route {
           Route::Fetch => {
-            fetch_handler::handle(client.clone(), control_stream_handler, msg, context.clone())
-              .await
+            fetch_handler::handle(
+              client.clone(),
+              stream_handler,
+              msg,
+              context.clone(),
+              opening_request_id,
+            )
+            .await
           }
           Route::Publish => {
-            publish_handler::handle(client.clone(), control_stream_handler, msg, context.clone())
-              .await
+            publish_handler::handle(
+              client.clone(),
+              stream_handler,
+              msg,
+              context.clone(),
+              opening_request_id,
+            )
+            .await
           }
           Route::PublishNamespace => {
             publish_namespace_handler::handle(
               client.clone(),
-              control_stream_handler,
+              stream_handler,
               msg,
               context.clone(),
+              opening_request_id,
             )
             .await
           }
           Route::Subscribe => {
-            subscribe_handler::handle(client.clone(), control_stream_handler, msg, context.clone())
-              .await
-          }
-          Route::SubscribeNamespace => {
-            subscribe_namespace_handler::handle(
+            subscribe_handler::handle(
               client.clone(),
-              control_stream_handler,
+              stream_handler,
               msg,
               context.clone(),
+              opening_request_id,
             )
             .await
           }
-          Route::TrackStatus => {
-            track_status_handler::handle(control_stream_handler, msg, context.clone()).await
+          Route::PrefixSubscription => {
+            crate::server::prefix_subscription::handle(
+              client.clone(),
+              stream_handler,
+              msg,
+              context.clone(),
+              opening_request_id,
+            )
+            .await
           }
           Route::NotFound => {
-            warn!(
-              "Router received generic message ({:?}) for untracked ID: {}",
-              msg.get_type(),
-              target_req_id
+            // A REQUEST_UPDATE must be answered with exactly one REQUEST_OK or
+            // REQUEST_ERROR, so an update naming a request the relay holds no
+            // updatable record of is rejected rather than terminating.
+            warn!("REQUEST_UPDATE for untracked request id {}", target_req_id);
+            let err = RequestError::new(
+              RequestErrorCode::NotSupported,
+              0,
+              ReasonPhrase::try_new("request does not support REQUEST_UPDATE".to_string()).unwrap(),
             );
-
-            // Draft-16: Unknown Update = ProtocolViolation. Unknown Response = Ignore.
-            if !is_response_to_relay {
-              Err(TerminationCode::ProtocolViolation)
-            } else {
-              Ok(())
-            }
+            stream_handler
+              .send(&ControlMessage::RequestError(Box::new(err)))
+              .await
           }
         }
       }
@@ -212,6 +263,44 @@ impl MessageHandler {
       Err(termination_code)
     } else {
       Ok(())
+    }
+  }
+
+  /// Opens a prefix subscription: SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS. What it
+  /// matches from then on goes out through `namespace_tx`, which the request stream
+  /// drains for as long as the subscription lives.
+  pub async fn handle_prefix_subscription(
+    client: Arc<MOQTClient>,
+    stream_handler: &mut ControlStreamHandler,
+    msg: ControlMessage,
+    context: Arc<SessionContext>,
+    namespace_tx: UnboundedSender<ControlMessage>,
+  ) -> Result<(), TerminationCode> {
+    match msg {
+      ControlMessage::SubscribeNamespace(sub_ns) => {
+        subscribe_namespace_handler::handle_subscribe_namespace(
+          client,
+          stream_handler,
+          sub_ns,
+          context,
+          namespace_tx,
+        )
+        .await
+      }
+      ControlMessage::SubscribeTracks(sub_tracks) => {
+        subscribe_tracks_handler::handle_subscribe_tracks(
+          client,
+          stream_handler,
+          sub_tracks,
+          context,
+          namespace_tx,
+        )
+        .await
+      }
+      other => {
+        warn!("{:?} is not a prefix subscription", other.get_type());
+        Err(TerminationCode::ProtocolViolation)
+      }
     }
   }
 }

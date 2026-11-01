@@ -20,10 +20,10 @@ pub enum FetchHeaderType {
   Type0x05 = 0x05,
 }
 
-/// Subgroup Header Type
+/// Subgroup Header Type.
 ///
-/// Type bit layout (0b00X1XXXX):
-/// - Bit 0 (0x01): EXTENSIONS - Extensions present in all objects
+/// Type bit layout (form `0b0XX1XXXX`):
+/// - Bit 0 (0x01): PROPERTIES - Properties present in all objects
 /// - Bits 1-2 (0x06): SUBGROUP_ID_MODE - How subgroup ID is encoded
 ///   - 0b00 (0x00): Subgroup ID = 0 (absent from header)
 ///   - 0b01 (0x02): Subgroup ID = First Object ID (absent from header)
@@ -32,15 +32,38 @@ pub enum FetchHeaderType {
 /// - Bit 3 (0x08): END_OF_GROUP - This subgroup contains the final object in the group
 /// - Bit 4 (0x10): Always set (distinguishes subgroup from other header types)
 /// - Bit 5 (0x20): DEFAULT_PRIORITY - Publisher priority field omitted, inherited from subscription
+/// - Bit 6 (0x40): FIRST_OBJECT - The first object on this stream is the first the original
+///   publisher published in the subgroup
+/// - Bit 7 (0x80): Must be 0
 ///
-/// Valid ranges: 0x10-0x15, 0x18-0x1D (bit 5=0), 0x30-0x35, 0x38-0x3D (bit 5=1)
-/// Invalid: 0x16, 0x17, 0x1E, 0x1F, 0x36, 0x37, 0x3E, 0x3F (SUBGROUP_ID_MODE=0b11)
+/// The Publisher Priority to assume where a header omits the field, having set its
+/// DEFAULT_PRIORITY bit. A track may name its own with the DEFAULT_PUBLISHER_PRIORITY
+/// track property; this is the value for one that does not. Priority runs from 0 (most
+/// important) to 255, so a wrong default here is not a small error: 0 makes every such
+/// object outrank all others.
+pub const DEFAULT_PUBLISHER_PRIORITY: u8 = 128;
+
+/// How a subgroup header gives the Subgroup ID (bits 1-2 of the type). The fourth
+/// value, 0b11, is reserved and has no variant, so a type built from one is always valid.
+#[derive(Debug, PartialEq, Clone, Copy, Eq)]
+pub enum SubgroupIdMode {
+  /// Subgroup ID is 0; the header has no Subgroup ID field.
+  Zero = 0b00,
+  /// Subgroup ID is the first Object ID on the stream; the header has no Subgroup ID field.
+  FirstObjectId = 0b01,
+  /// Subgroup ID is in the header.
+  Explicit = 0b10,
+}
+
+/// Valid Type values are exactly the ranges 0x10-0x1F, 0x30-0x3F, 0x50-0x5F and 0x70-0x7F
+/// (bit 4 set, bit 7 clear), minus those with SUBGROUP_ID_MODE = 0b11: 0x16, 0x17, 0x1E, 0x1F,
+/// 0x36, 0x37, 0x3E, 0x3F, 0x56, 0x57, 0x5E, 0x5F, 0x76, 0x77, 0x7E, 0x7F.
 #[derive(Debug, PartialEq, Clone, Copy, Eq)]
 pub struct SubgroupHeaderType(u8);
 
 impl SubgroupHeaderType {
-  /// Extensions present in all objects (bit 0)
-  pub const EXTENSIONS: u8 = 0x01;
+  /// Properties present in all objects (bit 0)
+  pub const PROPERTIES: u8 = 0x01;
   /// Mask for SUBGROUP_ID_MODE (bits 1-2)
   pub const SUBGROUP_ID_MODE_MASK: u8 = 0x06;
   /// This subgroup contains the final object in the group (bit 3)
@@ -49,8 +72,10 @@ impl SubgroupHeaderType {
   pub const REQUIRED_BIT: u8 = 0x10;
   /// Publisher priority field omitted, inherited from subscription (bit 5)
   pub const DEFAULT_PRIORITY: u8 = 0x20;
-  /// Mask for bits that must be zero: bits 6-7
-  const INVALID_BITS_MASK: u8 = 0xC0;
+  /// First object on this stream is the first published in the subgroup (bit 6)
+  pub const FIRST_OBJECT: u8 = 0x40;
+  /// Mask for bits that must be zero: bit 7 only
+  const INVALID_BITS_MASK: u8 = 0x80;
   /// Reserved SUBGROUP_ID_MODE value (0b11)
   const RESERVED_SUBGROUP_MODE: u8 = 0x06;
 
@@ -83,24 +108,34 @@ impl SubgroupHeaderType {
     self.0
   }
 
-  /// Check if extensions are present (bit 0 set)
-  pub fn has_extensions(&self) -> bool {
-    self.0 & Self::EXTENSIONS != 0
+  /// Check if properties are present (bit 0 set)
+  pub fn has_properties(&self) -> bool {
+    self.0 & Self::PROPERTIES != 0
+  }
+
+  /// How this header gives the Subgroup ID (bits 1-2).
+  pub fn subgroup_id_mode(&self) -> SubgroupIdMode {
+    match (self.0 & Self::SUBGROUP_ID_MODE_MASK) >> 1 {
+      0b00 => SubgroupIdMode::Zero,
+      0b01 => SubgroupIdMode::FirstObjectId,
+      // try_new rejects 0b11 and from_properties cannot produce it.
+      _ => SubgroupIdMode::Explicit,
+    }
   }
 
   /// Check if subgroup ID is explicit in header (SUBGROUP_ID_MODE = 0b10)
   pub fn has_explicit_subgroup_id(&self) -> bool {
-    self.0 & Self::SUBGROUP_ID_MODE_MASK == 0x04
+    self.subgroup_id_mode() == SubgroupIdMode::Explicit
   }
 
   /// Check if subgroup ID = 0 (SUBGROUP_ID_MODE = 0b00)
   pub fn subgroup_id_is_zero(&self) -> bool {
-    self.0 & Self::SUBGROUP_ID_MODE_MASK == 0x00
+    self.subgroup_id_mode() == SubgroupIdMode::Zero
   }
 
   /// Check if subgroup ID = first Object ID (SUBGROUP_ID_MODE = 0b01)
   pub fn subgroup_id_is_first_object_id(&self) -> bool {
-    self.0 & Self::SUBGROUP_ID_MODE_MASK == 0x02
+    self.subgroup_id_mode() == SubgroupIdMode::FirstObjectId
   }
 
   /// Check if this subgroup contains end of group (bit 3 set)
@@ -114,24 +149,33 @@ impl SubgroupHeaderType {
     self.0 & Self::DEFAULT_PRIORITY != 0
   }
 
+  /// Check if this stream's first object is the first the original publisher published
+  /// in the subgroup (bit 6 set).
+  pub fn is_first_object(&self) -> bool {
+    self.0 & Self::FIRST_OBJECT != 0
+  }
+
   /// Create type from property flags.
-  /// subgroup_id_mode: 0=zero, 1=firstObjId, 2=explicit
   pub fn from_properties(
-    has_extensions: bool,
-    subgroup_id_mode: u8,
+    has_properties: bool,
+    subgroup_id_mode: SubgroupIdMode,
     contains_end_of_group: bool,
     has_default_priority: bool,
+    first_object: bool,
   ) -> Self {
     let mut v: u8 = Self::REQUIRED_BIT;
-    if has_extensions {
-      v |= Self::EXTENSIONS;
+    if has_properties {
+      v |= Self::PROPERTIES;
     }
-    v |= (subgroup_id_mode & 0x03) << 1; // bits 1-2
+    v |= (subgroup_id_mode as u8) << 1; // bits 1-2
     if contains_end_of_group {
       v |= Self::END_OF_GROUP;
     }
     if has_default_priority {
       v |= Self::DEFAULT_PRIORITY;
+    }
+    if first_object {
+      v |= Self::FIRST_OBJECT;
     }
     Self(v)
   }
@@ -192,10 +236,10 @@ impl From<ObjectStatus> for u64 {
   }
 }
 
-/// Draft-16 Object Datagram Type (bitmask newtype).
+/// Object Datagram Type (bitmask newtype).
 ///
 /// Type bit layout (form `0b00X0XXXX`):
-/// - Bit 0 (0x01): EXTENSIONS — Extensions field present
+/// - Bit 0 (0x01): PROPERTIES — Properties field present
 /// - Bit 1 (0x02): END_OF_GROUP — Last object in group
 /// - Bit 2 (0x04): ZERO_OBJECT_ID — Object ID omitted (assumed 0)
 /// - Bit 3 (0x08): DEFAULT_PRIORITY — Publisher Priority omitted (inherited)
@@ -208,7 +252,7 @@ impl From<ObjectStatus> for u64 {
 pub struct ObjectDatagramType(u8);
 
 impl ObjectDatagramType {
-  pub const EXTENSIONS: u8 = 0x01;
+  pub const PROPERTIES: u8 = 0x01;
   pub const END_OF_GROUP: u8 = 0x02;
   pub const ZERO_OBJECT_ID: u8 = 0x04;
   pub const DEFAULT_PRIORITY: u8 = 0x08;
@@ -240,9 +284,9 @@ impl ObjectDatagramType {
     self.0
   }
 
-  /// Check if extensions are present (bit 0).
-  pub fn has_extensions(&self) -> bool {
-    self.0 & Self::EXTENSIONS != 0
+  /// Check if properties are present (bit 0).
+  pub fn has_properties(&self) -> bool {
+    self.0 & Self::PROPERTIES != 0
   }
 
   /// Check if this is end of group (bit 1).
@@ -270,15 +314,15 @@ impl ObjectDatagramType {
   /// Create type from property flags.
   /// Returns error if STATUS and END_OF_GROUP are both true.
   pub fn from_properties(
-    has_extensions: bool,
+    has_properties: bool,
     end_of_group: bool,
     object_id_is_zero: bool,
     default_priority: bool,
     is_status: bool,
   ) -> Result<Self, ParseError> {
     let mut v: u8 = 0;
-    if has_extensions {
-      v |= Self::EXTENSIONS;
+    if has_properties {
+      v |= Self::PROPERTIES;
     }
     if end_of_group {
       v |= Self::END_OF_GROUP;
@@ -307,5 +351,194 @@ impl TryFrom<u64> for ObjectDatagramType {
 impl From<ObjectDatagramType> for u64 {
   fn from(dtype: ObjectDatagramType) -> Self {
     dtype.0 as u64
+  }
+}
+
+#[cfg(test)]
+mod data_stream_type_conformance {
+  //! The type bytes are checked against `dev/conformance/draft22/data_stream_types.json`,
+  //! which is shared with moqtail-ts. The bit layout and the set of accepted bytes live
+  //! there, not in this file.
+
+  use super::*;
+  use crate::conformance;
+
+  #[test]
+  fn subgroup_header_bits_match_the_fixture() {
+    let fixture = conformance::data_stream_types().subgroup_header;
+    assert_eq!(fixture.mask("PROPERTIES"), SubgroupHeaderType::PROPERTIES);
+    assert_eq!(
+      fixture.mask("SUBGROUP_ID_MODE"),
+      SubgroupHeaderType::SUBGROUP_ID_MODE_MASK
+    );
+    assert_eq!(
+      fixture.mask("END_OF_GROUP"),
+      SubgroupHeaderType::END_OF_GROUP
+    );
+    assert_eq!(fixture.mask("REQUIRED"), SubgroupHeaderType::REQUIRED_BIT);
+    assert_eq!(
+      fixture.mask("DEFAULT_PRIORITY"),
+      SubgroupHeaderType::DEFAULT_PRIORITY
+    );
+    assert_eq!(
+      fixture.mask("FIRST_OBJECT"),
+      SubgroupHeaderType::FIRST_OBJECT
+    );
+  }
+
+  #[test]
+  fn subgroup_header_accepts_exactly_the_fixture_bytes() {
+    let valid = conformance::data_stream_types()
+      .subgroup_header
+      .valid_bytes();
+    for byte in 0u16..=0xff {
+      let byte = byte as u8;
+      let accepted = SubgroupHeaderType::try_new(byte as u64).is_ok();
+      assert_eq!(
+        accepted,
+        valid.contains(&byte),
+        "type {byte:#04x}: accepted={accepted}, fixture lists it={}",
+        valid.contains(&byte)
+      );
+    }
+  }
+
+  #[test]
+  fn subgroup_id_modes_match_the_fixture() {
+    let fixture = conformance::data_stream_types().subgroup_header;
+    for mode in &fixture.subgroup_id_modes {
+      let bits = mode.codepoint() as u8;
+      if mode.reserved {
+        // A reserved mode has no representable type, so nothing to interrogate.
+        assert!(
+          SubgroupHeaderType::try_new((SubgroupHeaderType::REQUIRED_BIT | bits) as u64).is_err()
+        );
+        continue;
+      }
+      let t = SubgroupHeaderType::try_new((SubgroupHeaderType::REQUIRED_BIT | bits) as u64)
+        .expect("fixture mode must produce a valid type");
+      match mode.name.as_str() {
+        "ZERO" => assert!(t.subgroup_id_is_zero()),
+        "FIRST_OBJECT_ID" => assert!(t.subgroup_id_is_first_object_id()),
+        "EXPLICIT" => assert!(t.has_explicit_subgroup_id()),
+        other => panic!("fixture names an unknown subgroup id mode {other:?}"),
+      }
+    }
+  }
+
+  #[test]
+  fn object_datagram_bits_match_the_fixture() {
+    let fixture = conformance::data_stream_types().object_datagram;
+    assert_eq!(fixture.mask("PROPERTIES"), ObjectDatagramType::PROPERTIES);
+    assert_eq!(
+      fixture.mask("END_OF_GROUP"),
+      ObjectDatagramType::END_OF_GROUP
+    );
+    assert_eq!(
+      fixture.mask("ZERO_OBJECT_ID"),
+      ObjectDatagramType::ZERO_OBJECT_ID
+    );
+    assert_eq!(
+      fixture.mask("DEFAULT_PRIORITY"),
+      ObjectDatagramType::DEFAULT_PRIORITY
+    );
+    assert_eq!(fixture.mask("STATUS"), ObjectDatagramType::STATUS);
+  }
+
+  #[test]
+  fn object_datagram_accepts_exactly_the_fixture_bytes() {
+    let valid = conformance::data_stream_types()
+      .object_datagram
+      .valid_bytes();
+    for byte in 0u16..=0xff {
+      let byte = byte as u8;
+      let accepted = ObjectDatagramType::try_new(byte as u64).is_ok();
+      assert_eq!(
+        accepted,
+        valid.contains(&byte),
+        "type {byte:#04x}: accepted={accepted}, fixture lists it={}",
+        valid.contains(&byte)
+      );
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// The independent oracle for a valid SUBGROUP_HEADER type byte:
+  /// bit 7 clear, bit 4 set, and SUBGROUP_ID_MODE (bits 1-2) not 0b11.
+  fn is_valid_subgroup_type(b: u8) -> bool {
+    b & 0x80 == 0 && b & 0x10 != 0 && b & 0x06 != 0x06
+  }
+
+  #[test]
+  fn subgroup_header_type_classifies_all_256_bytes() {
+    // The 16 reserved SUBGROUP_ID_MODE = 0b11 values named explicitly, as a
+    // cross-check that the oracle and the spec agree.
+    let reserved_mode_3 = [
+      0x16u8, 0x17, 0x1E, 0x1F, 0x36, 0x37, 0x3E, 0x3F, 0x56, 0x57, 0x5E, 0x5F, 0x76, 0x77, 0x7E,
+      0x7F,
+    ];
+
+    for b in 0u8..=255 {
+      let accepted = SubgroupHeaderType::try_new(b as u64).is_ok();
+      let expected = is_valid_subgroup_type(b);
+      assert_eq!(accepted, expected, "type byte {b:#04x}");
+
+      if reserved_mode_3.contains(&b) {
+        assert!(
+          !accepted,
+          "reserved SUBGROUP_ID_MODE 0b11 value {b:#04x} must be rejected"
+        );
+      }
+      // Round-trips preserve the byte for accepted values.
+      if accepted {
+        assert_eq!(SubgroupHeaderType::try_new(b as u64).unwrap().value(), b);
+      }
+    }
+
+    // Exactly the four ranges minus the 16 reserved values are valid.
+    let valid_count = (0u8..=255).filter(|&b| is_valid_subgroup_type(b)).count();
+    assert_eq!(valid_count, 4 * 16 - 16, "expected 48 valid type bytes");
+  }
+
+  #[test]
+  fn subgroup_id_mode_round_trips_through_the_type() {
+    for (mode, bits) in [
+      (SubgroupIdMode::Zero, 0x00),
+      (SubgroupIdMode::FirstObjectId, 0x02),
+      (SubgroupIdMode::Explicit, 0x04),
+    ] {
+      let t = SubgroupHeaderType::from_properties(true, mode, true, true, true);
+      assert_eq!(t.value() & SubgroupHeaderType::SUBGROUP_ID_MODE_MASK, bits);
+      assert_eq!(t.subgroup_id_mode(), mode);
+      assert_eq!(SubgroupHeaderType::try_new(t.value() as u64).unwrap(), t);
+    }
+  }
+
+  #[test]
+  fn first_object_bit_round_trips() {
+    let with =
+      SubgroupHeaderType::from_properties(false, SubgroupIdMode::Explicit, false, false, true);
+    assert!(with.is_first_object());
+    assert_eq!(with.value() & SubgroupHeaderType::FIRST_OBJECT, 0x40);
+    assert_eq!(
+      SubgroupHeaderType::try_new(with.value() as u64).unwrap(),
+      with
+    );
+
+    let without =
+      SubgroupHeaderType::from_properties(false, SubgroupIdMode::Explicit, false, false, false);
+    assert!(!without.is_first_object());
+  }
+
+  #[test]
+  fn first_object_alone_is_a_valid_type() {
+    // 0x50 = FIRST_OBJECT (0x40) + REQUIRED_BIT (0x10), mode 0b00. Rejected before RS-14
+    // because 0x40 was in INVALID_BITS_MASK.
+    let t = SubgroupHeaderType::try_new(0x50).unwrap();
+    assert!(t.is_first_object());
   }
 }

@@ -24,7 +24,6 @@ pub enum TerminationCode {
   InvalidRequestID = 0x4,
   DuplicateTrackAlias = 0x5,
   KeyValueFormattingError = 0x6,
-  TooManyRequests = 0x7,
   InvalidPath = 0x8,
   MalformedPath = 0x9,
   GoawayTimeout = 0x10,
@@ -38,6 +37,7 @@ pub enum TerminationCode {
   ExpiredAuthToken = 0x18,
   InvalidAuthority = 0x19,
   MalformedAuthority = 0x1A,
+  TooManyRequestUpdates = 0x1B,
 }
 
 impl TerminationCode {

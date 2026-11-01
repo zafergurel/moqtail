@@ -17,7 +17,12 @@ import { BaseByteBuffer, ByteBuffer, FrozenByteBuffer } from '../common/byte_buf
 import { Tuple } from '../common/tuple'
 import { ControlMessageType } from './constant'
 import { NotEnoughBytesError, LengthExceedsMaxError } from '../error/error'
-import { MessageParameter, MessageParameters } from '../parameter/message_parameter'
+import {
+  MessageParameter,
+  MessageParameters,
+  deserializeMessageParameterKvps,
+  serializeMessageParameterKvps,
+} from '../parameter/message_parameter'
 import { AuthorizationToken } from '../parameter/common/authorization_token'
 
 /**
@@ -65,9 +70,7 @@ export class PublishNamespace {
     payload.putVI(this.requestId)
     payload.putTuple(this.trackNamespace)
     payload.putVI(this.parameters.length)
-    for (const param of this.parameters) {
-      payload.putKeyValuePair(param.toKeyValuePair())
-    }
+    payload.putBytes(serializeMessageParameterKvps(this.parameters.map((p) => p.toKeyValuePair())).toUint8Array())
     const payloadBytes = payload.toUint8Array()
     if (payloadBytes.length > 0xffff) {
       throw new LengthExceedsMaxError('PublishNamespace::serialize(payloadBytes.length)', 0xffff, payloadBytes.length)
@@ -89,10 +92,7 @@ export class PublishNamespace {
     const requestId = buf.getVI()
     const trackNamespace = buf.getTuple()
     const paramCount = buf.getNumberVI()
-    const rawParams = new Array(paramCount)
-    for (let i = 0; i < paramCount; i++) {
-      rawParams[i] = buf.getKeyValuePair()
-    }
+    const rawParams = deserializeMessageParameterKvps(buf, paramCount)
     const parameters = MessageParameters.fromKeyValuePairs(rawParams)
     return new PublishNamespace(requestId, trackNamespace, parameters)
   }

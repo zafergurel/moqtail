@@ -16,20 +16,39 @@
 
 import { BaseByteBuffer, ByteBuffer, FrozenByteBuffer } from '../common/byte_buffer'
 import { ReasonPhrase } from '../common/reason_phrase'
-import { ControlMessageType, RequestErrorCode, requestErrorCodeFromBigInt } from './constant'
-import { LengthExceedsMaxError } from '../error/error'
+import { Redirect } from '../common/redirect'
+import { Tuple } from '../common/tuple'
+import { greaseValue } from '../common/grease'
+import { ControlMessageType, RequestErrorCode } from './constant'
+import { LengthExceedsMaxError, ProtocolViolationError } from '../error/error'
 
+/**
+ * REQUEST_ERROR (0x5) refuses any request type. It carries no Request ID: the request
+ * stream it arrives on identifies the request (§10.1).
+ */
 export class RequestError {
-  public readonly requestId: bigint
   public readonly errorCode: RequestErrorCode
   public readonly retryInterval: bigint
   public readonly reasonPhrase: ReasonPhrase
+  /** Present exactly when {@link RequestError.errorCode} is `REDIRECT` (§10.6.2). */
+  public readonly redirect: Redirect | undefined
 
-  constructor(requestId: bigint, errorCode: RequestErrorCode, retryInterval: bigint, reasonPhrase: ReasonPhrase) {
-    this.requestId = requestId
+  constructor(errorCode: RequestErrorCode, retryInterval: bigint, reasonPhrase: ReasonPhrase, redirect?: Redirect) {
+    if ((errorCode === RequestErrorCode.Redirect) !== (redirect !== undefined)) {
+      throw new ProtocolViolationError(
+        'RequestError::constructor(redirect)',
+        'A Redirect belongs to a REDIRECT error and to no other code',
+      )
+    }
     this.errorCode = errorCode
     this.retryInterval = retryInterval
     this.reasonPhrase = reasonPhrase
+    this.redirect = redirect
+  }
+
+  /** A REQUEST_ERROR that redirects the request elsewhere (§10.6.1). */
+  static redirect(retryInterval: bigint, reasonPhrase: ReasonPhrase, redirect: Redirect): RequestError {
+    return new RequestError(RequestErrorCode.Redirect, retryInterval, reasonPhrase, redirect)
   }
 
   getType(): ControlMessageType {
@@ -40,10 +59,10 @@ export class RequestError {
     const buf = new ByteBuffer()
     buf.putVI(ControlMessageType.RequestError)
     const payload = new ByteBuffer()
-    payload.putVI(this.requestId)
     payload.putVI(this.errorCode)
     payload.putVI(this.retryInterval)
     payload.putReasonPhrase(this.reasonPhrase)
+    if (this.redirect) payload.putBytes(this.redirect.serialize().toUint8Array())
     const payloadBytes = payload.toUint8Array()
     if (payloadBytes.length > 0xffff) {
       throw new LengthExceedsMaxError('RequestError::serialize(payloadBytes.length)', 0xffff, payloadBytes.length)
@@ -54,12 +73,12 @@ export class RequestError {
   }
 
   static parsePayload(buf: BaseByteBuffer): RequestError {
-    const requestId = buf.getVI()
-    const errorCodeRaw = buf.getVI()
-    const errorCode = requestErrorCodeFromBigInt(errorCodeRaw)
+    // An unknown or GREASE error code is not fatal; treat it as InternalError.
+    const errorCode = RequestErrorCode.fromWire(buf.getVI())
     const retryInterval = buf.getVI()
     const reasonPhrase = buf.getReasonPhrase()
-    return new RequestError(requestId, errorCode, retryInterval, reasonPhrase)
+    const redirect = errorCode === RequestErrorCode.Redirect ? Redirect.deserialize(buf) : undefined
+    return new RequestError(errorCode, retryInterval, reasonPhrase, redirect)
   }
 }
 
@@ -67,30 +86,39 @@ if (import.meta.vitest) {
   const { describe, test, expect } = import.meta.vitest
   describe('RequestError', () => {
     test('roundtrip', () => {
-      const requestId = 160669n
       const errorCode = RequestErrorCode.InternalError
       const retryInterval = 0n
       const reasonPhrase = new ReasonPhrase("They see me rollin'")
-      const requestError = new RequestError(requestId, errorCode, retryInterval, reasonPhrase)
+      const requestError = new RequestError(errorCode, retryInterval, reasonPhrase)
       const frozen = requestError.serialize()
       const msgType = frozen.getVI()
       expect(msgType).toBe(BigInt(ControlMessageType.RequestError))
       const msgLength = frozen.getU16()
       expect(msgLength).toBe(frozen.remaining)
       const deserialized = RequestError.parsePayload(frozen)
-      expect(deserialized.requestId).toBe(requestError.requestId)
       expect(deserialized.errorCode).toBe(requestError.errorCode)
       expect(deserialized.retryInterval).toBe(requestError.retryInterval)
       expect(deserialized.reasonPhrase.phrase).toBe(requestError.reasonPhrase.phrase)
       expect(frozen.remaining).toBe(0)
     })
 
+    // §14: a REQUEST_ERROR carrying a greased (unknown) error code must parse, not
+    // throw, and is surfaced as InternalError.
+    test('a greased error code parses as InternalError', () => {
+      const payload = new ByteBuffer()
+      payload.putVI(greaseValue(3)!)
+      payload.putVI(0n) // retryInterval
+      payload.putReasonPhrase(new ReasonPhrase('grease'))
+      const parsed = RequestError.parsePayload(payload.freeze())
+      expect(parsed.errorCode).toBe(RequestErrorCode.InternalError)
+      expect(parsed.reasonPhrase.phrase).toBe('grease')
+    })
+
     test('excess roundtrip', () => {
-      const requestId = 160669n
       const errorCode = RequestErrorCode.InternalError
       const retryInterval = 0n
       const reasonPhrase = new ReasonPhrase("They see me rollin'")
-      const requestError = new RequestError(requestId, errorCode, retryInterval, reasonPhrase)
+      const requestError = new RequestError(errorCode, retryInterval, reasonPhrase)
       const serialized = requestError.serialize().toUint8Array()
       const excess = new Uint8Array([9, 1, 1])
       const buf = new ByteBuffer()
@@ -102,7 +130,6 @@ if (import.meta.vitest) {
       const msgLength = frozen.getU16()
       expect(msgLength).toBe(frozen.remaining - 3)
       const deserialized = RequestError.parsePayload(frozen)
-      expect(deserialized.requestId).toBe(requestError.requestId)
       expect(deserialized.errorCode).toBe(requestError.errorCode)
       expect(deserialized.retryInterval).toBe(requestError.retryInterval)
       expect(deserialized.reasonPhrase.phrase).toBe(requestError.reasonPhrase.phrase)
@@ -110,12 +137,47 @@ if (import.meta.vitest) {
       expect(Array.from(frozen.getBytes(3))).toEqual([9, 1, 1])
     })
 
+    test('a REDIRECT carries its Redirect, and no other code may', () => {
+      const redirect = new Redirect(
+        'moqt://other.example',
+        Tuple.fromUtf8Path('room1/audio'),
+        new TextEncoder().encode('track-9'),
+      )
+      const requestError = RequestError.redirect(1000n, new ReasonPhrase('moved'), redirect)
+      const frozen = requestError.serialize()
+      frozen.getVI()
+      frozen.getU16()
+
+      const deserialized = RequestError.parsePayload(frozen)
+      expect(deserialized.errorCode).toBe(RequestErrorCode.Redirect)
+      expect(deserialized.redirect?.connectUri).toBe('moqt://other.example')
+      expect(deserialized.redirect?.trackNamespace.equals(redirect.trackNamespace)).toBe(true)
+      expect(deserialized.redirect?.trackName).toEqual(redirect.trackName)
+      expect(frozen.remaining).toBe(0)
+
+      expect(() => new RequestError(RequestErrorCode.InternalError, 0n, new ReasonPhrase('no'), redirect)).toThrow(
+        ProtocolViolationError,
+      )
+      expect(() => new RequestError(RequestErrorCode.Redirect, 0n, new ReasonPhrase('no'))).toThrow(
+        ProtocolViolationError,
+      )
+    })
+
+    test('a non-REDIRECT error carries no Redirect', () => {
+      const requestError = new RequestError(RequestErrorCode.GoingAway, 0n, new ReasonPhrase('bye'))
+      const frozen = requestError.serialize()
+      frozen.getVI()
+      frozen.getU16()
+
+      expect(RequestError.parsePayload(frozen).redirect).toBeUndefined()
+      expect(frozen.remaining).toBe(0)
+    })
+
     test('partial message', () => {
-      const requestId = 160669n
       const errorCode = RequestErrorCode.InternalError
       const retryInterval = 0n
       const reasonPhrase = new ReasonPhrase("They see me rollin'")
-      const requestError = new RequestError(requestId, errorCode, retryInterval, reasonPhrase)
+      const requestError = new RequestError(errorCode, retryInterval, reasonPhrase)
       const serialized = requestError.serialize().toUint8Array()
       const upper = Math.floor(serialized.length / 2)
       const partial = serialized.slice(0, upper)

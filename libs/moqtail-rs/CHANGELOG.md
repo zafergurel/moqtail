@@ -1,5 +1,57 @@
 # moqtail-rs
 
+## 0.16.0
+
+### Minor Changes
+
+- [#386](https://github.com/moqtail/moqtail/pull/386) [`d642d33`](https://github.com/moqtail/moqtail/commit/d642d335d1f0b0bc4d2020dc47416eaeb2b4a550) Thanks [@zafergurel](https://github.com/zafergurel)! - Switch tracks with the SWITCH_FROM parameter
+
+  A SUBSCRIBE or REQUEST_UPDATE carrying SWITCH_FROM activates its own
+  subscription and suspends the one it names, in place of the SWITCH message,
+  which is gone. A hard switch stops the suspended subscription at the cutover; a
+  soft switch lets it drain to the group before the new subscription's start, so
+  the two are contiguous.
+
+  The fill filter types — AbsoluteStartFill, AbsoluteRangeFill and the new
+  RelativeStartFill — ask the publisher for the objects already published, which
+  arrive on a fill fetch stream: a unidirectional stream beginning with a
+  FETCH_HEADER that names the request which asked for the fill. FILL_PARAMETERS
+  overrides the subscriber priority and group order that stream runs at.
+
+  FETCH is a single message now. Fetch Type and Joining Fetch are gone, along with
+  INVALID_JOINING_REQUEST_ID, whose codepoint INVALID_SWITCH takes over.
+
+## 0.15.0
+
+### Minor Changes
+
+- [#391](https://github.com/moqtail/moqtail/pull/391) [`fbec509`](https://github.com/moqtail/moqtail/commit/fbec5094b0be8fbb1431801093d091444c331a53) - - Changes related to draft-18 compatibility
+  - Added SSTS (Sender Side Track Switching) support, gated behind `--ssts-enable` since the setup option and the message parameter it uses are provisional on an unadopted draft. Also implements the default ABR algorithm and a backpressure based experimental algorithm. Algorithms live in the `moqtail-ssts` crate.
+  - Rename warp to cmsf and make catalog version string
+  - Refactor enums to use tryFrom for cleaner API
+  - Keep a publication alive when the peer moves its Forward State, and report the move through onForwardStateChange
+  - Tell onPeerPublishDone which request the PUBLISH_DONE ended
+  - Fix(moqtail-ts): stop TerminationCode.tryFrom throwing on five valid enum values
+  - Client: add a subscribe-namespace command, receive objects for the tracks SUBSCRIBE_TRACKS is handed, cancel a prefix subscription by resetting its request stream, and report REQUEST_ERROR with its code and reason
+  - Handle malformed FETCH track on end client
+  - Helper function to validate subgroup priority in FETCH
+  - Check prior id gaps for malformed track
+  - Relay: reset downstream FETCH on malformed upstream track
+  - Relay: handle objects received before FETCH_OK
+  - Relay: report stream closed for empty FETCHes
+
+## 0.14.0
+
+### Minor Changes
+
+- [`0ca44e5`](https://github.com/moqtail/moqtail/commit/0ca44e59cf39ac97e73e465e80b64dba0302b2ba) Thanks [@zafergurel](https://github.com/zafergurel)! - Add raw QUIC transport support alongside WebTransport. `TransportConnection`/`TransportSendStream`/`TransportRecvStream` in moqtail-rs now wrap both wtransport and raw quinn behind one API, threaded through the relay and client stream handlers. The relay's QUIC listener demultiplexes WebTransport and raw-QUIC connections on the same UDP socket/port via ALPN, and the client connects over raw QUIC when given a `moqt://authority[/path]` server URL (carrying authority/path via CLIENT_SETUP parameters instead of HTTP CONNECT).
+
+### Patch Changes
+
+- [#208](https://github.com/moqtail/moqtail/pull/208) [`211ce94`](https://github.com/moqtail/moqtail/commit/211ce94bd1890cb4846d1805dc476e2b6702321b) Thanks [@zafergurel](https://github.com/zafergurel)! - Fix Key-Value-Pair Type fields being encoded/decoded as raw absolute values instead of deltas from the previous Type in the same list, per draft-ietf-moq-transport-16 (#1315). This broke interop with spec-compliant v16 peers: parameters such as FORWARD or SUBSCRIPTION_FILTER could be received as the wrong type (e.g. logged as "Unsupported parameter 48/81") by any peer that correctly delta-decodes. Affects Setup/Message Parameters and Object/Track Extension Headers (including the nested ImmutableExtensions list) in both the Rust (`moqtail-rs`) and TypeScript (`moqtail`) libraries.
+
+- [#206](https://github.com/moqtail/moqtail/pull/206) [`9c236c9`](https://github.com/moqtail/moqtail/commit/9c236c9117578aaf1033ee1a8e7e52ad04086979) Thanks [@kerembkmz](https://github.com/kerembkmz)! - Normalize empty subgroup extension headers to null so [] serializes the same as no headers.
+
 ## 0.13.1
 
 ### Patch Changes

@@ -17,22 +17,56 @@ use super::control_message::ControlMessageTrait;
 use crate::model::common::varint::{BufMutVarIntExt, BufVarIntExt};
 use crate::model::error::ParseError;
 use crate::model::parameter::message_parameter::{
-  MessageParameter, deserialize_message_parameters,
+  MessageParameter, deserialize_message_parameters, serialize_message_parameters,
+};
+use crate::model::property::track_property::{
+  TrackProperty, deserialize_track_properties, serialize_track_properties,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 
+/// REQUEST_OK (0x7) answers PUBLISH, REQUEST_UPDATE, TRACK_STATUS,
+/// SUBSCRIBE_NAMESPACE, SUBSCRIBE_TRACKS and PUBLISH_NAMESPACE. There is one wire
+/// type; the per-request-type names (PUBLISH_OK, TRACK_STATUS_OK, ...) are
+/// shorthands, not distinct messages.
 #[derive(Debug, PartialEq, Clone)]
 pub struct RequestOk {
-  pub request_id: u64,
   pub parameters: Vec<MessageParameter>,
+  /// Populated only in TRACK_STATUS_OK; empty for every other request type.
+  pub track_properties: Vec<TrackProperty>,
 }
 
 impl RequestOk {
-  pub fn new(request_id: u64, parameters: Vec<MessageParameter>) -> Self {
+  /// A REQUEST_OK with no Track Properties (every request type except TRACK_STATUS).
+  pub fn new(parameters: Vec<MessageParameter>) -> Self {
     Self {
-      request_id,
       parameters,
+      track_properties: Vec::new(),
     }
+  }
+
+  /// A TRACK_STATUS_OK carrying Track Properties.
+  pub fn new_track_status(
+    parameters: Vec<MessageParameter>,
+    track_properties: Vec<TrackProperty>,
+  ) -> Self {
+    Self {
+      parameters,
+      track_properties,
+    }
+  }
+
+  /// Track Properties may only be non-empty when this REQUEST_OK answers a
+  /// TRACK_STATUS request. A receiver that sees them in any other REQUEST_OK
+  /// (PUBLISH_OK, REQUEST_UPDATE_OK, SUBSCRIBE_NAMESPACE_OK, PUBLISH_NAMESPACE_OK)
+  /// MUST close the session with a PROTOCOL_VIOLATION.
+  pub fn validate_track_properties(&self, answers_track_status: bool) -> Result<(), ParseError> {
+    if !answers_track_status && !self.track_properties.is_empty() {
+      return Err(ParseError::ProtocolViolation {
+        context: "RequestOk::validate_track_properties",
+        details: "Track Properties present in a non-TRACK_STATUS REQUEST_OK".to_string(),
+      });
+    }
+    Ok(())
   }
 }
 
@@ -42,12 +76,11 @@ impl ControlMessageTrait for RequestOk {
     buf.put_vi(ControlMessageType::RequestOk)?;
 
     let mut payload = BytesMut::new();
-    payload.put_vi(self.request_id)?;
-
     payload.put_vi(self.parameters.len() as u64)?;
-    for param in &self.parameters {
-      payload.extend_from_slice(&param.serialize()?);
-    }
+    payload.extend_from_slice(&serialize_message_parameters(&self.parameters)?);
+
+    // Track Properties span the remaining message length (no explicit count).
+    payload.extend_from_slice(&serialize_track_properties(&self.track_properties)?);
 
     let payload_len: u16 = payload
       .len()
@@ -66,14 +99,16 @@ impl ControlMessageTrait for RequestOk {
   }
 
   fn parse_payload(payload: &mut Bytes) -> Result<Box<Self>, ParseError> {
-    let request_id = payload.get_vi()?;
     let param_count = payload.get_vi()?;
     let parameters =
       deserialize_message_parameters(payload, param_count, ControlMessageType::RequestOk)?;
 
+    // Whatever remains is the Track Properties sequence.
+    let track_properties = deserialize_track_properties(payload)?;
+
     Ok(Box::new(RequestOk {
-      request_id,
       parameters,
+      track_properties,
     }))
   }
 
@@ -85,12 +120,12 @@ impl ControlMessageTrait for RequestOk {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::model::control::constant::GroupOrder;
+  use crate::model::common::location::Location;
   use bytes::Buf;
 
   #[test]
   fn test_roundtrip_no_params() {
-    let request_ok = RequestOk::new(12345, vec![]);
+    let request_ok = RequestOk::new(vec![]);
 
     let mut buf = request_ok.serialize().unwrap();
     let msg_type = buf.get_vi().unwrap();
@@ -104,13 +139,10 @@ mod tests {
 
   #[test]
   fn test_roundtrip_with_params() {
-    let request_ok = RequestOk::new(
-      67890,
-      vec![
-        MessageParameter::new_expires(3600),
-        MessageParameter::new_group_order(GroupOrder::Ascending),
-      ],
-    );
+    let request_ok = RequestOk::new(vec![
+      MessageParameter::new_expires(3600),
+      MessageParameter::new_largest_object(Location::new(4, 2)),
+    ]);
 
     let mut buf = request_ok.serialize().unwrap();
     let msg_type = buf.get_vi().unwrap();
@@ -124,7 +156,7 @@ mod tests {
 
   #[test]
   fn test_excess_roundtrip() {
-    let request_ok = RequestOk::new(112233, vec![MessageParameter::new_expires(3600)]);
+    let request_ok = RequestOk::new(vec![MessageParameter::new_expires(3600)]);
 
     let serialized = request_ok.serialize().unwrap();
     let mut excess = BytesMut::new();
@@ -146,7 +178,7 @@ mod tests {
 
   #[test]
   fn test_partial_message() {
-    let request_ok = RequestOk::new(112233, vec![MessageParameter::new_expires(3600)]);
+    let request_ok = RequestOk::new(vec![MessageParameter::new_expires(3600)]);
     let mut buf = request_ok.serialize().unwrap();
     let msg_type = buf.get_vi().unwrap();
     assert_eq!(msg_type, ControlMessageType::RequestOk as u64);
@@ -157,5 +189,49 @@ mod tests {
     let mut partial = buf.slice(..upper);
     let deserialized = RequestOk::parse_payload(&mut partial);
     assert!(deserialized.is_err());
+  }
+
+  #[test]
+  fn test_roundtrip_track_status_with_track_properties() {
+    use crate::model::property::track_property::TrackProperty;
+    let request_ok = RequestOk::new_track_status(
+      vec![MessageParameter::new_expires(60)],
+      vec![
+        TrackProperty::MaxCacheDuration {
+          duration_ms: 60_000,
+        },
+        TrackProperty::DefaultPublisherPriority { priority: 3 },
+      ],
+    );
+
+    let mut buf = request_ok.serialize().unwrap();
+    let msg_type = buf.get_vi().unwrap();
+    assert_eq!(msg_type, ControlMessageType::RequestOk as u64);
+    let msg_length = buf.get_u16();
+    assert_eq!(msg_length as usize, buf.remaining());
+    let deserialized = RequestOk::parse_payload(&mut buf).unwrap();
+    assert_eq!(*deserialized, request_ok);
+    assert!(!buf.has_remaining());
+  }
+
+  #[test]
+  fn test_track_properties_only_valid_for_track_status() {
+    use crate::model::property::track_property::TrackProperty;
+    let with_props = RequestOk::new_track_status(
+      vec![],
+      vec![TrackProperty::MaxCacheDuration { duration_ms: 1 }],
+    );
+    // Non-empty properties answering a TRACK_STATUS request are allowed.
+    assert!(with_props.validate_track_properties(true).is_ok());
+    // Non-empty properties answering any other request type are a violation.
+    assert!(matches!(
+      with_props.validate_track_properties(false),
+      Err(ParseError::ProtocolViolation { .. })
+    ));
+
+    // Empty properties are always fine.
+    let empty = RequestOk::new(vec![]);
+    assert!(empty.validate_track_properties(false).is_ok());
+    assert!(empty.validate_track_properties(true).is_ok());
   }
 }

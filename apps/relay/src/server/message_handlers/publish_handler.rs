@@ -13,31 +13,40 @@
 // limitations under the License.
 
 use crate::server::client::MOQTClient;
+use crate::server::message_handlers::parameters;
 use crate::server::session::Session;
 use crate::server::session_context::PendingRequest;
 use crate::server::session_context::SessionContext;
-use crate::server::track::{Track, TrackStatus};
+use crate::server::subscription::Subscription;
+use crate::server::track::{Track, TrackOrigin, TrackStatus, await_publisher_streams};
+use crate::server::track_manager::SubscribeKind;
 use core::result::Result;
 use moqtail::model::common::reason_phrase::ReasonPhrase;
 use moqtail::model::control::{
-  constant::{FilterType, GroupOrder, RequestErrorCode},
-  control_message::ControlMessage,
-  publish_ok::PublishOk,
-  request_error::RequestError,
+  control_message::ControlMessage, publish::Publish, request_error::RequestError,
+  request_ok::RequestOk, request_update::RequestUpdate,
 };
-use moqtail::model::error::TerminationCode;
+use moqtail::model::data::full_track_name::FullTrackName;
+use moqtail::model::error::{RequestErrorCode, TerminationCode};
+use moqtail::model::parameter::combined_filter::CombinedFilter;
 use moqtail::model::parameter::constant::MessageParameterType;
-use moqtail::model::parameter::message_parameter::apply_message_parameter_update;
 use moqtail::model::parameter::message_parameter::{MessageParameter, MessageParameterVecExt};
+use moqtail::model::parameter::message_parameter::{
+  apply_message_parameter_update, include_properties,
+};
+use moqtail::model::property::track_property::has_unsupported_mandatory;
 use moqtail::transport::control_stream_handler::ControlStreamHandler;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use std::sync::atomic::Ordering;
+use tokio::sync::RwLock;
+use tracing::{error, info, trace, warn};
 
 pub async fn handle(
   client: Arc<MOQTClient>,
-  control_stream_handler: &mut ControlStreamHandler,
+  stream_handler: &mut ControlStreamHandler,
   msg: ControlMessage,
   context: Arc<SessionContext>,
+  opening_request_id: Option<u64>,
 ) -> Result<(), TerminationCode> {
   match msg {
     ControlMessage::Publish(m) => {
@@ -45,18 +54,19 @@ pub async fn handle(
       let request_id = m.request_id;
       let track_alias = m.track_alias;
 
-      // Check request ID
-      {
-        let max_request_id = context
-          .max_request_id
-          .load(std::sync::atomic::Ordering::Relaxed);
-        if request_id >= max_request_id {
-          warn!(
-            "Request ID ({}) is greater than max request ID ({})",
-            request_id, max_request_id
-          );
-          return Err(TerminationCode::TooManyRequests);
-        }
+      // reject a PUBLISH with an unsupported mandatory track property.
+      if has_unsupported_mandatory(&m.track_properties) {
+        let reason_phrase =
+          ReasonPhrase::try_new("Unsupported mandatory track property".to_string())
+            .map_err(|_| TerminationCode::InternalError)?;
+        let publish_error = Box::new(RequestError::new(
+          RequestErrorCode::UnsupportedExtension,
+          0,
+          reason_phrase,
+        ));
+        return stream_handler
+          .send(&ControlMessage::RequestError(publish_error))
+          .await;
       }
 
       // Validate track namespace authorization
@@ -69,13 +79,12 @@ pub async fn handle(
             .map_err(|_| TerminationCode::InternalError)?;
 
         let publish_error = Box::new(RequestError::new(
-          request_id,
           RequestErrorCode::Unauthorized,
           0, //TODO: Maybe decide on another retry interval?
           reason_phrase,
         ));
 
-        return control_stream_handler
+        return stream_handler
           .send(&ControlMessage::RequestError(publish_error))
           .await;
       }
@@ -85,6 +94,21 @@ pub async fn handle(
         namespace: m.track_namespace.clone(),
         name: m.track_name.clone(),
       };
+
+      // Tracks MUST NOT be published under a reserved namespace.
+      if let Some(reason) =
+        crate::server::utils::reserved_namespace_rejection(&m.track_namespace, &m.track_name)
+      {
+        info!("Rejecting PUBLISH for reserved namespace: {}", reason);
+        let publish_error = Box::new(RequestError::new(
+          RequestErrorCode::DoesNotExist,
+          0,
+          ReasonPhrase::try_new(reason.to_string()).map_err(|_| TerminationCode::InternalError)?,
+        ));
+        return stream_handler
+          .send(&ControlMessage::RequestError(publish_error))
+          .await;
+      }
 
       // Multiple publishers may share the same alias for the same track (fan-out).
       // Only reject if the alias already maps to a different full track name for this connection.
@@ -110,62 +134,111 @@ pub async fn handle(
         }
       }
 
-      if !context.track_manager.has_track(&full_track_name).await {
-        info!(
-          "Track not found, creating new track for publisher alias={}",
-          m.track_alias
-        );
-        let relay_track_id = context.track_manager.generate_relay_track_id();
-        let track = Track::new(
-          relay_track_id,
-          full_track_name.clone(),
-          context.server_config,
-          TrackStatus::Confirmed {
-            subscribe_parameters: vec![],
-          },
-        );
-        let track_arc = context
-          .track_manager
-          .add_track(
-            context.connection_id,
-            m.track_alias,
+      // Several publishers may share a track. Taking or creating it under one lock
+      // gives every one of them the same Track, and tells exactly one that it is first.
+      let (track_arc, created) = context
+        .track_manager
+        .get_or_create_track(&full_track_name, |relay_track_id| {
+          Track::new(
+            relay_track_id,
             full_track_name.clone(),
-            track,
+            context.server_config,
+            TrackStatus::Confirmed {
+              upstream_parameters: vec![],
+            },
+            TrackOrigin::Publish,
+          )
+        })
+        .await;
+      // A cache-only track becomes this publisher's, as if it had created it.
+      let created = created
+        || track_arc
+          .read()
+          .await
+          .take_over(
+            TrackOrigin::Publish,
+            TrackStatus::Confirmed {
+              upstream_parameters: vec![],
+            },
           )
           .await;
-        {
-          let track = track_arc.write().await;
-          track
-            .add_publisher(context.connection_id, track_alias)
-            .await;
-          track.set_track_extensions(m.track_extensions.clone()).await;
-        }
 
-        client
-          .add_published_track(request_id, full_track_name.clone())
+      // Wakes any data stream already parked waiting for this alias. The check above
+      // can race a PUBLISH for another track that claims the alias first.
+      if !context
+        .track_manager
+        .add_track_alias(context.connection_id, track_alias, full_track_name.clone())
+        .await
+      {
+        return Err(TerminationCode::DuplicateTrackAlias);
+      }
+
+      track_arc
+        .write()
+        .await
+        .add_publisher(context.connection_id, track_alias)
+        .await;
+
+      client
+        .add_published_track(request_id, full_track_name.clone())
+        .await;
+      context.client_manager.publishers_changed();
+
+      // Raising the Forward State later needs the request id this arrived on.
+      context
+        .track_manager
+        .add_publish_message(full_track_name.clone(), context.connection_id, (*m).clone())
+        .await;
+
+      // A REQUEST_UPDATE for this publisher is resolved out of this map.
+      {
+        let mut map = client.inbound_requests.write().await;
+        map.insert(
+          request_id,
+          PendingRequest::Publish {
+            publisher_connection_id: context.connection_id,
+            original_request_id: request_id,
+            message: (*m).clone(),
+          },
+        );
+      }
+
+      let m_clone = m.clone();
+      // FORWARD in PUBLISH is the publisher declaring its own behaviour: 0 means
+      // it sends nothing until we raise the state, omitted or 1 means it sends
+      // immediately. That declaration is the initial Forward State.
+      let publisher_forwards = matches!(
+        m_clone.parameters.get_param_or(
+          MessageParameterType::Forward,
+          MessageParameter::new_forward(true),
+        ),
+        MessageParameter::Forward { forward: true }
+      );
+
+      // if the forward parameter is true, set the track property
+      if publisher_forwards {
+        track_arc
+          .read()
+          .await
+          .upstream_forward
+          .store(publisher_forwards, Ordering::SeqCst);
+      }
+
+      if created {
+        info!(
+          "Created track for publisher alias={}: {:?}",
+          track_alias, full_track_name
+        );
+        // A track's properties come from the publisher that created it.
+        track_arc
+          .write()
+          .await
+          .set_track_properties(m.track_properties.clone())
           .await;
-
-        // register this publish message
-        context
-          .track_manager
-          .add_publish_message(full_track_name.clone(), context.connection_id, (*m).clone())
-          .await;
-
-        {
-          let mut map = client.inbound_requests.write().await;
-          map.insert(
-            request_id,
-            PendingRequest::Publish {
-              publisher_connection_id: context.connection_id,
-              original_request_id: request_id,
-              message: (*m).clone(),
-            },
-          );
-        }
 
         let subscribers = context
           .track_manager
-          .get_namespace_subscribers(&m.track_namespace)
+          .get_namespace_subscribers(&m.track_namespace, SubscribeKind::Tracks)
           .await;
 
         if !subscribers.is_empty() {
@@ -176,181 +249,96 @@ pub async fn handle(
           );
         }
 
-        for subscriber in subscribers {
+        for (subscriber, subscribe_tracks_params) in subscribers {
+          // Never push a track back to its own publisher, and let an explicit
+          // SUBSCRIBE take precedence over SUBSCRIBE_TRACKS for the same track.
+          if subscriber.connection_id == context.connection_id
+            || track_arc
+              .read()
+              .await
+              .has_any_subscription(subscriber.connection_id)
+              .await
+          {
+            continue;
+          }
+
           info!(
             "Forwarding Publish to interested client: {}",
             subscriber.connection_id
           );
 
-          let sub_clone = subscriber.clone();
-
-          let mut m_clone = m.clone();
-
-          let relay_req_id =
-            Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
-
-          m_clone.request_id = relay_req_id;
-          m_clone.track_alias = relay_track_id;
-
-          // Register the message in unified map for draft-16 response tracking
-          {
-            let mut map = context.relay_pending_requests.write().await;
-            map.insert(
-              relay_req_id,
-              PendingRequest::Publish {
-                publisher_connection_id: context.connection_id,
-                original_request_id: request_id,
-                message: (*m_clone).clone(),
-              },
-            );
-          }
-
-          let m_clone2 = m_clone.clone();
-          tokio::spawn(async move {
-            sub_clone
-              .queue_message(ControlMessage::Publish(m_clone2))
-              .await;
-          });
-
-          let track_write = track_arc.read().await;
-          if let Err(e) = track_write
-            .add_subscription(subscriber.clone(), (*m_clone).clone(), false)
-            .await
-          {
-            warn!(
-              "Failed to auto-subscribe client {} to pushed track: {:?}",
-              subscriber.connection_id, e
-            );
-          }
-        }
-      } else {
-        // Another publisher for the same track with a different alias.
-        // Register their alias so their data stream can be routed to the existing track.
-        context
-          .track_manager
-          .add_track_alias(
-            context.connection_id,
-            m.track_alias,
-            full_track_name.clone(),
+          push_track_to_subscriber(
+            &context,
+            subscriber,
+            &track_arc,
+            &m,
+            &subscribe_tracks_params,
           )
           .await;
-        if let Some(track_arc) = context.track_manager.get_track(&full_track_name).await {
-          track_arc
-            .write()
-            .await
-            .add_publisher(context.connection_id, m.track_alias)
-            .await;
         }
-        client
-          .add_published_track(request_id, full_track_name.clone())
-          .await;
+      } else {
         info!(
           "Additional publisher for existing track {:?}/{}: registered alias {}",
-          m.track_namespace, m.track_name, m.track_alias
+          m.track_namespace, m.track_name, track_alias
         );
       }
 
-      let m_clone = m.clone();
-      let publish_forward_param = m_clone.parameters.get_param_or(
-        MessageParameterType::Forward,
-        MessageParameter::new_forward(true),
-      );
-      let publish_ok = Box::new(PublishOk::new(
-        request_id,
-        vec![
-          publish_forward_param,
-          MessageParameter::new_subscriber_priority(5),
-          MessageParameter::new_group_order(GroupOrder::Ascending),
-          MessageParameter::new_subscription_filter(FilterType::LatestObject, None, None),
-        ],
-      ));
-
+      // PUBLISH is answered by REQUEST_OK, which carries no subscription
+      // parameters and no Track Properties. The relay leaves its subscription at
+      // the defaults: SUBSCRIBER_PRIORITY 128, since it has no reason to rank a
+      // pushed track above everything else, and no LOCATION_FILTER, since a relay
+      // wants every Object, both to serve downstream filters and to fill its cache
+      // for FETCH. GROUP_ORDER is applied per subscriber on the way out.
       info!(
-        "Accepted publish request for track: {:?} with alias: {}",
-        m_clone.track_name, m_clone.track_alias
+        "Accepted publish request for track: {:?} with alias: {}, forward: {}",
+        m_clone.track_name, m_clone.track_alias, publisher_forwards
       );
 
-      control_stream_handler
-        .send(&ControlMessage::PublishOk(publish_ok))
-        .await
-    }
+      let publish_ok = Box::new(RequestOk::new(vec![]));
 
-    ControlMessage::PublishDone(m) => {
-      info!(
-        "Received PublishDone message for request ID: {} with status: {:?}",
-        m.request_id, m.status_code
-      );
+      stream_handler
+        .send(&ControlMessage::RequestOk(publish_ok))
+        .await?;
 
-      // Clean up the published track
-      cleanup_published_track(&client, m.request_id, &context).await;
+      // A publisher that declared FORWARD=0 is told to send by a REQUEST_UPDATE
+      // when a downstream subscriber already wants Objects, which can only follow
+      // the PUBLISH_OK.
 
-      // Remove the request from the unified map to avoid memory leak
-      {
-        let mut map = client.inbound_requests.write().await;
-        map.remove(&m.request_id);
-        debug!(
-          "Removed terminated PUBLISH request {} from pending requests map",
-          m.request_id
-        );
-      }
+      ensure_upstream_forwarding(&track_arc, &context).await;
 
       Ok(())
     }
 
-    ControlMessage::PublishOk(m) => {
-      info!("Received PublishOk for request_id: {}", m.request_id);
-
-      let pending_request = {
-        let map = context.relay_pending_requests.read().await;
-        map.get(&m.request_id).cloned()
+    ControlMessage::PublishDone(m) => {
+      // PUBLISH_DONE names no request; it ends the one that opened this stream.
+      let Some(publisher_req_id) = opening_request_id else {
+        warn!("PUBLISH_DONE on the control stream; closing session");
+        return Err(TerminationCode::ProtocolViolation);
       };
 
-      match pending_request {
-        Some(PendingRequest::Publish { .. }) => {
-          // 1. Look up which track this PublishOk corresponds to using the connection_id and request_id
-          if let Some(full_track_name) = context
-            .track_manager
-            .get_track_name_by_publisher(client.connection_id, m.request_id)
-            .await
-          {
-            // 2. Fetch the track and the original publish message details
-            if let Some(track_arc) = context.track_manager.get_track(&full_track_name).await
-              && let Some(orig_publish) = context
-                .track_manager
-                .get_publish_message(&full_track_name, client.connection_id)
-                .await
-            {
-              info!(
-                "Publish accepted! Wiring up data stream for: {:?}",
-                full_track_name
-              );
+      info!(
+        "Received PublishDone message for request ID: {} with status: {:?}",
+        publisher_req_id, m.status_code
+      );
 
-              let track_read = track_arc.read().await;
-              if let Err(e) = track_read
-                .add_subscription(client.clone(), orig_publish.clone(), false)
-                .await
-              {
-                warn!("Failed to auto-subscribe client after PublishOk: {:?}", e);
-              } else {
-                info!("Successfully wired data stream!");
-              }
-            }
-          } else {
-            warn!(
-              "Received PublishOk for an unknown push request_id: {}",
-              m.request_id
-            );
-          }
-        }
-        Some(_) => {
-          warn!("Mismatched request type for PublishOk: {}", m.request_id);
-        }
-        None => {
-          warn!(
-            "Received PublishOk for untracked request_id: {}",
-            m.request_id
-          );
-        }
+      // PUBLISH_DONE rides the request stream, which overtakes the data streams it
+      // accounts for. Tearing the track down now would close the downstream streams
+      // out from under objects still arriving, and would hand subscribers a Stream
+      // Count for streams the relay has yet to open. Its own Stream Count says how
+      // many the publisher opened, so wait for that many to finish first.
+      wait_for_publisher_streams(&client, publisher_req_id, m.stream_count, &context).await;
+
+      // Clean up the published track
+      cleanup_published_track(&client, publisher_req_id, &context).await;
+
+      // Remove the request from the unified map to avoid memory leak
+      {
+        let mut map = client.inbound_requests.write().await;
+        map.remove(&publisher_req_id);
+        trace!(
+          "Removed terminated PUBLISH request {} from pending requests map",
+          publisher_req_id
+        );
       }
 
       Ok(())
@@ -358,8 +346,10 @@ pub async fn handle(
 
     ControlMessage::RequestUpdate(m) => {
       let update_msg = *m;
-      let publisher_req_id = update_msg.existing_request_id;
-      let update_req_id = update_msg.request_id;
+      let Some(target_request_id) = opening_request_id else {
+        return Err(TerminationCode::ProtocolViolation);
+      };
+      let publisher_req_id = target_request_id;
 
       {
         let mut map = client.inbound_requests.write().await;
@@ -448,22 +438,537 @@ pub async fn handle(
 
         let mut forwarded_update = update_msg.clone();
         forwarded_update.request_id = relay_update_id;
-        forwarded_update.existing_request_id = subscriber_existing_id;
 
+        // Goes on the subscription's own request stream, which is what names
+        // the request being updated.
         subscriber_client
-          .queue_message(ControlMessage::RequestUpdate(Box::new(forwarded_update)))
+          .send_response(
+            subscriber_existing_id,
+            ControlMessage::RequestUpdate(Box::new(forwarded_update)),
+          )
           .await;
       }
 
       use moqtail::model::control::request_ok::RequestOk;
-      let ok_msg = RequestOk::new(update_req_id, vec![]);
-      control_stream_handler
+      let ok_msg = RequestOk::new(vec![]);
+      stream_handler
         .send(&ControlMessage::RequestOk(Box::new(ok_msg)))
         .await?;
 
       Ok(())
     }
     _ => Ok(()),
+  }
+}
+
+/// Raise a PUBLISH-created track's upstream Forward State to 1 once something
+/// downstream wants Objects. A publisher that declared FORWARD=0 sends nothing
+/// until told to, so without this the track never delivers.
+pub(crate) async fn ensure_upstream_forwarding(
+  track_arc: &Arc<tokio::sync::RwLock<Track>>,
+  context: &Arc<SessionContext>,
+) {
+  let (origin, full_track_name) = {
+    let track = track_arc.read().await;
+    (track.origin(), track.full_track_name.clone())
+  };
+  if origin != TrackOrigin::Publish {
+    return;
+  }
+
+  let publisher_ids: Vec<usize> = {
+    let track = track_arc.read().await;
+    if !track.has_forwarding_subscriber().await {
+      return;
+    }
+
+    // swap returns the previous value, so false means this call is the one that
+    // set the flag and therefore owns the update; true means someone beat us.
+    if track.upstream_forward.swap(true, Ordering::SeqCst) {
+      return;
+    }
+    let aliases = track.publisher_aliases.read().await;
+    aliases.keys().copied().collect()
+  };
+
+  for connection_id in publisher_ids {
+    let Some(publisher_request_id) = context
+      .track_manager
+      .get_publish_request_id(&full_track_name, connection_id)
+      .await
+    else {
+      warn!("No stored PUBLISH for publisher {connection_id} on {full_track_name:?}");
+      continue;
+    };
+    let publisher = { context.client_manager.get(connection_id).await };
+    let Some(publisher) = publisher else {
+      continue;
+    };
+
+    let update = moqtail::model::control::request_update::RequestUpdate::new(
+      Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await,
+      vec![MessageParameter::new_forward(true)],
+    );
+    // Goes on the publisher's own PUBLISH request stream, where the responses to
+    // that request belong.
+    let delivered = publisher
+      .send_response(
+        publisher_request_id,
+        ControlMessage::RequestUpdate(Box::new(update)),
+      )
+      .await;
+    if delivered {
+      info!("Raised upstream Forward State for {full_track_name:?} (publisher {connection_id})");
+    } else {
+      warn!("No open PUBLISH request stream for publisher {connection_id} on {full_track_name:?}");
+    }
+  }
+}
+
+/// Send a PUBLISH for one track to one SUBSCRIBE_TRACKS subscriber, re-originated for
+/// this hop: the relay's own request id, its own track alias, and parameters it builds
+/// rather than forwards.
+///
+/// The caller decides whether this subscriber should be served, and owns any push limit.
+/// The SUBSCRIBE_TRACKS track filters have the last word: a track whose Track Properties
+/// pass none of them is not pushed, and `false` says so.
+pub(crate) async fn push_track_to_subscriber(
+  context: &Arc<SessionContext>,
+  subscriber: Arc<MOQTClient>,
+  track_arc: &Arc<RwLock<Track>>,
+  publish: &Publish,
+  subscribe_tracks_params: &[MessageParameter],
+) -> bool {
+  let Some(range_filters) = crate::server::filter_constructor::filters_for_track(
+    subscribe_tracks_params,
+    &publish.track_properties,
+  ) else {
+    info!(
+      "Not pushing {:?}/{:?} to subscriber {}: its Track Properties pass no track filter",
+      publish.track_namespace, publish.track_name, subscriber.connection_id
+    );
+    return false;
+  };
+
+  let relay_request_id =
+    Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+
+  let mut downstream = publish.clone();
+  downstream.request_id = relay_request_id;
+  // INCLUDE_PROPERTIES=0 asks for the PUBLISH without Track Properties. Only this
+  // subscriber's copy is emptied: the track filter check above has already run against
+  // the publisher's properties.
+  if !include_properties(subscribe_tracks_params) {
+    downstream.track_properties.clear();
+  }
+  {
+    let track = track_arc.read().await;
+    downstream.track_alias = subscriber.assign_track_alias(track.relay_track_id);
+    downstream.parameters = parameters::downstream_publish(
+      &publish.parameters,
+      subscribe_tracks_params,
+      track.largest_object().await,
+    );
+  }
+
+  let track = track_arc.read().await;
+  if let Err(e) = track
+    .add_subscription(subscriber.clone(), downstream.clone())
+    .await
+  {
+    warn!(
+      "Failed to auto-subscribe client {} to pushed track: {:?}",
+      subscriber.connection_id, e
+    );
+  }
+  let subscription = track
+    .get_subscription(&(subscriber.connection_id, downstream.request_id))
+    .await;
+  drop(track);
+
+  // The subscription starts with the Object filters of the SetIDs the track passed.
+  // They are kept with its parameters, so an update measures against them.
+  if let Some(subscription) = &subscription
+    && !range_filters.is_empty()
+  {
+    let sub = subscription.read().await;
+    let mut state = sub.subscription_state.write().await;
+    state.range_filter = CombinedFilter::for_objects(&range_filters).unwrap_or_default();
+    state.subscribe_parameters.extend(range_filters);
+  }
+
+  // A fill the SUBSCRIBE_TRACKS asked for is kept with the subscription too: a PUBLISH
+  // cannot carry FILL_PARAMETERS, so the relay opens the fill itself once the PUBLISH
+  // is out.
+  if let Some(subscription) = &subscription
+    && let Some(fill) = subscribe_tracks_params
+      .iter()
+      .find(|p| matches!(p, MessageParameter::FillParameters { .. }))
+  {
+    let sub = subscription.read().await;
+    sub
+      .subscription_state
+      .write()
+      .await
+      .subscribe_parameters
+      .push(fill.clone());
+  }
+
+  // The subscription this just created is what wants Objects, so the publisher has
+  // to be told to send. Taken after the read guard above is dropped: this reaches
+  // for the same lock, and a writer queued between the two would deadlock a
+  // recursive read.
+  ensure_upstream_forwarding(track_arc, context).await;
+
+  // Each PUBLISH is a request on its own bidi stream.
+  let track_arc = track_arc.clone();
+  let context = context.clone();
+  tokio::spawn(async move {
+    forward_publish_downstream(subscriber, downstream, subscription, track_arc, context).await;
+  });
+  true
+}
+
+/// Push a PUBLISH to a subscriber on its own bidirectional request stream and serve
+/// that request there for as long as it lives: the PUBLISH_OK (or REQUEST_ERROR) comes
+/// back on it, and PUBLISH_DONE goes out on it at the end. The stream is registered as
+/// the request's response channel, because a PUBLISH the relay originates has no other
+/// route to its subscriber — without it the subscription's PUBLISH_DONE is dropped and
+/// the subscriber waits for an end that never arrives.
+pub(crate) async fn forward_publish_downstream(
+  subscriber: Arc<MOQTClient>,
+  publish: Publish,
+  subscription: Option<Arc<RwLock<Subscription>>>,
+  track_arc: Arc<RwLock<Track>>,
+  context: Arc<SessionContext>,
+) {
+  let (send, recv) = match subscriber.connection.open_bi().await {
+    Ok(streams) => streams,
+    Err(e) => {
+      error!("Failed to open downstream publish stream: {:?}", e);
+      return;
+    }
+  };
+  let mut stream = ControlStreamHandler::new(send, recv).with_peer_id(subscriber.connection_id);
+  let publish_request_id = publish.request_id;
+
+  // Registered before the PUBLISH goes out, so nothing sent in response to it can
+  // race ahead of the channel that carries it.
+  let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel();
+  subscriber
+    .register_response_sender(publish_request_id, response_tx)
+    .await;
+
+  if let Err(e) = stream
+    .send(&ControlMessage::Publish(Box::new(publish.clone())))
+    .await
+  {
+    error!("Failed to push PUBLISH downstream: {:?}", e);
+    subscriber
+      .unregister_response_sender(publish_request_id)
+      .await;
+    return;
+  }
+
+  // The subscription is live from here: Objects may flow before the PUBLISH_OK
+  // arrives, and the parameters it carries are applied to it when it does.
+  if let Some(subscription) = &subscription {
+    subscription.read().await.mark_alias_announced();
+
+    // So may a fill the SUBSCRIBE_TRACKS asked for. Its range is measured against the
+    // Largest Object when it opens, and the live subscription's start was measured when
+    // the subscription was made; waiting a round trip for the PUBLISH_OK would let a new
+    // group begin in between, and the Objects of the group before it would be in
+    // neither. Without FILL_PARAMETERS, or while Forward State is 0, this opens nothing.
+    crate::server::fill::open_fill_fetch_stream(
+      context.clone(),
+      track_arc.clone(),
+      subscription.clone(),
+      publish_request_id,
+    )
+    .await;
+  }
+
+  loop {
+    tokio::select! {
+      biased;
+      outgoing = response_rx.recv() => {
+        let Some(msg) = outgoing else {
+          break;
+        };
+        // PUBLISH_DONE is the last word the relay has on this request, but the
+        // stream is not torn down on the strength of that: closing it here races
+        // the subscriber's read of the message just written, and the subscriber is
+        // the one that knows when it is done with the request.
+        let ends_request = matches!(msg, ControlMessage::PublishDone(_));
+        if let Err(e) = stream.send(&msg).await {
+          warn!(
+            "Failed to write {:?} to subscriber {}: {:?}",
+            msg.get_type(),
+            subscriber.connection_id,
+            e
+          );
+          break;
+        }
+        if ends_request {
+          // FIN now so the subscriber sees the end of the request, then keep
+          // reading until it closes its half.
+          stream.finish().await;
+        }
+      }
+      incoming = stream.next_message() => {
+        match incoming {
+        Ok(ControlMessage::RequestOk(m)) => {
+          info!(
+            "Pushed PUBLISH accepted by subscriber {}",
+            subscriber.connection_id
+          );
+
+          // The subscriber may assign this track to one of its own SSTS
+          // switching sets in the PUBLISH_OK; this may set the subscription's
+          // Forward State, which the next step relies on.
+          register_ssts_assignment_from_publish_ok(
+            subscriber.clone(),
+            &publish,
+            m.as_ref().clone(),
+            subscription.as_ref(),
+          )
+          .await;
+
+          // The PUBLISH_OK may be what turns this subscriber's Forward State on, in
+          // which case it is the first thing wanting Objects from the track.
+          ensure_upstream_forwarding(&track_arc, &context).await;
+        }
+        // A PUBLISH_OK carries no subscription parameters: the subscription the
+        // subscriber actually wants follows it in a REQUEST_UPDATE on this stream.
+        Ok(ControlMessage::RequestUpdate(update)) => {
+          apply_pushed_update(
+            &mut stream,
+            *update,
+            subscription.as_ref(),
+            &track_arc,
+            &context,
+            publish_request_id,
+          )
+          .await;
+        }
+        Ok(ControlMessage::RequestError(m)) => {
+          warn!(
+            "Subscriber {} rejected pushed PUBLISH: {:?}",
+            subscriber.connection_id, m.error_code
+          );
+          end_pushed_subscription(&subscriber, &track_arc, publish_request_id).await;
+          break;
+        }
+        Ok(other) => warn!(
+          "Unexpected {:?} on downstream publish stream",
+          other.get_type()
+        ),
+          Err(_) => {
+            // FIN or RESET: the subscriber cancelled, or is done after PUBLISH_DONE.
+            trace!("Downstream publish stream closed");
+            end_pushed_subscription(&subscriber, &track_arc, publish_request_id).await;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // FIN rather than drop: anything already written is still in flight, and
+  // dropping the handler would reset the stream out from under it.
+  stream.finish().await;
+  subscriber
+    .unregister_response_sender(publish_request_id)
+    .await;
+}
+
+/// Ends the subscription a pushed PUBLISH opened, once the subscriber has refused the
+/// PUBLISH or closed its stream. Objects stop on its data and fill streams, the track
+/// drops it, and it leaves any switching set its PUBLISH_OK put it in. A subscription
+/// already gone, as after PUBLISH_DONE, is left alone.
+async fn end_pushed_subscription(
+  subscriber: &Arc<MOQTClient>,
+  track_arc: &Arc<RwLock<Track>>,
+  request_id: u64,
+) {
+  let full_track_name = {
+    let track = track_arc.read().await;
+    track
+      .remove_subscription(&(subscriber.connection_id, request_id))
+      .await;
+    track.full_track_name.clone()
+  };
+  subscriber
+    .ssts
+    .switching_sets
+    .write()
+    .await
+    .release(&full_track_name, request_id);
+  subscriber.subscriptions.remove(request_id).await;
+}
+
+/// Applies a subscriber's REQUEST_UPDATE to the subscription a pushed PUBLISH
+/// opened, and answers it on the PUBLISH's stream.
+async fn apply_pushed_update(
+  stream: &mut ControlStreamHandler,
+  update: RequestUpdate,
+  subscription: Option<&Arc<RwLock<Subscription>>>,
+  track_arc: &Arc<RwLock<Track>>,
+  context: &Arc<SessionContext>,
+  publish_request_id: u64,
+) {
+  let changes_filter = update
+    .parameters
+    .iter()
+    .any(|p| matches!(p, MessageParameter::LocationFilter { .. }));
+  let asks_for_a_fill = update
+    .parameters
+    .iter()
+    .any(|p| matches!(p, MessageParameter::FillParameters { .. }));
+
+  // Filters the subscription would be left with but that cannot be honoured refuse
+  // the update before any of it is applied.
+  if let Some(subscription) = subscription {
+    let current = {
+      let sub = subscription.read().await;
+      sub
+        .subscription_state
+        .read()
+        .await
+        .subscribe_parameters
+        .clone()
+    };
+    if let Err(e) = crate::server::filter_constructor::updated_filter(
+      &current,
+      &update.parameters,
+      context.server_config.max_filter_ranges,
+    ) {
+      info!("Refusing REQUEST_UPDATE on a pushed PUBLISH: {e}");
+      let error = crate::server::filter_constructor::invalid_filter(&e);
+      let _ = stream
+        .send(&ControlMessage::RequestError(Box::new(error)))
+        .await;
+      return;
+    }
+  }
+
+  let result = match subscription {
+    Some(subscription) => subscription.read().await.update_subscription(update).await,
+    None => Err(anyhow::anyhow!("no subscription for this PUBLISH")),
+  };
+  if let Err(e) = result {
+    warn!("REQUEST_UPDATE on a pushed PUBLISH failed: {:?}", e);
+    let error = RequestError::new(
+      RequestErrorCode::InternalError,
+      0,
+      ReasonPhrase::try_new("Update failed".to_string()).unwrap(),
+    );
+    let _ = stream
+      .send(&ControlMessage::RequestError(Box::new(error)))
+      .await;
+    return;
+  }
+  let Some(subscription) = subscription else {
+    return;
+  };
+
+  // The update may be what turns this subscriber's Forward State on, in which
+  // case it is the first thing wanting Objects from the track.
+  ensure_upstream_forwarding(track_arc, context).await;
+  let _ = stream
+    .send(&ControlMessage::RequestOk(Box::new(RequestOk::new(vec![]))))
+    .await;
+
+  // A filter the update changed starts where it now says, which for a live one
+  // is against the largest Object as of this update.
+  if changes_filter {
+    let largest = track_arc.read().await.largest_object().await;
+    subscription.read().await.resolve_live_start(largest).await;
+  }
+  if asks_for_a_fill {
+    crate::server::fill::open_fill_fetch_stream(
+      context.clone(),
+      track_arc.clone(),
+      subscription.clone(),
+      publish_request_id,
+    )
+    .await;
+  }
+}
+
+/// The subscriber may assign a track to an SSTS switching set by appending
+/// SWITCHING_SET_ASSIGNMENT to the PUBLISH_OK that accepts a pushed PUBLISH.
+async fn register_ssts_assignment_from_publish_ok(
+  subscriber: Arc<MOQTClient>,
+  publish: &Publish,
+  ok: RequestOk,
+  subscription: Option<&Arc<RwLock<Subscription>>>,
+) {
+  let Some(p) = ok
+    .parameters
+    .iter()
+    .find(|p| matches!(p, MessageParameter::SwitchingSetAssignment { .. }))
+  else {
+    return;
+  };
+
+  let Ok(full_track_name) =
+    FullTrackName::new(publish.track_namespace.clone(), publish.track_name.clone())
+  else {
+    return;
+  };
+
+  // The pushed PUBLISH's track alias is the relay track id.
+  let relay_track_id = publish.track_alias;
+
+  if let MessageParameter::SwitchingSetAssignment {
+    switching_set_id,
+    algorithm_id,
+    throughput_threshold_kbps,
+    set_throughput_weight,
+    activate_switching,
+    set_rank,
+  } = p
+  {
+    // The same validation as the SUBSCRIBE path; a PUBLISH_OK cannot be
+    // rejected, so an invalid assignment is ignored instead.
+    if let Err(e) = subscriber.ssts.validate_assignment(*algorithm_id) {
+      warn!(
+        "Ignoring SWITCHING_SET_ASSIGNMENT in PUBLISH_OK from {}: {}",
+        subscriber.connection_id, e
+      );
+      return;
+    }
+
+    {
+      let mut manager = subscriber.ssts.switching_sets.write().await;
+      if let Err(e) = manager.assign(
+        full_track_name.clone(),
+        relay_track_id,
+        publish.request_id,
+        *switching_set_id,
+        *algorithm_id,
+        *throughput_threshold_kbps,
+        *set_throughput_weight,
+        *activate_switching,
+        *set_rank,
+      ) {
+        warn!(
+          "Ignoring SWITCHING_SET_ASSIGNMENT in PUBLISH_OK from {}: {}",
+          subscriber.connection_id, e
+        );
+        return;
+      }
+    }
+
+    // Same forward-state reasoning as the SUBSCRIBE path: the gating in the
+    // subscription implements the spec's per-group forward selection.
+    if let Some(subscription) = subscription {
+      let sub = subscription.read().await;
+      let mut state = sub.subscription_state.write().await;
+      state.forward = true;
+    }
   }
 }
 
@@ -481,6 +986,39 @@ async fn validate_publish_authorization(
 
   // For now, allow all publishes (this should be replaced with actual auth logic)
   true
+}
+
+/// Resolves the track this PUBLISH_DONE ends, then waits for the data streams it
+/// accounts for to finish arriving.
+async fn wait_for_publisher_streams(
+  client: &Arc<MOQTClient>,
+  request_id: u64,
+  stream_count: u64,
+  context: &Arc<SessionContext>,
+) {
+  if stream_count == 0 {
+    return;
+  }
+
+  let full_track_name = {
+    let published_tracks = client.published_tracks.read().await;
+    published_tracks.get(&request_id).cloned()
+  };
+  let Some(full_track_name) = full_track_name else {
+    return;
+  };
+  let Some(track_arc) = context.track_manager.get_track(&full_track_name).await else {
+    return;
+  };
+
+  await_publisher_streams(
+    &track_arc,
+    client.connection_id,
+    stream_count,
+    context.server_config.publish_done_stream_timeout,
+    context.server_config.publish_done_datagram_quiet,
+  )
+  .await;
 }
 
 /// Cleans up resources associated with a published track.
@@ -519,16 +1057,21 @@ async fn cleanup_published_track(
   };
 
   let track = track_arc.read().await;
-  if let Some(alias) = track.remove_publisher(client.connection_id).await {
+  if let Some(removal) = track.remove_publisher(client.connection_id).await {
     context
       .track_manager
-      .remove_publisher_alias(client.connection_id, alias)
+      .remove_publisher_alias(client.connection_id, removal.alias)
       .await;
-    if !track.has_publishers().await {
+    if !removal.still_served {
+      // SSTS: the track is over, so it leaves the switching sets of its
+      // subscribers. While another publisher still serves it, the sets stay as
+      // they are: dropping the track from them would stop it being gated and
+      // let every rendition of its set forward at once.
+      track.remove_from_subscriber_switching_sets().await;
       drop(track);
-      context.track_manager.remove_track(&full_track_name).await;
+      context.track_manager.retire_track(&full_track_name).await;
       info!(
-        "cleanup_published_track: removed track {:?} (no publishers left) request_id={}",
+        "cleanup_published_track: no publishers left for {:?} request_id={}",
         full_track_name, request_id
       );
     }

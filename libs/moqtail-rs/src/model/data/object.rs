@@ -18,7 +18,7 @@ use bytes::Bytes;
 
 use crate::model::common::location::Location;
 use crate::model::error::ParseError;
-use crate::model::extension_header::object_extension::ObjectExtension;
+use crate::model::property::object_property::ObjectProperty;
 
 use super::constant::{ObjectForwardingPreference, ObjectStatus};
 use super::datagram::Datagram;
@@ -33,7 +33,7 @@ pub struct Object {
   pub forwarding_preference: ObjectForwardingPreference,
   pub subgroup_id: Option<u64>,
   pub status: ObjectStatus,
-  pub extensions: Option<Vec<ObjectExtension>>,
+  pub properties: Option<Vec<ObjectProperty>>,
   pub payload: Option<Bytes>,
 }
 impl fmt::Debug for Object {
@@ -45,7 +45,7 @@ impl fmt::Debug for Object {
       .field("forwarding_preference", &self.forwarding_preference)
       .field("subgroup_id", &self.subgroup_id)
       .field("status", &self.status)
-      .field("extensions", &self.extensions)
+      .field("properties", &self.properties)
       .field("payload_length", &self.payload.as_ref().map(|p| p.len()))
       .finish()
   }
@@ -79,7 +79,7 @@ impl Object {
         forwarding_preference: ObjectForwardingPreference::Datagram,
         subgroup_id: None,
         status,
-        extensions: datagram.extension_headers,
+        properties: datagram.properties,
         payload,
       },
       end_of_group,
@@ -92,6 +92,7 @@ impl Object {
     group_id: u64,                  // Context from SubgroupHeader
     subgroup_id: Option<u64>,       // Context from SubgroupHeader
     publisher_priority: Option<u8>, // Context from SubgroupHeader; None when using DEFAULT_PRIORITY
+    default_priority: u8,           // Used when publisher_priority is None
   ) -> Result<Self, ParseError> {
     Ok(Object {
       track_alias,
@@ -99,17 +100,17 @@ impl Object {
         group: group_id,
         object: subgroup_obj.object_id,
       },
-      publisher_priority: publisher_priority.unwrap_or(0), // Default to 0 if not specified
+      publisher_priority: publisher_priority.unwrap_or(default_priority),
       forwarding_preference: ObjectForwardingPreference::Subgroup,
       subgroup_id,
       status: subgroup_obj.object_status.unwrap_or(ObjectStatus::Normal),
-      extensions: subgroup_obj.extension_headers,
+      properties: subgroup_obj.properties,
       payload: subgroup_obj.payload,
     })
   }
 
-  /// Convert a draft-16 fetch-stream payload object into the unified Object view.
-  /// Fetch objects carry no status (§10.4.4); status is always Normal here.
+  /// Convert a fetch-stream payload object into the unified Object view.
+  /// Fetch objects carry no status; status is always Normal here.
   pub fn try_from_fetch(
     fetch_obj: FetchObjectPayload,
     track_alias: u64,
@@ -133,7 +134,7 @@ impl Object {
       forwarding_preference: fetch_obj.forwarding_preference,
       subgroup_id,
       status: ObjectStatus::Normal,
-      extensions: fetch_obj.extension_headers,
+      properties: fetch_obj.properties,
       payload,
     })
   }
@@ -184,7 +185,7 @@ impl Object {
         self.location.group,
         self.location.object,
         publisher_priority,
-        self.extensions,
+        self.properties,
         self.status,
       ))
     } else {
@@ -200,7 +201,7 @@ impl Object {
         self.location.group,
         self.location.object,
         publisher_priority,
-        self.extensions,
+        self.properties,
         payload,
         end_of_group,
       ))
@@ -248,13 +249,13 @@ impl Object {
 
     Ok(SubgroupObject {
       object_id: self.location.object,
-      extension_headers: self.extensions,
+      properties: self.properties,
       object_status,
       payload,
     })
   }
 
-  /// Convert to a draft-16 fetch-stream payload object.
+  /// Convert to a fetch-stream payload object.
   /// Fetch objects carry no status field; non-Normal status must be surfaced
   /// as an EndOfRange marker by the caller instead.
   pub fn try_into_fetch(self) -> Result<FetchObjectPayload, ParseError> {
@@ -296,7 +297,7 @@ impl Object {
       object_id: self.location.object,
       publisher_priority: self.publisher_priority,
       forwarding_preference: self.forwarding_preference,
-      extension_headers: self.extensions,
+      properties: self.properties,
       payload,
     })
   }

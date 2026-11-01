@@ -16,16 +16,15 @@ use crate::connection::MoqConnection;
 use crate::stats::{BAcceptance, PlayerSimulator, SwitchRecord, SwitchStats};
 use anyhow::Result;
 
-use moqtail::model::common::location::Location;
 use moqtail::model::common::tuple::{Tuple, TupleField};
-use moqtail::model::control::constant::FetchType;
+use moqtail::model::control::constant::SwitchMode;
 use moqtail::model::control::control_message::ControlMessage;
-use moqtail::model::control::fetch::Fetch;
 use moqtail::model::control::request_update::RequestUpdate;
 use moqtail::model::control::subscribe::Subscribe;
-use moqtail::model::control::switch::Switch;
-use moqtail::model::control::unsubscribe::Unsubscribe;
+use moqtail::model::parameter::location_filter::LocationFilter;
 use moqtail::model::parameter::message_parameter::MessageParameter;
+use moqtail::transport::connection::TransportConnection;
+use moqtail::transport::control_stream_handler::ControlStreamHandler;
 use moqtail::transport::data_stream_handler::{FetchRequest, RecvDataStream};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -46,6 +45,8 @@ pub struct SwitchTestConfig {
   pub track_a: String,
   pub track_b: String,
   pub method: SwitchMethod,
+  /// How a SWITCH_FROM stops the subscription it suspends (switch method only).
+  pub switch_mode: SwitchMode,
   pub switch_after_ms: u64,
   pub bandwidth_cap_bps: u64,
   pub output_json: Option<String>,
@@ -67,7 +68,6 @@ impl SwitchTestConfig {
 pub enum SwitchMethod {
   Switch,
   SubUpdateForward,
-  JoiningFetch,
 }
 
 impl SwitchMethod {
@@ -75,7 +75,6 @@ impl SwitchMethod {
     match self {
       SwitchMethod::Switch => "switch",
       SwitchMethod::SubUpdateForward => "sub-update-forward",
-      SwitchMethod::JoiningFetch => "joining-fetch",
     }
   }
 }
@@ -219,22 +218,26 @@ struct SwitchState {
   current_alias: u64,
   /// Request-ID of the currently active subscription.
   current_req_id: u64,
-  /// Monotonically increasing counter for issuing new request-IDs.
+  /// Next request-ID to issue; a client's request-IDs are even.
   next_req_id: u64,
+  /// Request stream of every subscription, by request-ID. Each is held open for
+  /// the whole run: dropping one cancels its subscription.
+  streams: HashMap<u64, ControlStreamHandler>,
 }
 
 impl SwitchState {
-  fn new(initial_alias: u64) -> Self {
+  fn new(initial_alias: u64, initial_stream: ControlStreamHandler) -> Self {
     Self {
       current_alias: initial_alias,
       current_req_id: 0,
-      next_req_id: 1,
+      next_req_id: 2,
+      streams: HashMap::from([(0, initial_stream)]),
     }
   }
 
   fn take_req_id(&mut self) -> u64 {
     let id = self.next_req_id;
-    self.next_req_id += 1;
+    self.next_req_id += 2;
     id
   }
 }
@@ -251,7 +254,7 @@ struct PhaseResult {
 // ─── Receiver task ────────────────────────────────────────────────────────────
 
 async fn receiver_task(
-  conn: Arc<wtransport::Connection>,
+  conn: Arc<TransportConnection>,
   pending_fetches: Arc<RwLock<BTreeMap<u64, FetchRequest>>>,
   tx: mpsc::UnboundedSender<ObjectEvent>,
   elog: EventLog,
@@ -304,35 +307,42 @@ async fn receiver_task(
 
 // ─── Control helpers ──────────────────────────────────────────────────────────
 
-async fn subscribe_track(
-  control_stream: &mut moqtail::transport::control_stream_handler::ControlStreamHandler,
+/// Open a request stream and send SUBSCRIBE on it, starting at the next object.
+/// A `switch_from` makes it a switch, which decides the Forward State itself.
+async fn send_subscribe(
+  conn: &Arc<TransportConnection>,
   namespace: &str,
   track_name: &str,
   request_id: u64,
   priority: u8,
   forward: bool,
-) -> Result<u64> {
-  let ns = Tuple::from_utf8_path(namespace);
-  let subscribe = Subscribe::new_latest_object(
+  switch_from: Option<MessageParameter>,
+) -> Result<ControlStreamHandler> {
+  let mut params = vec![
+    MessageParameter::new_subscriber_priority(priority),
+    MessageParameter::new_location_filter(LocationFilter::NextObject),
+  ];
+  params.push(switch_from.unwrap_or(MessageParameter::new_forward(forward)));
+  let subscribe = Subscribe::new(
     request_id,
-    ns,
+    Tuple::from_utf8_path(namespace),
     TupleField::from_utf8(track_name),
-    vec![
-      MessageParameter::new_subscriber_priority(priority),
-      MessageParameter::new_forward(forward),
-    ],
+    params,
   );
-  control_stream
+  let (send, recv) = conn.open_bi().await?;
+  let mut stream = ControlStreamHandler::new(send, recv);
+  stream
     .send(&ControlMessage::Subscribe(Box::new(subscribe)))
     .await
     .map_err(|e| anyhow::anyhow!("Subscribe send failed: {:?}", e))?;
+  Ok(stream)
+}
 
-  match control_stream.next_message().await {
+/// Wait for the SUBSCRIBE_OK on a request stream; returns the track alias.
+async fn await_subscribe_ok(stream: &mut ControlStreamHandler, track_name: &str) -> Result<u64> {
+  match stream.next_message().await {
     Ok(ControlMessage::SubscribeOk(m)) => {
-      info!(
-        "Subscribed to {}/{}: alias={}",
-        namespace, track_name, m.track_alias
-      );
+      info!("Subscribed to {}: alias={}", track_name, m.track_alias);
       Ok(m.track_alias)
     }
     Ok(m) => anyhow::bail!("Expected SubscribeOk for {}, got {:?}", track_name, m),
@@ -340,14 +350,36 @@ async fn subscribe_track(
   }
 }
 
+async fn subscribe_track(
+  conn: &Arc<TransportConnection>,
+  namespace: &str,
+  track_name: &str,
+  request_id: u64,
+  priority: u8,
+  forward: bool,
+) -> Result<(u64, ControlStreamHandler)> {
+  let mut stream = send_subscribe(
+    conn, namespace, track_name, request_id, priority, forward, None,
+  )
+  .await?;
+  let alias = await_subscribe_ok(&mut stream, track_name).await?;
+  Ok((alias, stream))
+}
+
+/// Send REQUEST_UPDATE on the request stream of subscription `existing_req_id`.
 async fn send_request_update(
-  cs: &mut moqtail::transport::control_stream_handler::ControlStreamHandler,
-  update_req_id: u64,
+  state: &mut SwitchState,
   existing_req_id: u64,
   params: Vec<MessageParameter>,
 ) -> Result<()> {
-  let ru = RequestUpdate::new(update_req_id, existing_req_id, params);
-  cs.send(&ControlMessage::RequestUpdate(Box::new(ru)))
+  let update_req_id = state.take_req_id();
+  let stream = state
+    .streams
+    .get_mut(&existing_req_id)
+    .ok_or_else(|| anyhow::anyhow!("no request stream for request {}", existing_req_id))?;
+  let ru = RequestUpdate::new(update_req_id, params);
+  stream
+    .send(&ControlMessage::RequestUpdate(Box::new(ru)))
     .await
     .map_err(|e| anyhow::anyhow!("RequestUpdate send failed: {:?}", e))
 }
@@ -540,10 +572,8 @@ fn process_b_object(
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
-  let MoqConnection {
-    connection,
-    mut control_stream,
-  } = moq;
+  // `moq` stays alive to the end: its control stream must outlive the session.
+  let connection = moq.connection.clone();
 
   let sequence = config.sequence();
   if sequence.len() < 2 {
@@ -554,15 +584,8 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
     Arc::new(RwLock::new(BTreeMap::new()));
 
   // Subscribe to the initial track (req_id=0, priority=128, forward=true).
-  let initial_alias = subscribe_track(
-    &mut control_stream,
-    &config.namespace,
-    &sequence[0],
-    0,
-    128,
-    true,
-  )
-  .await?;
+  let (initial_alias, initial_stream) =
+    subscribe_track(&connection, &config.namespace, &sequence[0], 0, 128, true).await?;
 
   // Start the background receiver task.
   let elog = EventLog::new();
@@ -573,7 +596,7 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
   let elog_rt = elog.clone();
   tokio::spawn(async move { receiver_task(conn_clone, pf_clone, tx, elog_rt).await });
 
-  let mut state = SwitchState::new(initial_alias);
+  let mut state = SwitchState::new(initial_alias, initial_stream);
   let mut stats = SwitchStats::new(
     config.method.as_str(),
     config.bandwidth_cap_bps,
@@ -596,7 +619,7 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
     let phase = match config.method {
       SwitchMethod::Switch => {
         run_switch_phase(
-          &mut control_stream,
+          &connection,
           &mut rx,
           &mut state,
           from_track,
@@ -611,8 +634,8 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
         // Pre-subscribe the target track with forward=false.
         let b_req_id = state.take_req_id();
         elog.record(Instant::now(), "subscribe_b");
-        let b_alias = subscribe_track(
-          &mut control_stream,
+        let (b_alias, b_stream) = subscribe_track(
+          &connection,
           &config.namespace,
           to_track,
           b_req_id,
@@ -622,30 +645,9 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
         .await?;
         elog.record(Instant::now(), "subscribe_ok_b");
         elog.register_alias(b_alias, "B");
+        state.streams.insert(b_req_id, b_stream);
         run_sub_update_forward_phase(
-          &mut control_stream,
-          &mut rx,
-          &mut state,
-          b_alias,
-          b_req_id,
-          from_track,
-          to_track,
-          &config,
-          &elog,
-        )
-        .await?
-      }
-
-      SwitchMethod::JoiningFetch => {
-        run_joining_fetch_phase(
-          &mut control_stream,
-          &mut rx,
-          &mut state,
-          &pending_fetches,
-          from_track,
-          to_track,
-          &config,
-          &elog,
+          &mut rx, &mut state, b_alias, b_req_id, from_track, to_track, &config, &elog,
         )
         .await?
       }
@@ -674,7 +676,9 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
     }
   }
 
-  connection.close(0u32.into(), b"Done");
+  drop(state);
+  connection.close(0u32, b"Done");
+  drop(moq);
   Ok(())
 }
 
@@ -685,7 +689,7 @@ pub async fn run(moq: MoqConnection, config: SwitchTestConfig) -> Result<()> {
 // ─── Method A: SWITCH ────────────────────────────────────────────────────────
 
 async fn run_switch_phase(
-  cs: &mut moqtail::transport::control_stream_handler::ControlStreamHandler,
+  conn: &Arc<TransportConnection>,
   rx: &mut mpsc::UnboundedReceiver<ObjectEvent>,
   state: &mut SwitchState,
   from_track: &str,
@@ -731,19 +735,23 @@ async fn run_switch_phase(
     record.decision_a_group, record.decision_a_object
   );
 
-  // Phase 2: send SWITCH message.
+  // Phase 2: SUBSCRIBE to B carrying SWITCH_FROM, which activates B and
+  // suspends A.
   let switch_req_id = state.take_req_id();
-  let ns = Tuple::from_utf8_path(&config.namespace);
-  let switch = Switch::new(
+  let mut b_stream = send_subscribe(
+    conn,
+    &config.namespace,
+    to_track,
     switch_req_id,
-    ns,
-    TupleField::from_utf8(to_track),
-    current_req_id,
-    vec![],
-  );
-  cs.send(&ControlMessage::Switch(Box::new(switch)))
-    .await
-    .map_err(|e| anyhow::anyhow!("Switch send failed: {:?}", e))?;
+    128,
+    true,
+    Some(MessageParameter::new_switch_from(
+      current_req_id,
+      config.switch_mode,
+      false,
+    )),
+  )
+  .await?;
   record.control_messages += 1;
 
   // Phase 3: wait for SubscribeOk for B, then collect post-switch objects.
@@ -767,20 +775,17 @@ async fn run_switch_phase(
         }
         None => break,
       },
-      msg = cs.next_message() => match msg {
-        Ok(ControlMessage::SubscribeOk(m)) => {
-          info!("switch: SubscribeOk for {}, alias={}", to_track, m.track_alias);
-          elog.record(Instant::now(), "subscribe_ok_b");
-          elog.register_alias(m.track_alias, "B");
-          b_alias = Some(m.track_alias);
-        }
-        Ok(other) => info!("switch: unexpected ctrl msg: {:?}", other),
-        Err(e) => { warn!("switch: control stream error: {:?}", e); break; }
+      alias = await_subscribe_ok(&mut b_stream, to_track), if b_alias.is_none() => {
+        let alias = alias?;
+        elog.record(Instant::now(), "subscribe_ok_b");
+        elog.register_alias(alias, "B");
+        b_alias = Some(alias);
       }
     }
   }
 
   let new_alias = b_alias.unwrap_or(current_alias);
+  state.streams.insert(switch_req_id, b_stream);
   Ok(PhaseResult {
     record,
     new_alias,
@@ -791,7 +796,6 @@ async fn run_switch_phase(
 // ─── Method B: Sub Update Forward ────────────────────────────────────────────
 
 async fn run_sub_update_forward_phase(
-  cs: &mut moqtail::transport::control_stream_handler::ControlStreamHandler,
   rx: &mut mpsc::UnboundedReceiver<ObjectEvent>,
   state: &mut SwitchState,
   b_alias: u64,
@@ -841,15 +845,8 @@ async fn run_sub_update_forward_phase(
   );
 
   // Phase 2: enable B (forward=true).
-  let ru_req_b = state.take_req_id();
   elog.record(Instant::now(), "enable_b");
-  send_request_update(
-    cs,
-    ru_req_b,
-    b_req_id,
-    vec![MessageParameter::new_forward(true)],
-  )
-  .await?;
+  send_request_update(state, b_req_id, vec![MessageParameter::new_forward(true)]).await?;
   record.control_messages += 1;
 
   // Phase 3: drain A and B concurrently.
@@ -876,10 +873,9 @@ async fn run_sub_update_forward_phase(
             handle_a_object(&ev, &mut record, &mut player, elog, first_b_seen);
           } else if ev.track_alias == b_alias {
             if ev.object == 0 && !a_stopped {
-              let ru_req_a = state.take_req_id();
               elog.record(Instant::now(), "stop_a");
               if let Err(e) = send_request_update(
-                cs, ru_req_a, current_req_id,
+                state, current_req_id,
                 vec![MessageParameter::new_forward(false)],
               ).await {
                 warn!("sub_update_forward: RequestUpdate A failed: {:?}", e);
@@ -898,11 +894,6 @@ async fn run_sub_update_forward_phase(
         }
         None => break,
       },
-      msg = cs.next_message() => match msg {
-        Ok(ControlMessage::RequestOk(m)) => info!("sub_update_forward: RequestOk: {:?}", m),
-        Ok(other) => info!("sub_update_forward: unexpected ctrl: {:?}", other),
-        Err(e) => { warn!("sub_update_forward: control error: {:?}", e); break; }
-      }
     }
   }
 
@@ -910,306 +901,5 @@ async fn run_sub_update_forward_phase(
     record,
     new_alias: b_alias,
     new_req_id: b_req_id,
-  })
-}
-
-// ─── Method C: Joining Fetch ──────────────────────────────────────────────────
-
-async fn run_joining_fetch_phase(
-  cs: &mut moqtail::transport::control_stream_handler::ControlStreamHandler,
-  rx: &mut mpsc::UnboundedReceiver<ObjectEvent>,
-  state: &mut SwitchState,
-  pending_fetches: &Arc<RwLock<BTreeMap<u64, FetchRequest>>>,
-  from_track: &str,
-  to_track: &str,
-  config: &SwitchTestConfig,
-  elog: &EventLog,
-) -> Result<PhaseResult> {
-  let mut record = SwitchRecord::new(from_track, to_track);
-  let current_alias = state.current_alias;
-  let current_req_id = state.current_req_id;
-  let mut player = PlayerSimulator::new(&config.playout);
-
-  info!(
-    "joining-fetch: Phase1 start, current_alias={}, switch_after_ms={}",
-    current_alias, config.switch_after_ms
-  );
-
-  // Phase 1: collect A for switch_after_ms, then set switch_decision_time.
-  let deadline = tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms);
-  loop {
-    tokio::select! {
-      _ = tokio::time::sleep_until(deadline) => {
-        let now = Instant::now();
-        record.switch_decision_time = Some(now);
-        record.decision_a_group = record.last_a_group;
-        elog.record(now, "switch_decision");
-        info!(
-          "joining-fetch: decision fired, last_a_group={:?}, decision_a_group={:?}",
-          record.last_a_group, record.decision_a_group
-        );
-        break;
-      },
-      ev = rx.recv() => match ev {
-        Some(ev) if ev.track_alias == current_alias => {
-          record.last_a_object_time = Some(ev.received_at);
-          record.last_a_group = Some(ev.group);
-          record.last_a_object = Some(ev.object);
-          if ev.object == 0
-            && player.set_base_if_unset(ev.group, ev.received_at) { elog.set_t0(ev.received_at); }
-          if let Some(pt) = player.pt_ms(ev.group, ev.object, false) {
-            elog.record(ev.received_at, format!("pt,A,{},{},{:.1}", ev.group, ev.object, pt));
-          }
-        }
-        Some(ev) => {
-          info!(
-            "joining-fetch: Phase1 unexpected track_alias={} (want {}), group={}, object={}",
-            ev.track_alias, current_alias, ev.group, ev.object
-          );
-        }
-        None => return Ok(PhaseResult {
-          record,
-          new_alias: current_alias,
-          new_req_id: current_req_id,
-        }),
-      }
-    }
-  }
-  // Phase 2: send Subscribe-B (probe), await SubscribeOk, determine strategy.
-  let b_req_id = state.take_req_id();
-  let subscribe = Subscribe::new_latest_object(
-    b_req_id,
-    Tuple::from_utf8_path(&config.namespace),
-    TupleField::from_utf8(to_track),
-    vec![
-      MessageParameter::new_subscriber_priority(200),
-      MessageParameter::new_forward(true),
-    ],
-  );
-  elog.record(Instant::now(), "subscribe_b");
-  cs.send(&ControlMessage::Subscribe(Box::new(subscribe)))
-    .await
-    .map_err(|e| anyhow::anyhow!("Subscribe send failed: {:?}", e))?;
-  record.control_messages += 1;
-
-  let decision_a_group = record.decision_a_group.unwrap_or(0);
-
-  let probe_ok = match cs.next_message().await {
-    Ok(ControlMessage::SubscribeOk(m)) => m,
-    Ok(m) => anyhow::bail!("Expected SubscribeOk for {}, got {:?}", to_track, m),
-    Err(e) => anyhow::bail!("Error waiting SubscribeOk for {}: {:?}", to_track, e),
-  };
-  let probe_alias = probe_ok.track_alias;
-  elog.record(Instant::now(), "subscribe_ok_b");
-  elog.register_alias(probe_alias, "B");
-  info!(
-    "JoiningFetch: SubscribeOk for {}, alias={}",
-    to_track, probe_alias
-  );
-
-  let largest = probe_ok.subscribe_parameters.iter().find_map(|p| {
-    if let MessageParameter::LargestObject { location } = p {
-      Some(location.clone())
-    } else {
-      None
-    }
-  });
-
-  // Decide strategy based on B's current position relative to A.
-  let (b_alias, active_b_req_id) = if let Some(loc) = largest {
-    if loc.group < decision_a_group {
-      // B is behind A: unsubscribe the probe and re-subscribe from the start of
-      // A's current group. The relay will deliver once B reaches that group.
-      info!(
-        "JoiningFetch: B group {} < A group {}, re-subscribing from A's group start (no fetch)",
-        loc.group, decision_a_group
-      );
-      cs.send(&ControlMessage::Unsubscribe(Box::new(Unsubscribe::new(
-        b_req_id,
-      ))))
-      .await
-      .map_err(|e| anyhow::anyhow!("Unsubscribe send failed: {:?}", e))?;
-      record.control_messages += 1;
-
-      let future_req_id = state.take_req_id();
-      let subscribe_future = Subscribe::new_absolute_start(
-        future_req_id,
-        Tuple::from_utf8_path(&config.namespace),
-        TupleField::from_utf8(to_track),
-        Location {
-          group: decision_a_group,
-          object: 0,
-        },
-        vec![
-          MessageParameter::new_subscriber_priority(128),
-          MessageParameter::new_forward(true),
-        ],
-      );
-      elog.record(Instant::now(), "subscribe_b_future");
-      cs.send(&ControlMessage::Subscribe(Box::new(subscribe_future)))
-        .await
-        .map_err(|e| anyhow::anyhow!("Subscribe (future) send failed: {:?}", e))?;
-      record.control_messages += 1;
-
-      match cs.next_message().await {
-        Ok(ControlMessage::SubscribeOk(m)) => {
-          let future_alias = m.track_alias;
-          elog.register_alias(future_alias, "B");
-          info!("JoiningFetch: SubscribeOk (future) alias={}", future_alias);
-          (future_alias, future_req_id)
-        }
-        Ok(m) => anyhow::bail!(
-          "Expected SubscribeOk (future) for {}, got {:?}",
-          to_track,
-          m
-        ),
-        Err(e) => anyhow::bail!(
-          "Error waiting SubscribeOk (future) for {}: {:?}",
-          to_track,
-          e
-        ),
-      }
-    } else if loc.object > 0 {
-      // B is mid-group and at or ahead of A: issue a Joining Fetch to deliver
-      // [I-frame … LargestObject] so live B can start from the group boundary.
-      let fetch_req_id = state.take_req_id();
-      elog.register_alias(0, "F");
-      let fetch = Fetch::new_joining(
-        fetch_req_id,
-        FetchType::AbsoluteFetch,
-        b_req_id,
-        record.last_a_group.unwrap_or(loc.group),
-        vec![MessageParameter::new_subscriber_priority(50)],
-      )
-      .map_err(|e| anyhow::anyhow!("Fetch::new_joining: {}", e))?;
-      elog.record(Instant::now(), "fetch_sent");
-      cs.send(&ControlMessage::Fetch(Box::new(fetch.clone())))
-        .await
-        .map_err(|e| anyhow::anyhow!("Fetch send failed: {:?}", e))?;
-      pending_fetches
-        .write()
-        .await
-        .insert(fetch_req_id, FetchRequest::new(fetch_req_id, 0, fetch, 0));
-      record.control_messages += 1;
-      loop {
-        match cs.next_message().await {
-          Ok(ControlMessage::FetchOk(m)) => {
-            info!("JoiningFetch FetchOk: {:?}", m);
-            break;
-          }
-          Ok(ControlMessage::RequestOk(m)) => info!("JoiningFetch RequestOk: {:?}", m),
-          Ok(ControlMessage::RequestError(e)) => {
-            anyhow::bail!("JoiningFetch RequestError: {:?}", e)
-          }
-          Ok(m) => warn!("JoiningFetch: unexpected msg after Fetch: {:?}", m),
-          Err(e) => anyhow::bail!("JoiningFetch: error reading FetchOk: {:?}", e),
-        }
-      }
-      (probe_alias, b_req_id)
-    } else {
-      info!("JoiningFetch: B at group boundary, no fetch needed");
-      (probe_alias, b_req_id)
-    }
-  } else {
-    info!("JoiningFetch: no LargestObject in SubscribeOk");
-    (probe_alias, b_req_id)
-  };
-
-  // Phase 3: collect B until first fresh I-frame, then 5-second tail.
-  // Fetch objects (alias=0) and live B objects (alias=b_alias) are both subject
-  // to the freshness check.  A objects continue arriving as trailing data and
-  // advance the freshness threshold.
-  let post_deadline =
-    tokio::time::Instant::now() + Duration::from_millis(config.switch_after_ms.max(10_000));
-  let mut first_b_seen = false;
-  let mut a_stopped = false;
-  let mut post_b_deadline: Option<tokio::time::Instant> = None;
-  let mut overdue_target: Option<u64> = None;
-
-  loop {
-    let maybe_post = post_b_deadline;
-    tokio::select! {
-      _ = tokio::time::sleep_until(post_deadline) => break,
-      _ = async {
-        if let Some(d) = maybe_post { tokio::time::sleep_until(d).await }
-        else { std::future::pending::<()>().await }
-      } => break,
-      ev = rx.recv() => match ev {
-        Some(ev) => {
-          if ev.track_alias == current_alias {
-            handle_a_object(&ev, &mut record, &mut player, elog, first_b_seen);
-          } else if ev.track_alias == 0 {
-            // Fetch object.
-            if ev.object == 0 && !a_stopped {
-              let ru_a_req = state.take_req_id();
-              elog.record(Instant::now(), "stop_a");
-              if let Err(e) = send_request_update(
-                cs, ru_a_req, current_req_id,
-                vec![MessageParameter::new_forward(false)],
-              ).await {
-                warn!("joining_fetch: RequestUpdate A failed: {:?}", e);
-                break;
-              }
-              record.control_messages += 1;
-              a_stopped = true;
-              info!("joining-fetch: sent RequestUpdate to stop A at {:?}", ev.received_at);
-            }
-            if process_b_object(&ev, &mut player, &mut record, elog,
-                                &mut overdue_target, &mut first_b_seen, "F", false) {
-              let ru_b_req = state.take_req_id();
-              if let Err(e) = send_request_update(
-                cs, ru_b_req, active_b_req_id,
-                vec![MessageParameter::new_subscriber_priority(128)],
-              ).await {
-                warn!("joining_fetch: RequestUpdate B failed: {:?}", e);
-                break;
-              }
-              record.control_messages += 1;
-              post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
-            }
-          } else if ev.track_alias == b_alias {
-            // Live B object.
-            if ev.object == 0 && !a_stopped {
-              let ru_a_req = state.take_req_id();
-              elog.record(Instant::now(), "stop_a");
-              if let Err(e) = send_request_update(
-                cs, ru_a_req, current_req_id,
-                vec![MessageParameter::new_forward(false)],
-              ).await {
-                warn!("joining_fetch: RequestUpdate A failed: {:?}", e);
-                break;
-              }
-              record.control_messages += 1;
-              a_stopped = true;
-              record.a_stopped_at_ms = player.pt_ms(ev.group, 0, false);
-            }
-            if process_b_object(&ev, &mut player, &mut record, elog,
-                                &mut overdue_target, &mut first_b_seen, "B", true) {
-              let ru_b_req = state.take_req_id();
-              if let Err(e) = send_request_update(
-                cs, ru_b_req, active_b_req_id,
-                vec![MessageParameter::new_subscriber_priority(128)],
-              ).await {
-                warn!("joining_fetch: RequestUpdate B failed: {:?}", e);
-                break;
-              }
-              record.control_messages += 1;
-              post_b_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
-            }
-          }
-        }
-        None => break,
-      },
-      msg = cs.next_message() => match msg {
-        Ok(ControlMessage::RequestOk(m)) => info!("joining_fetch: RequestOk: {:?}", m),
-        Ok(other) => info!("joining_fetch: unexpected ctrl: {:?}", other),
-        Err(e) => { warn!("joining_fetch: control error: {:?}", e); break; }
-      }
-    }
-  }
-  Ok(PhaseResult {
-    record,
-    new_alias: b_alias,
-    new_req_id: active_b_req_id,
   })
 }

@@ -13,32 +13,41 @@
 // limitations under the License.
 
 use anyhow::Result;
-use bytes::Bytes;
+use moqtail::model::common::location::Location;
+use moqtail::model::data::full_track_name::FullTrackName;
+use moqtail::model::parameter::setup_option::SetupOption;
 use moqtail::model::{
   control::{
-    constant::SUPPORTED_VERSIONS, control_message::ControlMessage, server_setup::ServerSetup,
+    constant::SUPPORTED_VERSIONS,
+    control_message::ControlMessage,
+    namespace_done::NamespaceDone,
+    setup::{Setup, SetupSender},
   },
   data::datagram::Datagram,
   error::TerminationCode,
 };
 use moqtail::transport::{
+  connection::{
+    TransportConnection, TransportConnectionError, TransportRecvStream, TransportSendStream,
+  },
   control_stream_handler::ControlStreamHandler,
-  data_stream_handler::{HeaderInfo, RecvDataStream},
+  data_stream_handler::{DataStreamItem, HeaderInfo, RecvDataStream},
 };
 use std::{
   collections::HashMap,
   sync::{Arc, atomic::AtomicU64},
 };
 use tokio::sync::RwLock;
-use tracing::{Instrument, debug, error, info, info_span, warn};
-use wtransport::{RecvStream, SendStream, endpoint::IncomingSession, error::ConnectionError};
+use tracing::{Instrument, debug, error, info, info_span, trace, warn};
+use wtransport::endpoint::SessionRequest;
+use wtransport::quinn;
 
 use crate::server::{Server, stream_id::StreamId};
 
 use super::{
   client::MOQTClient,
-  message_handlers,
-  session_context::{RequestMaps, SessionContext},
+  message_handlers, request_stream,
+  session_context::{RequestMaps, SessionContext, UpstreamFetchEvent},
   track::Track,
   utils,
 };
@@ -46,9 +55,14 @@ use super::{
 pub struct Session {}
 
 impl Session {
-  pub async fn new(incoming_session: IncomingSession, server: Server) -> Result<Session> {
-    let session_request = incoming_session.await?;
-
+  /// Accepts a connection that the relay's ALPN demux (see `Server::accept_incoming`)
+  /// has already identified as WebTransport (negotiated ALPN `h3`). Does the
+  /// WebTransport-specific extended-CONNECT negotiation (path/headers/version-via-header),
+  /// then hands off to `Session::start`, which is shared with the raw-QUIC path.
+  pub async fn accept_webtransport(
+    session_request: SessionRequest,
+    server: Server,
+  ) -> Result<Session> {
     let remote_addr = session_request.remote_address();
     let origin = session_request.origin();
     let authority = session_request.authority();
@@ -88,17 +102,37 @@ impl Session {
     };
 
     let mut response_headers: HashMap<String, String> = HashMap::new();
-    response_headers.insert("wt-protocol".to_string(), selected_version);
+    response_headers.insert(
+      "wt-protocol".to_string(),
+      format!("\"{}\"", selected_version),
+    );
 
-    // in the headers, we expect wt-available-protocols
+    let connection = TransportConnection::WebTransport(
+      session_request
+        .accept_with_headers(response_headers)
+        .await?,
+    );
+    Self::start(connection, server).await
+  }
 
+  /// Accepts a connection that the relay's ALPN demux (see `Server::accept_incoming`)
+  /// has already identified as raw QUIC (negotiated ALPN is a MOQT version string).
+  /// Raw QUIC has no headers/path/origin and the version was already pinned by ALPN
+  /// during the demux, so there's nothing WebTransport-specific to do here.
+  pub async fn accept_quic(connection: quinn::Connection, server: Server) -> Result<Session> {
+    Self::start(TransportConnection::Quic(connection), server).await
+  }
+
+  /// Shared session bootstrap once a connection has been accepted by either transport:
+  /// build the `SessionContext` and spawn the long-lived control-stream/close-watcher tasks.
+  async fn start(connection: TransportConnection, server: Server) -> Result<Session> {
     let client_manager = server.client_manager.clone();
     let track_manager = server.track_manager.clone();
     let server_config = server.app_config;
     let relay_pending_requests = server.relay_pending_requests.clone();
     let upstream_fetch_senders = server.upstream_fetch_senders.clone();
     let relay_next_request_id = server.relay_next_request_id.clone();
-    let connection = session_request.accept().await?;
+    let draining = server.draining.clone();
 
     let request_maps = RequestMaps {
       relay_pending_requests,
@@ -112,7 +146,16 @@ impl Session {
       request_maps,
       connection,
       relay_next_request_id,
+      server.active_request_streams.clone(),
+      draining,
     ));
+
+    info!(
+      "New session: connection_id={} transport={} remote={}",
+      context.connection_id,
+      context.transport_kind,
+      context.connection.remote_address()
+    );
 
     tokio::spawn(Self::handle_connection_close(context.clone()));
     tokio::spawn(Self::accept_control_stream(context.clone()));
@@ -121,14 +164,34 @@ impl Session {
   }
 
   async fn accept_control_stream(context: Arc<SessionContext>) -> Result<()> {
-    match context.connection.accept_bi().await {
-      Ok((send_stream, recv_stream)) => {
+    // The control plane is a pair of unidirectional streams. Accept the peer's
+    // control stream (recv half) and open our own (send half), each beginning
+    // with SETUP.
+    let recv_stream = match context.connection.accept_uni().await {
+      Ok(recv_stream) => recv_stream,
+      Err(e) => {
+        error!("Failed to accept control stream: {:?}", e);
+        Self::close_session(
+          context.clone(),
+          TerminationCode::InternalError,
+          "Error in control stream handler",
+        );
+        return Err(e.into());
+      }
+    };
+    match context.connection.open_uni().await {
+      Ok(send_stream) => {
         let session_context = context.clone();
         let connection_id = session_context.connection_id;
+        let transport = session_context.transport_kind;
         tokio::spawn(async move {
           if let Err(e) =
             Self::handle_control_messages(session_context.clone(), send_stream, recv_stream)
-              .instrument(info_span!("handle_control_messages", connection_id))
+              .instrument(info_span!(
+                "handle_control_messages",
+                connection_id,
+                %transport
+              ))
               .await
           {
             match e {
@@ -152,7 +215,7 @@ impl Session {
         Ok(())
       }
       Err(e) => {
-        error!("Failed to accept stream: {:?}", e);
+        error!("Failed to open control send stream: {:?}", e);
         Self::close_session(
           context.clone(),
           TerminationCode::InternalError,
@@ -165,20 +228,25 @@ impl Session {
 
   async fn handle_control_messages(
     context: Arc<SessionContext>,
-    send_stream: SendStream,
-    recv_stream: RecvStream,
+    send_stream: TransportSendStream,
+    recv_stream: TransportRecvStream,
   ) -> core::result::Result<(), TerminationCode> {
     info!("new control message stream");
-    let mut control_stream_handler = ControlStreamHandler::new(send_stream, recv_stream);
+    let mut control_stream_handler =
+      ControlStreamHandler::new(send_stream, recv_stream).with_peer_id(context.connection_id);
 
     // Client-server negotiation
     let client = match Self::negotiate(context.clone(), &mut control_stream_handler)
-      .instrument(info_span!("negotiate", context.connection_id))
+      .instrument(info_span!(
+        "negotiate",
+        context.connection_id,
+        transport = %context.transport_kind
+      ))
       .await
     {
       Ok(client) => client,
       Err(e) => {
-        context.connection.close(0u32.into(), b"Setup failed");
+        context.connection.close(0u32, b"Setup failed");
         return Err(e);
       }
     };
@@ -232,13 +300,29 @@ impl Session {
         } // end of tokio::select!
       }
 
-      let message_type = &msg.get_type();
+      let message_type = msg.get_type();
+
+      // Request-opening types must arrive on their own bidi request streams; the
+      // control stream carries only session-level messages and responses.
+      if message_type.is_first() {
+        error!(
+          "Request type {:?} received on the control stream",
+          message_type
+        );
+        Self::close_session(
+          context.clone(),
+          TerminationCode::ProtocolViolation,
+          "Request type received on the control stream",
+        );
+        return Err(TerminationCode::ProtocolViolation);
+      }
 
       let handling_result = message_handlers::MessageHandler::handle(
         client.clone(),
         &mut control_stream_handler,
         msg,
         context.clone(),
+        None,
       )
       .await;
 
@@ -257,10 +341,14 @@ impl Session {
     } // end of loop
   }
 
-  fn close_session(context: Arc<SessionContext>, error_code: TerminationCode, msg: &str) {
+  pub(crate) fn close_session(
+    context: Arc<SessionContext>,
+    error_code: TerminationCode,
+    msg: &str,
+  ) {
     context
       .connection
-      .close(error_code.to_u32().into(), msg.as_bytes());
+      .close(error_code.to_u32(), msg.as_bytes());
   }
 
   // TODO: in an error close the connection
@@ -287,7 +375,7 @@ impl Session {
             Ok((send, recv)) => {
               let ctx = context.clone();
               tokio::spawn(async move {
-                Self::handle_request_stream(ctx, send, recv).await;
+                request_stream::accept(ctx, send, recv).await;
               });
             }
             Err(e) => {
@@ -324,7 +412,7 @@ impl Session {
           let datagram_bytes = match datagram_result {
             Ok(bytes) => bytes,
             Err(e) => {
-              if matches!(e, ConnectionError::ApplicationClosed(_)) {
+              if matches!(e, TransportConnectionError::ApplicationClosed) {
                 continue; // Connection closed, exit the loop
               }
               error!("Failed to receive datagram from client {}: {:?}", connection_id, e);
@@ -333,14 +421,13 @@ impl Session {
           };
 
           tokio::spawn(async move {
-            debug!("Received datagram from client {}", connection_id);
+            trace!("Received datagram from client {}", connection_id);
 
             // Parse the datagram
-            let bytes = Bytes::from(datagram_bytes.payload().to_vec());
-            let mut bytes = bytes;
+            let mut bytes = datagram_bytes;
             match Datagram::deserialize(&mut bytes) {
               Ok(datagram_obj) => {
-                debug!("Parsed datagram: track_alias={}, group_id={}, object_id={}",
+                trace!("Parsed datagram: track_alias={}, group_id={}, object_id={}",
                        datagram_obj.track_alias, datagram_obj.group_id, datagram_obj.object_id);
 
                 if let Some(track) = context_clone.track_manager.get_track_by_alias(context_clone.connection_id, datagram_obj.track_alias).await {
@@ -349,7 +436,7 @@ impl Session {
                     error!("Failed to process datagram: {:?}", e);
                   }
                 } else {
-                  debug!("Track not found for track_alias {}", datagram_obj.track_alias);
+                  trace!("Track not found for track_alias {}", datagram_obj.track_alias);
                 }
               }
               Err(e) => {
@@ -362,130 +449,10 @@ impl Session {
     }
   }
 
-  async fn handle_request_stream(
-    context: Arc<SessionContext>,
-    send_stream: SendStream,
-    recv_stream: RecvStream,
-  ) {
-    let client = match context.get_client().await {
-      Some(c) => c,
-      None => return,
-    };
-    let mut stream_handler = ControlStreamHandler::new(send_stream, recv_stream);
-
-    let msg = match stream_handler.next_message().await {
-      Ok(m) => m,
-      Err(e) => {
-        error!("Failed to read first message on request bi-stream: {:?}", e);
-        return;
-      }
-    };
-
-    // Validate request_id
-    let request_id_opt = match &msg {
-      ControlMessage::SubscribeNamespace(m) => Some(m.request_id),
-      _ => None,
-    };
-    if let Some(rid) = request_id_opt {
-      let max_request_id = context
-        .max_request_id
-        .load(std::sync::atomic::Ordering::Relaxed);
-      if rid >= max_request_id {
-        warn!(
-          "Request bi-stream: request_id ({}) >= max_request_id ({})",
-          rid, max_request_id
-        );
-        Self::close_session(
-          context,
-          TerminationCode::TooManyRequests,
-          "Request ID exceeds maximum",
-        );
-        return;
-      }
-    }
-
-    Self::dispatch_request_stream_message(client, stream_handler, msg, context).await;
-  }
-
-  async fn dispatch_request_stream_message(
-    client: Arc<MOQTClient>,
-    mut stream_handler: ControlStreamHandler,
-    msg: ControlMessage,
-    context: Arc<SessionContext>,
-  ) {
-    match msg {
-      ControlMessage::SubscribeNamespace(sub_ns) => {
-        let request_id = sub_ns.request_id;
-
-        let (namespace_tx, mut namespace_rx) =
-          tokio::sync::mpsc::unbounded_channel::<ControlMessage>();
-
-        let result = message_handlers::subscribe_namespace_handler::handle_subscribe_namespace(
-          client.clone(),
-          &mut stream_handler,
-          sub_ns,
-          context.clone(),
-          namespace_tx,
-        )
-        .await;
-
-        if let Err(e) = result {
-          error!("handle_subscribe_namespace error: {:?}", e);
-          return;
-        }
-
-        // Long-lived loop: forward NAMESPACE messages to bi-stream, or cancel on stream close
-        loop {
-          tokio::select! {
-            biased;
-            msg_opt = namespace_rx.recv() => {
-              match msg_opt {
-                Some(ns_msg) => {
-                  if let Err(e) = stream_handler.send(&ns_msg).await {
-                    warn!("Error writing NAMESPACE to bi-stream: {:?}", e);
-                    message_handlers::subscribe_namespace_handler::cancel(client, request_id, &context).await;
-                    return;
-                  }
-                }
-                None => return, // channel dropped, subscription ended
-              }
-            }
-            result = stream_handler.next_message() => {
-              match result {
-                Ok(extra) => {
-                  warn!("Unexpected message {:?} on request bi-stream", extra.get_type());
-                  Self::close_session(context, TerminationCode::ProtocolViolation, "Unexpected message on request bi-stream");
-                  return;
-                }
-                Err(_) => {
-                  // FIN or RESET — subscriber cancelled
-                  message_handlers::subscribe_namespace_handler::cancel(client, request_id, &context).await;
-                  return;
-                }
-              }
-            }
-          }
-        }
-      }
-      _ => {
-        warn!(
-          "Unsupported message type {:?} on request bi-stream",
-          msg.get_type()
-        );
-        Self::close_session(
-          context,
-          TerminationCode::ProtocolViolation,
-          "Unsupported message type on request bi-stream",
-        );
-      }
-    }
-  }
-
   async fn handle_connection_close(context: Arc<SessionContext>) -> Result<()> {
-    let client_manager_cleanup = context.client_manager.clone();
     let track_manager_cleanup = context.track_manager.clone();
 
-    debug!(
+    trace!(
       "handle_connection_close | waiting ({})",
       context.connection_id
     );
@@ -506,36 +473,46 @@ impl Session {
     // Remove the disconnecting publisher from all tracks they were publishing.
     // remove_publisher() internally notifies subscribers when the last publisher leaves.
     // Collect full track names for tracks that have no publishers left.
-    let mut tracks_with_no_publishers: Vec<moqtail::model::data::full_track_name::FullTrackName> =
-      Vec::new();
+    let mut tracks_with_no_publishers: Vec<FullTrackName> = Vec::new();
     {
       let tracks = track_manager_cleanup.tracks.read().await;
       for (full_track_name, track_lock) in tracks.iter() {
         let track = track_lock.read().await;
-        if let Some(alias) = track.remove_publisher(context.connection_id).await {
+        if let Some(removal) = track.remove_publisher(context.connection_id).await {
           track_manager_cleanup
-            .remove_publisher_alias(context.connection_id, alias)
+            .remove_publisher_alias(context.connection_id, removal.alias)
             .await;
-          if !track.has_publishers().await {
+          if !removal.still_served {
             tracks_with_no_publishers.push(full_track_name.clone());
           }
         }
       }
     }
 
-    // Remove tracks that have no publishers left
+    // Tracks no publisher serves any more stay only if they hold cached Objects.
     for full_track_name in &tracks_with_no_publishers {
-      track_manager_cleanup.remove_track(full_track_name).await;
+      track_manager_cleanup.retire_track(full_track_name).await;
       info!(
-        "Removed track {:?} after publisher {} disconnect",
+        "No publishers left for {:?} after publisher {} disconnect",
         full_track_name, context.connection_id
       );
     }
 
-    // Remove announcements for the disconnecting publisher
-    track_manager_cleanup
+    // Remove announcements for the disconnecting publisher. Losing the publisher ends
+    // its namespaces just as closing the request stream would, so subscribers are told
+    // the same way.
+    let withdrawn = track_manager_cleanup
       .remove_announcements_by_connection(context.connection_id)
       .await;
+    for namespace in &withdrawn {
+      message_handlers::publish_namespace_handler::announce_to_namespace_subscribers(
+        &context,
+        namespace,
+        context.connection_id,
+        |s| ControlMessage::NamespaceDone(Box::new(NamespaceDone::new(s))),
+      )
+      .await;
+    }
 
     // Remove the disconnecting client from namespace_subscribers
     track_manager_cleanup
@@ -544,18 +521,17 @@ impl Session {
 
     // Remove client from client_manager
     {
-      let cm = client_manager_cleanup.read().await;
-      cm.remove(context.connection_id).await;
+      context.client_manager.remove(context.connection_id).await;
     }
-    debug!(
+    trace!(
       "handle_connection_close | removed client {} from client manager",
       context.connection_id
     );
 
     // Remove client from all remaining tracks (as a subscriber)
-    for (_, track_lock) in track_manager_cleanup.tracks.read().await.iter() {
+    for track_lock in track_manager_cleanup.tracks.read().await.values() {
       let track = track_lock.read().await;
-      track.remove_subscription(context.connection_id).await;
+      track.remove_subscriptions(context.connection_id).await;
     }
 
     info!(
@@ -565,39 +541,73 @@ impl Session {
     Ok(())
   }
 
-  async fn handle_uni_stream(context: Arc<SessionContext>, stream: RecvStream) -> Result<()> {
-    debug!("accepted unidirectional stream");
+  async fn handle_uni_stream(
+    context: Arc<SessionContext>,
+    stream: TransportRecvStream,
+  ) -> Result<()> {
+    trace!("accepted unidirectional stream");
     let client = context.get_client().await;
     let client = match client {
       Some(c) => c,
       None => return Err(TerminationCode::InternalError.into()),
     };
 
-    debug!("client is {}", client.connection_id);
+    trace!("client is {}", client.connection_id);
 
     let mut stream_handler = &RecvDataStream::new(stream, client.outgoing_fetch_requests.clone());
 
     let mut first_object = true;
     let mut track_alias = 0u64;
+    // The track named by the upstream FETCH this stream answers, when nothing waits on
+    // that FETCH any more: its Objects are still worth caching.
+    let mut fetch_track_name: Option<FullTrackName> = None;
     let mut stream_id: Option<StreamId> = None;
     let mut current_track: Option<Arc<RwLock<Track>>> = None;
+    // Only subgroup streams count toward the Stream Count a publisher reports in
+    // PUBLISH_DONE; a fetch stream answers a request of the relay's own.
+    let mut is_subgroup_stream = false;
     // Used if this stream is a response to an upstream fetch the relay issued.
-    let mut upstream_sender: Option<
-      tokio::sync::mpsc::Sender<super::session_context::UpstreamFetchEvent>,
-    > = None;
+    let mut upstream_sender: Option<tokio::sync::mpsc::Sender<UpstreamFetchEvent>> = None;
 
     let mut object_count = 0;
+    // The last Object a subgroup stream carried.
+    let mut last_location: Option<Location> = None;
 
     loop {
-      let next = stream_handler.next_object().await;
+      let next = stream_handler.next_item().await;
 
       match next {
-        (handler, Some(object)) => {
+        // Only a fetch stream carries these. The relay passes them on to whatever
+        // waits on the FETCH it sent.
+        (handler, Some(DataStreamItem::EndOfRange { kind, location })) => {
+          stream_handler = handler;
+          if upstream_sender.is_none() {
+            upstream_sender = Self::upstream_fetch_sender(&context, handler).await;
+          }
+          if let Some(ref sender) = upstream_sender {
+            let _ = sender
+              .send(UpstreamFetchEvent::EndOfRange { kind, location })
+              .await;
+          }
+        }
+        (handler, Some(DataStreamItem::Object(object))) => {
           // Handle the object
           stream_handler = handler;
 
+          // An answer to a FETCH the relay sent goes to that FETCH, which caches it
+          // into the track it holds, so it is not looked up here.
+          if first_object && upstream_sender.is_none() {
+            upstream_sender = Self::upstream_fetch_sender(&context, handler).await;
+          }
+          if let Some(ref sender) = upstream_sender {
+            if let Ok(fetch_object) = object.try_into_fetch() {
+              let _ = sender.send(UpstreamFetchEvent::Object(fetch_object)).await;
+            }
+            continue;
+          }
+
           let header_info = if first_object {
-            // debug!("First object received, processing header info");
+            // trace!("First object received, processing header info");
             let header = handler.get_header_info().await;
             if header.is_none() {
               error!("no header info found, terminating session");
@@ -609,81 +619,57 @@ impl Session {
 
             match header_info {
               HeaderInfo::Subgroup { header } => {
-                debug!("received Subgroup header: {:?}", header);
+                trace!("received Subgroup header: {:?}", header);
                 track_alias = header.track_alias;
+                is_subgroup_stream = true;
               }
               HeaderInfo::Fetch {
                 header,
                 fetch_request: _,
               } => {
-                debug!("received Fetch header: {:?}", header);
+                trace!("received Fetch header: {:?}", header);
                 let fetch_request_id = header.request_id;
-                track_alias = client
+                // A fetch answers a request the relay made, which names the track.
+                // The publisher may have no alias for it: the relay can fetch a track
+                // nothing subscribes to.
+                if let Some(req) = client
                   .outgoing_fetch_requests
                   .read()
                   .await
                   .get(&fetch_request_id)
-                  .map_or(0, |r| r.track_alias);
-
-                // Check if this stream is a response to a relay-initiated
-                // upstream fetch. If so, grab the sender to forward objects.
-                if let Some(sender) = context
-                  .upstream_fetch_senders
-                  .read()
-                  .await
-                  .get(&fetch_request_id)
-                  .cloned()
                 {
-                  upstream_sender = Some(sender);
+                  track_alias = req.track_alias;
+                  fetch_track_name = Some(req.fetch_request.get_full_track_name());
                 }
               }
             }
 
-            // The track might have not been added yet, wait for it for a few attempts
-            let mut attempt_count = 5;
-            let attempt_interval_ms = 100;
-            debug!("looking for track with alias: {:?}", track_alias);
-            loop {
-              if attempt_count == 0 {
-                error!("track not found after multiple attempts: {:?}", track_alias);
-                return Err(anyhow::Error::msg(TerminationCode::InternalError.to_json()));
+            // A data stream can outrun the control message that establishes its alias,
+            // so wait briefly for it. An alias that never arrives is not a session
+            // error: the stream is abandoned and the session carries on.
+            current_track = match fetch_track_name.take() {
+              Some(full_track_name) => context.track_manager.get_track(&full_track_name).await,
+              None => {
+                trace!("looking for track with alias: {:?}", track_alias);
+                context
+                  .track_manager
+                  .resolve_track_by_alias(
+                    client.connection_id,
+                    track_alias,
+                    context.server_config.track_alias_resolution_timeout,
+                  )
+                  .await
               }
-              let full_track_name_opt = context
-                .track_manager
-                .track_aliases
-                .read()
-                .await
-                .get(&(client.connection_id, track_alias))
-                .cloned();
-
-              if full_track_name_opt.is_none() {
-                attempt_count -= 1;
-                tokio::time::sleep(std::time::Duration::from_millis(attempt_interval_ms)).await;
-                continue;
-              }
-
-              current_track = if let Some(full_track_name) = full_track_name_opt {
-                if let Some(t) = context.track_manager.get_track(&full_track_name).await {
-                  debug!("track found: {:?}", track_alias);
-                  Some(t)
-                } else {
-                  error!(
-                    "track not found: {:?} full track name: {:?}",
-                    track_alias, &full_track_name
-                  );
-                  return Err(anyhow::Error::msg(TerminationCode::InternalError.to_json()));
-                }
-              } else {
-                None
-              };
-              break;
-            }
+            };
 
             let relay_track_id = match current_track.as_ref() {
               Some(t) => t.read().await.relay_track_id,
               None => {
-                error!("track not found when building stream_id: {:?}", track_alias);
-                return Err(anyhow::Error::msg(TerminationCode::InternalError.to_json()));
+                warn!(
+                  "Abandoning data stream for unresolved track alias {} after {:?}",
+                  track_alias, context.server_config.track_alias_resolution_timeout
+                );
+                return Ok(());
               }
             };
             stream_id = Some(utils::build_stream_id(relay_track_id, &header_info));
@@ -694,7 +680,11 @@ impl Session {
 
           let track = current_track.as_ref().unwrap().read().await;
 
-          if let Err(e) = track
+          // What a fetch brings in is history, for the cache alone: subscribers get the
+          // live feed.
+          if !is_subgroup_stream {
+            track.cache_fetched_object(&object).await;
+          } else if let Err(e) = track
             .new_subgroup_object(
               &stream_id.clone().unwrap().clone(),
               &object,
@@ -708,36 +698,78 @@ impl Session {
             );
           }
 
-          // Forward object to upstream fetch channel if this is a relay-initiated fetch
-          if let Some(ref sender) = upstream_sender
-            && let Ok(fetch_object) = object.clone().try_into_fetch()
-          {
-            let _ = sender
-              .send(super::session_context::UpstreamFetchEvent::Object(
-                fetch_object,
-              ))
-              .await;
-          }
-
           object_count += 1;
+          last_location = Some(object.location.clone());
           first_object = false; // reset the first object flag after processing the header
         }
-        (_, None) => {
+        (handler, None) => {
           // error!("Failed to receive object: {:?}", e);
-          info!(
+          debug!(
             "no more objects in the stream client: {} track: {} stream_id: {:?} objects: {}",
             context.connection_id,
             track_alias,
             stream_id.clone(),
             object_count
           );
+
+          // Resolve an empty FETCH stream's sender from its parsed header.
+          if upstream_sender.is_none() {
+            upstream_sender = Self::upstream_fetch_sender(&context, handler).await;
+          }
+
+          // A relay-initiated fetch ends when its stream does. Without this the loop
+          // waiting on those Objects has nothing to end it but its own timeout.
+          if let Some(ref sender) = upstream_sender {
+            let event = if handler.is_malformed_track() {
+              UpstreamFetchEvent::MalformedTrack
+            } else if handler.was_aborted() {
+              // Not all of the range arrived, so this is not the end of it.
+              UpstreamFetchEvent::Error("fetch stream ended without its FIN".to_string())
+            } else {
+              UpstreamFetchEvent::StreamClosed
+            };
+            let _ = sender.send(event).await;
+          }
+
+          // A subgroup stream that carried no object never resolved its track above,
+          // yet its publisher still counts it. Resolve it from the header so the
+          // count a PUBLISH_DONE is waiting on can reach the number it names.
+          if current_track.is_none()
+            && let Some(HeaderInfo::Subgroup { header }) = handler.get_header_info().await
+          {
+            is_subgroup_stream = true;
+            track_alias = header.track_alias;
+            current_track = context
+              .track_manager
+              .resolve_track_by_alias(
+                context.connection_id,
+                track_alias,
+                context.server_config.track_alias_resolution_timeout,
+              )
+              .await;
+          }
+
           // Close the stream for all subscribers
           if let Some(track_lock) = &current_track {
-            return track_lock
-              .read()
-              .await
-              .stream_closed(&stream_id.unwrap())
-              .await;
+            let track = track_lock.read().await;
+            if is_subgroup_stream {
+              track
+                .publisher_stream_progress
+                .stream_closed(context.connection_id)
+                .await;
+              // A FIN on a stream that holds the end of its group means it carried the
+              // group's last Object.
+              if !handler.was_aborted()
+                && let Some(HeaderInfo::Subgroup { header }) = handler.get_header_info().await
+                && header.header_type.contains_end_of_group()
+                && let Some(last) = &last_location
+              {
+                track.group_ended_after(last);
+              }
+            }
+            if let Some(stream_id) = &stream_id {
+              return track.stream_closed(stream_id).await;
+            }
           }
           break;
         }
@@ -745,6 +777,23 @@ impl Session {
     }
 
     Ok(())
+  }
+
+  /// The channel to whatever waits on the upstream FETCH a fetch stream answers, if
+  /// the stream is one.
+  async fn upstream_fetch_sender(
+    context: &Arc<SessionContext>,
+    handler: &RecvDataStream,
+  ) -> Option<tokio::sync::mpsc::Sender<UpstreamFetchEvent>> {
+    let Some(HeaderInfo::Fetch { header, .. }) = handler.get_header_info().await else {
+      return None;
+    };
+    context
+      .upstream_fetch_senders
+      .read()
+      .await
+      .get(&header.request_id)
+      .cloned()
   }
 
   pub(crate) async fn get_next_relay_request_id(relay_next_request_id: Arc<AtomicU64>) -> u64 {
@@ -771,60 +820,71 @@ impl Session {
     context: Arc<SessionContext>,
     control_stream_handler: &mut ControlStreamHandler,
   ) -> Result<Arc<MOQTClient>, TerminationCode> {
-    debug!("Negotiating with client...");
-    let client_setup = match control_stream_handler.next_message().await {
-      Ok(ControlMessage::ClientSetup(m)) => *m,
-      Ok(_) => {
-        error!("Unexpected message received");
-        return Err(TerminationCode::ProtocolViolation);
-      }
+    trace!("Negotiating with client...");
+    // The client's control stream MUST begin with SETUP.
+    let client_setup = match control_stream_handler.read_setup().await {
+      Ok(m) => m,
       Err(TerminationCode::NoError) => {
         info!("Client disconnected during negotiation");
         return Err(TerminationCode::NoError);
       }
       Err(e) => {
-        error!("Failed to deserialize message: {:?}", e);
+        error!("Client control stream did not begin with SETUP: {:?}", e);
         return Err(e);
       }
     };
 
+    // AUTHORITY and PATH are for native QUIC only; over WebTransport the transport
+    // carries them.
+    client_setup.validate_incoming(SetupSender::Client, context.transport_kind)?;
+
     utils::print_msg_bytes(&client_setup);
 
-    let max_request_id_param = {
-      let max_request_id = context
-        .max_request_id
-        .load(std::sync::atomic::Ordering::Relaxed);
-      moqtail::model::parameter::setup_parameter::SetupParameter::new_max_request_id(
-        max_request_id + 1,
-      )
-      .try_into()
-      .unwrap()
-    };
-
     let moqt_implementation_param =
-      moqtail::model::parameter::setup_parameter::SetupParameter::new_moqt_implementation(
-        env!("MOQTAIL_VERSION").to_string(),
-      )
+      SetupOption::new_moqt_implementation(env!("MOQTAIL_VERSION").to_string())
+        .try_into()
+        .unwrap();
+
+    let max_filter_ranges =
+      SetupOption::new_max_filter_ranges(context.server_config.max_filter_ranges)
+        .try_into()
+        .unwrap();
+    let max_request_updates_param = SetupOption::new_max_request_updates(0u64)
       .try_into()
       .unwrap();
 
-    let server_setup = ServerSetup::new(vec![max_request_id_param, moqt_implementation_param]);
+    let mut setup_options = vec![
+      max_filter_ranges,
+      moqt_implementation_param,
+      max_request_updates_param,
+    ];
+    if context.server_config.ssts_enable {
+      setup_options.push(
+        moqtail::model::parameter::setup_option::SetupOption::new_ssts_algorithms(
+          context.server_config.ssts_algorithms.clone(),
+        )
+        .try_into()
+        .unwrap(),
+      );
+    }
 
-    debug!("client setup: {:?}", client_setup);
-    debug!("server setup: {:?}", server_setup);
+    let server_setup = Setup::new(setup_options);
+
+    trace!("client setup: {:?}", client_setup);
+    trace!("server setup: {:?}", server_setup);
 
     // Check for authorization tokens and log them if token logging is enabled
     if context.server_config.enable_token_logging {
       // Import the necessary types
       use moqtail::model::parameter::constant::TokenAliasType;
-      use moqtail::model::parameter::setup_parameter::SetupParameter;
+      use moqtail::model::parameter::setup_option::SetupOption;
 
       // Iterate through setup parameters to find authorization tokens
-      for param in &client_setup.setup_parameters {
-        // Try to deserialize as a SetupParameter
-        if let Ok(setup_param) = SetupParameter::deserialize(param) {
+      for param in &client_setup.setup_options {
+        // Try to deserialize as a SetupOption
+        if let Ok(setup_param) = SetupOption::deserialize(param) {
           // Check if it's an AuthorizationToken
-          if let SetupParameter::AuthorizationToken { token } = setup_param
+          if let SetupOption::AuthorizationToken { token } = setup_param
             && token.alias_type == TokenAliasType::Register as u64
           {
             // Get client port number from the connection
@@ -849,19 +909,21 @@ impl Session {
       }
     }
 
-    let mut m = context.client_manager.write().await;
-
     let client = MOQTClient::new(
       context.connection_id,
       Arc::new(context.connection.clone()),
       Arc::new(client_setup),
+      context.server_config,
     );
     let client = Arc::new(client);
-    m.add(client.clone()).await;
+    if client.ssts_enabled() {
+      client.clone().start_abr_controller();
+    }
+    context.client_manager.add(client.clone()).await;
 
     match control_stream_handler.send_impl(&server_setup).await {
       Ok(_) => {
-        debug!("Sent server setup to client");
+        trace!("Sent server setup to client");
         Ok(client)
       }
       Err(e) => {

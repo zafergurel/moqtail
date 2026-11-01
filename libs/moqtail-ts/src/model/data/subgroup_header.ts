@@ -20,7 +20,13 @@ import { SubgroupHeaderType } from './constant'
 
 // TODO: couple type and subgroup id
 export class SubgroupHeader {
-  readonly subgroupId: bigint | undefined
+  /**
+   * Absent on the wire, and still unknown here, when the type says the Subgroup ID
+   * is the first Object ID: that object has not been read yet at header time.
+   * `resolveSubgroupId` fills it in, so consumers can read this rather than each
+   * deriving it again.
+   */
+  subgroupId: bigint | undefined
   readonly trackAlias: bigint
   readonly groupId: bigint
 
@@ -84,13 +90,24 @@ export class SubgroupHeader {
     }
     return new SubgroupHeader(headerType, trackAlias, groupId, subgroupId, publisherPriority)
   }
+
+  /**
+   * Name this subgroup from the first object read off its stream, for the header
+   * type that defers the Subgroup ID to it. Ignored for every other type, and for
+   * a header already named, so later objects on the stream cannot rename it.
+   */
+  resolveSubgroupId(firstObjectId: bigint): void {
+    if (this.subgroupId === undefined && SubgroupHeaderType.isSubgroupIdFirstObjectId(this.type)) {
+      this.subgroupId = firstObjectId
+    }
+  }
 }
 
 if (import.meta.vitest) {
   const { describe, test, expect } = import.meta.vitest
   describe('SubgroupHeader', () => {
     test('roundtrip serialization/deserialization', () => {
-      // explicit subgroup ID, no extensions, no end-of-group, priority present
+      // explicit subgroup ID, no properties, no end-of-group, priority present
       const headerType = SubgroupHeaderType.fromProperties(false, 2, false)
       const trackAlias = 87n
       const groupId = 9n
@@ -124,7 +141,7 @@ if (import.meta.vitest) {
       expect(frozen.remaining).toBe(0)
     })
     test('excess roundtrip', () => {
-      // explicit subgroup ID, no extensions, no end-of-group, priority present
+      // explicit subgroup ID, no properties, no end-of-group, priority present
       const headerType = SubgroupHeaderType.fromProperties(false, 2, false)
       const trackAlias = 87n
       const groupId = 9n
@@ -146,8 +163,21 @@ if (import.meta.vitest) {
       expect(frozen.remaining).toBe(3)
       expect(Array.from(frozen.getBytes(3))).toEqual([9, 1, 1])
     })
+    test('FIRST_OBJECT survives a roundtrip and is absent on a reopened subgroup', () => {
+      const newSubgroup = SubgroupHeaderType.fromProperties(false, 2, false, false, true)
+      const header = new SubgroupHeader(newSubgroup, 87n, 9n, 11n, 128)
+      expect(SubgroupHeaderType.isFirstObject(header.type)).toBe(true)
+      const parsed = SubgroupHeader.deserialize(header.serialize())
+      expect(parsed.type).toBe(newSubgroup)
+      expect(SubgroupHeaderType.isFirstObject(parsed.type)).toBe(true)
+
+      // A stream reopening an existing subgroup does not start at its first object.
+      const reopened = SubgroupHeaderType.fromProperties(false, 2, false, false, false)
+      expect(SubgroupHeaderType.isFirstObject(reopened)).toBe(false)
+      expect(newSubgroup - reopened).toBe(SubgroupHeaderType.FIRST_OBJECT)
+    })
     test('partial message fails', () => {
-      // explicit subgroup ID, no extensions, no end-of-group, priority present
+      // explicit subgroup ID, no properties, no end-of-group, priority present
       const headerType = SubgroupHeaderType.fromProperties(false, 2, false)
       const trackAlias = 87n
       const groupId = 9n

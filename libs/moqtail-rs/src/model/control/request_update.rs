@@ -17,22 +17,20 @@ use super::control_message::ControlMessageTrait;
 use crate::model::common::varint::{BufMutVarIntExt, BufVarIntExt};
 use crate::model::error::ParseError;
 use crate::model::parameter::message_parameter::{
-  MessageParameter, deserialize_message_parameters,
+  MessageParameter, deserialize_message_parameters, serialize_message_parameters,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct RequestUpdate {
   pub request_id: u64,
-  pub existing_request_id: u64,
   pub parameters: Vec<MessageParameter>,
 }
 
 impl RequestUpdate {
-  pub fn new(request_id: u64, existing_request_id: u64, parameters: Vec<MessageParameter>) -> Self {
+  pub fn new(request_id: u64, parameters: Vec<MessageParameter>) -> Self {
     Self {
       request_id,
-      existing_request_id,
       parameters,
     }
   }
@@ -45,11 +43,8 @@ impl ControlMessageTrait for RequestUpdate {
 
     let mut payload = BytesMut::new();
     payload.put_vi(self.request_id)?;
-    payload.put_vi(self.existing_request_id)?;
     payload.put_vi(self.parameters.len())?;
-    for param in &self.parameters {
-      payload.extend_from_slice(&param.serialize()?);
-    }
+    payload.extend_from_slice(&serialize_message_parameters(&self.parameters)?);
 
     let payload_len: u16 = payload
       .len()
@@ -69,7 +64,6 @@ impl ControlMessageTrait for RequestUpdate {
 
   fn parse_payload(payload: &mut Bytes) -> Result<Box<Self>, ParseError> {
     let request_id = payload.get_vi()?;
-    let existing_request_id = payload.get_vi()?;
 
     let param_count = payload.get_vi()?;
     let parameters =
@@ -77,7 +71,6 @@ impl ControlMessageTrait for RequestUpdate {
 
     Ok(Box::new(RequestUpdate {
       request_id,
-      existing_request_id,
       parameters,
     }))
   }
@@ -91,21 +84,24 @@ impl ControlMessageTrait for RequestUpdate {
 mod tests {
   use super::*;
   use crate::model::common::location::Location;
-  use crate::model::control::constant::FilterType;
+  use crate::model::parameter::location_filter::LocationFilter;
   use bytes::Buf;
 
   #[test]
   fn test_roundtrip() {
     let request_update = RequestUpdate::new(
       120205,
-      54321,
-      vec![MessageParameter::new_subscription_filter(
-        FilterType::AbsoluteRange,
-        Some(Location {
-          group: 81,
-          object: 81,
-        }),
-        Some(25),
+      vec![MessageParameter::new_location_filter(
+        LocationFilter::AbsoluteRange {
+          start: Location {
+            group: 81,
+            object: 81,
+          },
+          end: Location {
+            group: 106,
+            object: 4,
+          },
+        },
       )],
     );
 
@@ -123,14 +119,17 @@ mod tests {
   fn test_excess_roundtrip() {
     let request_update = RequestUpdate::new(
       120205,
-      54321,
-      vec![MessageParameter::new_subscription_filter(
-        FilterType::AbsoluteRange,
-        Some(Location {
-          group: 81,
-          object: 81,
-        }),
-        Some(25),
+      vec![MessageParameter::new_location_filter(
+        LocationFilter::AbsoluteRange {
+          start: Location {
+            group: 81,
+            object: 81,
+          },
+          end: Location {
+            group: 106,
+            object: 4,
+          },
+        },
       )],
     );
 
@@ -154,14 +153,17 @@ mod tests {
   fn test_partial_message() {
     let request_update = RequestUpdate::new(
       120205,
-      54321,
-      vec![MessageParameter::new_subscription_filter(
-        FilterType::AbsoluteRange,
-        Some(Location {
-          group: 81,
-          object: 81,
-        }),
-        Some(25),
+      vec![MessageParameter::new_location_filter(
+        LocationFilter::AbsoluteRange {
+          start: Location {
+            group: 81,
+            object: 81,
+          },
+          end: Location {
+            group: 106,
+            object: 4,
+          },
+        },
       )],
     );
 

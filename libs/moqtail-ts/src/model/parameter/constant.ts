@@ -16,61 +16,128 @@
 
 import { InvalidTypeError } from '../error'
 
-export enum SetupParameterType {
+export enum SetupOptionType {
   Path = 0x01,
-  MaxRequestId = 0x02,
   AuthorizationToken = 0x03,
   MaxAuthTokenCacheSize = 0x04,
+  /** Raw-QUIC only. Client-only; MUST NOT be sent over WebTransport. */
+  Authority = 0x05,
+  MaxFilterRanges = 0x06,
+  MoqtImplementation = 0x07,
+  MaxRequestUpdates = 0x08,
+  /**
+   * PROVISIONAL: sender-side track switching is not an adopted extension, so this
+   * codepoint is absent from the registry the conformance fixture tracks. It sits in the
+   * 0x07-0x7F range of this space, which that registry leaves free.
+   */
+  SstsAlgorithms = 0x09,
 }
 
-export function setupParameterTypeFromNumber(value: number): SetupParameterType {
+export function setupOptionTypeFromNumber(value: number): SetupOptionType {
   switch (value) {
     case 0x01:
-      return SetupParameterType.Path
-    case 0x02:
-      return SetupParameterType.MaxRequestId
+      return SetupOptionType.Path
     case 0x03:
-      return SetupParameterType.AuthorizationToken
+      return SetupOptionType.AuthorizationToken
     case 0x04:
-      return SetupParameterType.MaxAuthTokenCacheSize
+      return SetupOptionType.MaxAuthTokenCacheSize
+    case 0x05:
+      return SetupOptionType.Authority
+    case 0x06:
+      return SetupOptionType.MaxFilterRanges
+    case 0x07:
+      return SetupOptionType.MoqtImplementation
+    case 0x08:
+      return SetupOptionType.MaxRequestUpdates
+    case 0x09:
+      return SetupOptionType.SstsAlgorithms
     default:
-      throw new InvalidTypeError('setupParameterTypeFromNumber', `Invalid setup parameter type: ${value}`)
+      throw new InvalidTypeError('setupOptionTypeFromNumber', `Invalid setup option type: ${value}`)
   }
 }
 
 export enum MessageParameterType {
-  DeliveryTimeout = 0x02,
+  ObjectDeliveryTimeout = 0x02,
   AuthorizationToken = 0x03,
+  RendezvousTimeout = 0x04,
+  SubgroupDeliveryTimeout = 0x06,
   Expires = 0x08,
   LargestObject = 0x09,
+  FillTimeout = 0x0a,
   Forward = 0x10,
   SubscriberPriority = 0x20,
-  SubscriptionFilter = 0x21,
+  LocationFilter = 0x21,
   GroupOrder = 0x22,
+  FillParameters = 0x23,
+  SwitchFrom = 0x24,
+  SubgroupFilter = 0x25,
+  ObjectIdFilter = 0x26,
+  PriorityFilter = 0x27,
+  ObjectPropertyFilter = 0x28,
+  TrackPropertyFilter = 0x29,
   NewGroupRequest = 0x32,
+  /**
+   * Registered codepoint with no typed parameter yet: its consumer is REQUEST_UPDATE for
+   * SUBSCRIBE_TRACKS (TS-11), and the value is a Track Namespace tuple rather than the
+   * varint its even Type implies.
+   */
+  TrackNamespacePrefix = 0x34,
+  IncludeProperties = 0x35,
+  /**
+   * PROVISIONAL: sender-side track switching is not an adopted extension, so this
+   * codepoint is absent from the registry the conformance fixture tracks; see its
+   * `local_extensions`.
+   */
+  SwitchingSetAssignment = 0x41,
 }
 
 export function messageParameterTypeFromNumber(value: bigint | number): MessageParameterType {
   const numValue = Number(value)
   switch (numValue) {
     case 0x02:
-      return MessageParameterType.DeliveryTimeout
+      return MessageParameterType.ObjectDeliveryTimeout
     case 0x03:
       return MessageParameterType.AuthorizationToken
+    case 0x04:
+      return MessageParameterType.RendezvousTimeout
+    case 0x06:
+      return MessageParameterType.SubgroupDeliveryTimeout
     case 0x08:
       return MessageParameterType.Expires
     case 0x09:
       return MessageParameterType.LargestObject
+    case 0x0a:
+      return MessageParameterType.FillTimeout
     case 0x10:
       return MessageParameterType.Forward
     case 0x20:
       return MessageParameterType.SubscriberPriority
     case 0x21:
-      return MessageParameterType.SubscriptionFilter
+      return MessageParameterType.LocationFilter
     case 0x22:
       return MessageParameterType.GroupOrder
+    case 0x23:
+      return MessageParameterType.FillParameters
+    case 0x24:
+      return MessageParameterType.SwitchFrom
+    case 0x25:
+      return MessageParameterType.SubgroupFilter
+    case 0x26:
+      return MessageParameterType.ObjectIdFilter
+    case 0x27:
+      return MessageParameterType.PriorityFilter
+    case 0x28:
+      return MessageParameterType.ObjectPropertyFilter
+    case 0x29:
+      return MessageParameterType.TrackPropertyFilter
     case 0x32:
       return MessageParameterType.NewGroupRequest
+    case 0x34:
+      return MessageParameterType.TrackNamespacePrefix
+    case 0x35:
+      return MessageParameterType.IncludeProperties
+    case 0x41:
+      return MessageParameterType.SwitchingSetAssignment
     default:
       throw new InvalidTypeError('messageParameterTypeFromNumber', `Unknown message parameter type: ${value}`)
   }
@@ -96,4 +163,28 @@ export function tokenAliasTypeFromNumber(value: number): TokenAliasType {
     default:
       throw new InvalidTypeError('tokenAliasTypeFromNumber', `Invalid token alias type: ${value}`)
   }
+}
+
+if (import.meta.vitest) {
+  const { describe, test } = import.meta.vitest
+
+  // Asserted against dev/conformance/draft22/, which is shared with moqtail-rs. These
+  // enums have no tryFrom, so the lookup uses the enum's own reverse mapping.
+  describe('draft-22 conformance', () => {
+    const fixture = async () => await import('../../../test/conformance')
+
+    test('SetupOptionType matches parameter_types.json', async () => {
+      const { parameterTypes, assertRegistry, pascalIdent } = await fixture()
+      assertRegistry(parameterTypes().setup_options, pascalIdent(), (codepoint) => SetupOptionType[Number(codepoint)])
+    })
+
+    test('MessageParameterType matches parameter_types.json', async () => {
+      const { parameterTypes, assertRegistry, pascalIdent } = await fixture()
+      assertRegistry(
+        parameterTypes().message_parameters,
+        pascalIdent({ OBJECTID_FILTER: 'ObjectIdFilter' }),
+        (codepoint) => MessageParameterType[Number(codepoint)],
+      )
+    })
+  })
 }

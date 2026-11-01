@@ -66,7 +66,7 @@ Three terminal windows, all from the workspace root:
 
 ```bash
 ./target/release/client \
-  --server https://127.0.0.1:4433 \
+  --server moqt://127.0.0.1:4433 \
   --namespace moqtail-experiment \
   --command publish-multi \
   --no-cert-validation \
@@ -77,13 +77,13 @@ Three terminal windows, all from the workspace root:
 
 ```bash
 ./target/release/client \
-  --server https://127.0.0.1:4433 \
+  --server moqt://127.0.0.1:4433 \
   --namespace moqtail-experiment \
   --command switch-test \
   --no-cert-validation \
   --method switch \
   --track-sequence "3,4" \
-  --switch-after 5000 \
+  --switch-after-ms 5000 \
   --jitter-buffer-ms 200 \
   --output-json /tmp/result.json
 
@@ -293,13 +293,13 @@ SWITCH's key advantage is not delay immunity but maintaining **AETR=0.00 regardl
 # Start relay and publisher first, then:
 
 ./target/release/client \
-  --server https://127.0.0.1:4433 \
+  --server moqt://127.0.0.1:4433 \
   --namespace moqtail-experiment \
   --command switch-test \
   --no-cert-validation \
   --track-sequence "3,4" \
   --method switch \
-  --switch-after 5000 \
+  --switch-after-ms 5000 \
   --jitter-buffer-ms 200 \
   --bandwidth-cap-bps 0 \
   --output-json /tmp/result.json
@@ -309,13 +309,13 @@ With `RUST_LOG=debug` for verbose output:
 
 ```bash
 RUST_LOG=debug ./target/release/client \
-  --server https://127.0.0.1:4433 \
+  --server moqt://127.0.0.1:4433 \
   --namespace moqtail-experiment \
   --command switch-test \
   --no-cert-validation \
-  --method joining-fetch \
+  --method sub-update-forward \
   --track-sequence "3,4" \
-  --switch-after 5000
+  --switch-after-ms 5000
 ```
 
 ---
@@ -769,8 +769,8 @@ I/P sizes computed with `p_ratio=0.25` and `N=25` objects/group.
 ```
 --track-sequence <s>        Comma-separated track list, e.g. "3,4"
 --track-a / --track-b       Shorthand for a single switch (ignored when --track-sequence is set)
---method                    switch | sub-update-forward | joining-fetch
---switch-after <ms>         Milliseconds per track before triggering the next switch   [15000]
+--method                    switch | sub-update-forward
+--switch-after-ms <ms>      Milliseconds per track before triggering the next switch   [15000]
 --jitter-buffer-ms <ms>     Jitter budget; gap > JB triggers a GoP-length stall   [0]
 --bandwidth-cap-bps <bps>   Recorded in JSON only; does not apply tc               [0]
 --output-json <path>        Write result JSON to this path

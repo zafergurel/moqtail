@@ -12,38 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) mod request_subscription_map;
 pub(crate) mod switch_context;
-pub(crate) mod track_subscription_map;
 
 use crate::server::{
-  client::track_subscription_map::TrackSubscriptionMap,
+  client::request_subscription_map::RequestSubscriptionMap,
+  config::{AppConfig, TrackAliasMode},
+  message_handlers::fetch_handler::FetchStop,
   session_context::PendingRequest,
-  stream_id::{StreamId, StreamType},
+  ssts,
+  stream_id::{SendStreamKey, StreamType},
   utils,
 };
 use anyhow::Result;
-#[allow(dead_code)]
 use bytes::Bytes;
 use moqtail::{
   model::{
     common::tuple::Tuple,
-    control::{client_setup::ClientSetup, control_message::ControlMessage},
+    control::{control_message::ControlMessage, setup::Setup},
     data::full_track_name::FullTrackName,
+    error::StreamResetCode,
   },
-  transport::data_stream_handler::{FetchRequest, SubscribeRequest},
+  transport::{
+    connection::{TransportConnection, TransportKind, TransportSendStream, TransportWriteError},
+    data_stream_handler::{FetchRequest, SubscribeRequest},
+  },
 };
 use switch_context::SwitchContext;
 
 use std::{
   collections::{BTreeMap, HashMap, VecDeque},
-  sync::Arc,
+  sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+  },
   time::Duration,
 };
 use tokio::sync::Notify;
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::time::Instant;
-use tracing::{debug, error, info, warn};
-use wtransport::{Connection, SendStream, error::StreamWriteError};
+use tracing::{debug, error, trace, warn};
 
 /// Token-bucket rate limiter. All streams of one subscriber share a single
 /// bucket so they compete for bandwidth — the QUIC scheduler then drains
@@ -89,16 +97,22 @@ impl TokenBucket {
 /// Should be a power of 2 for optimal modulo performance.
 pub const SEND_STREAM_PARTITION_COUNT: usize = 16;
 
-pub type SendStreamMap = HashMap<String, Arc<Mutex<SendStream>>>;
+pub type SendStreamMap = HashMap<SendStreamKey, Arc<Mutex<TransportSendStream>>>;
 pub type SendStreamLock = Arc<RwLock<SendStreamMap>>;
 pub type SendStreamList = Vec<SendStreamLock>;
+
+// Per-request response channels, sharded like the send-stream map so a
+// register/lookup only locks one partition.
+pub type ResponseSenderMap = HashMap<u64, mpsc::UnboundedSender<ControlMessage>>;
+pub type ResponseSenderList = Vec<Arc<RwLock<ResponseSenderMap>>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct MOQTClient {
   pub connection_id: usize,
-  pub connection: Arc<Connection>,
+  pub transport_kind: TransportKind,
+  pub connection: Arc<TransportConnection>,
   #[allow(dead_code)]
-  pub client_setup: Arc<ClientSetup>,
+  pub client_setup: Arc<Setup>,
   pub announced_track_namespaces: Arc<RwLock<Vec<Tuple>>>, // the track namespaces the publisher announced
   pub outbound_announcements: Arc<RwLock<HashMap<Tuple, u64>>>, //Maps a Namespace to the outbound request_id we used to announce it to the client
   pub published_tracks: Arc<RwLock<HashMap<u64, FullTrackName>>>, // request_id -> track the client is publishing
@@ -108,8 +122,12 @@ pub(crate) struct MOQTClient {
   pub message_notify: Arc<Notify>, // notify when a new message is available
   pub send_streams: Arc<SendStreamList>,
 
-  // fetch requests that this client sent to the relay
-  pub incoming_fetch_requests: Arc<RwLock<BTreeMap<u64, FetchRequest>>>,
+  // Per-request response channels, keyed by the request's (downstream) request id
+  // and sharded across partitions. A request stream registers its sender here so
+  // responses/follow-ups produced elsewhere (e.g. a deferred SUBSCRIBE_OK fan-out)
+  // are delivered onto that stream instead of the control stream.
+  pub response_senders: Arc<ResponseSenderList>,
+
   // fetch requests that the relay sent to this client
   pub outgoing_fetch_requests: Arc<RwLock<BTreeMap<u64, FetchRequest>>>,
 
@@ -120,38 +138,66 @@ pub(crate) struct MOQTClient {
   pub inbound_requests: Arc<RwLock<BTreeMap<u64, PendingRequest>>>,
 
   // Senders for cancelling active fetch tasks, keyed by request_id.
-  pub fetch_cancel_senders: Arc<RwLock<HashMap<u64, watch::Sender<bool>>>>,
+  pub fetch_cancel_senders: Arc<RwLock<HashMap<u64, watch::Sender<FetchStop>>>>,
 
   // this contains the subscriptions made by the client
-  pub subscriptions: TrackSubscriptionMap,
+  pub subscriptions: RequestSubscriptionMap,
 
   pub switch_context: SwitchContext,
 
   // Optional per-connection write rate limiter. All streams of this client share
   // the same bucket so they compete for bandwidth, exercising QUIC stream priority.
   rate_limiter: Option<Arc<Mutex<TokenBucket>>>,
+
+  /// Sender-side track switching: the negotiation, switching sets, ABR
+  /// controller channel and decision cache, behind one handle.
+  pub ssts: Arc<ssts::SstsState>,
+
+  /// The settings this relay started with, handed in the way `Track` and
+  /// `Subscription` take theirs, rather than reached for through the global.
+  config: &'static AppConfig,
+
+  /// The next Track Alias handed out under `per-subscription`.
+  next_track_alias: Arc<AtomicU64>,
+}
+
+/// The Track Alias `mode` gives a new subscription to the track the relay knows as
+/// `relay_track_id`, drawing fresh ones from `next`.
+fn pick_track_alias(mode: TrackAliasMode, relay_track_id: u64, next: &AtomicU64) -> u64 {
+  match mode {
+    TrackAliasMode::PerTrack => relay_track_id,
+    TrackAliasMode::PerSubscription => next.fetch_add(1, Ordering::Relaxed),
+  }
 }
 
 impl MOQTClient {
   pub(crate) fn new(
     connection_id: usize,
-    connection: Arc<Connection>,
-    client_setup: Arc<ClientSetup>,
+    connection: Arc<TransportConnection>,
+    client_setup: Arc<Setup>,
+    config: &'static AppConfig,
   ) -> Self {
     let mut send_streams = Vec::with_capacity(SEND_STREAM_PARTITION_COUNT);
     for _ in 0..SEND_STREAM_PARTITION_COUNT {
       send_streams.push(Arc::new(RwLock::new(HashMap::new())));
     }
 
-    let kbps = crate::server::config::AppConfig::load().write_kbps_limit;
+    let kbps = config.write_kbps_limit;
     let rate_limiter = if kbps > 0 {
       Some(Arc::new(Mutex::new(TokenBucket::new(kbps))))
     } else {
       None
     };
 
+    // SSTS for this connection.
+    let ssts = Arc::new(ssts::SstsState::new(
+      client_setup.as_ref(),
+      &config.ssts_algorithms,
+    ));
+
     MOQTClient {
       connection_id,
+      transport_kind: connection.kind(),
       connection,
       client_setup,
       announced_track_namespaces: Arc::new(RwLock::new(Vec::new())),
@@ -161,20 +207,45 @@ impl MOQTClient {
       message_queue: Arc::new(RwLock::new(VecDeque::new())),
       message_notify: Arc::new(Notify::default()),
       send_streams: Arc::new(send_streams),
-      incoming_fetch_requests: Arc::new(RwLock::new(BTreeMap::new())),
+      response_senders: Arc::new(
+        (0..SEND_STREAM_PARTITION_COUNT)
+          .map(|_| Arc::new(RwLock::new(HashMap::new())))
+          .collect(),
+      ),
       outgoing_fetch_requests: Arc::new(RwLock::new(BTreeMap::new())),
       subscribe_requests: Arc::new(RwLock::new(BTreeMap::new())),
       inbound_requests: Arc::new(RwLock::new(BTreeMap::new())),
       fetch_cancel_senders: Arc::new(RwLock::new(HashMap::new())),
-      subscriptions: TrackSubscriptionMap::new(),
+      subscriptions: RequestSubscriptionMap::new(),
       switch_context: SwitchContext::new(),
       rate_limiter,
+      ssts,
+      config,
+      next_track_alias: Arc::new(AtomicU64::new(0)),
     }
   }
 
   pub(crate) async fn add_announced_track_namespace(&self, track_namespace: Tuple) {
     let mut announced_track_namespaces = self.announced_track_namespaces.write().await;
     announced_track_namespaces.push(track_namespace);
+  }
+
+  /// Leaving a withdrawn namespace here would keep routing subscriptions to this client.
+  pub(crate) async fn remove_announced_track_namespace(&self, track_namespace: &Tuple) {
+    let mut announced_track_namespaces = self.announced_track_namespaces.write().await;
+    announced_track_namespaces.retain(|ns| ns != track_namespace);
+  }
+
+  /// The Track Alias to give this subscriber for a new subscription to the track
+  /// the relay knows as `relay_track_id`: that id itself under `per-track`, or a
+  /// fresh one under `per-subscription`. Fresh ones come from a counter of this
+  /// connection's own, so no two are alike within its session.
+  pub(crate) fn assign_track_alias(&self, relay_track_id: u64) -> u64 {
+    pick_track_alias(
+      self.config.track_alias_mode,
+      relay_track_id,
+      &self.next_track_alias,
+    )
   }
 
   pub(crate) async fn add_subscriber(&self, subscriber_id: usize) {
@@ -215,10 +286,47 @@ impl MOQTClient {
     self.message_notify.notify_one();
   }
 
+  /// The response-sender shard for a request id (sequential ids spread evenly).
+  fn response_partition(&self, request_id: u64) -> usize {
+    (request_id % self.response_senders.len() as u64) as usize
+  }
+
+  /// Register a request stream's response channel under its request id.
+  pub(crate) async fn register_response_sender(
+    &self,
+    request_id: u64,
+    tx: mpsc::UnboundedSender<ControlMessage>,
+  ) {
+    let idx = self.response_partition(request_id);
+    self.response_senders[idx]
+      .write()
+      .await
+      .insert(request_id, tx);
+  }
+
+  /// Remove a request stream's response channel (on stream close).
+  pub(crate) async fn unregister_response_sender(&self, request_id: u64) {
+    let idx = self.response_partition(request_id);
+    self.response_senders[idx].write().await.remove(&request_id);
+  }
+
+  /// Deliver a message onto the request stream registered for `request_id`.
+  /// Returns true if a request stream was registered and accepted it; false
+  /// otherwise (the caller may fall back to the control-stream queue).
+  pub(crate) async fn send_response(&self, request_id: u64, message: ControlMessage) -> bool {
+    let idx = self.response_partition(request_id);
+    let senders = self.response_senders[idx].read().await;
+    match senders.get(&request_id) {
+      Some(tx) => tx.send(message).is_ok(),
+      None => false,
+    }
+  }
+
   /// Calculate the partition index for stream distribution across buckets.
   /// This method implements a load balancing strategy to distribute streams
   /// across multiple stream buckets to improve performance and reduce contention.
-  fn get_partition_index(&self, stream_id: &StreamId) -> usize {
+  fn get_partition_index(&self, key: &SendStreamKey) -> usize {
+    let stream_id = &key.stream_id;
     let value = match stream_id.stream_type {
       StreamType::Fetch => {
         // Use a simple hash combining relay_track_id and fetch_request_id
@@ -235,97 +343,113 @@ impl MOQTClient {
       }
     };
 
+    // Streams of different requests for the same track spread apart too.
+    let value = value.wrapping_add(key.request_id.wrapping_mul(7));
+
     // Convert to bytes for fnv_hash function
     let value_bytes = value.to_le_bytes();
     (utils::fnv_hash(&value_bytes) % SEND_STREAM_PARTITION_COUNT as u64) as usize
   }
 
-  fn get_stream_map(
-    &self,
-    stream_id: &StreamId,
-  ) -> Arc<RwLock<HashMap<String, Arc<Mutex<SendStream>>>>> {
-    let partition_index = self.get_partition_index(stream_id);
-    debug!(
-      "get_stream_map | stream_id: {} partition_index: {}",
-      stream_id, partition_index
+  fn get_stream_map(&self, stream_key: &SendStreamKey) -> SendStreamLock {
+    let partition_index = self.get_partition_index(stream_key);
+    trace!(
+      "get_stream_map | stream_key: {} partition_index: {}",
+      stream_key, partition_index
     );
     self.send_streams[partition_index].clone()
   }
 
-  pub async fn get_stream(&self, stream_id: &StreamId) -> Option<Arc<Mutex<SendStream>>> {
-    let send_stream_map = self.get_stream_map(stream_id);
+  pub async fn get_stream(
+    &self,
+    stream_key: &SendStreamKey,
+  ) -> Option<Arc<Mutex<TransportSendStream>>> {
+    let send_stream_map = self.get_stream_map(stream_key);
     let send_streams = send_stream_map.read().await;
-    let send_stream = send_streams.get(stream_id.get_stream_id().as_str());
+    let send_stream = send_streams.get(stream_key);
     send_stream.cloned()
   }
 
   pub async fn open_stream(
     &self,
-    stream_id: &StreamId,
+    stream_key: &SendStreamKey,
     header_payload: Bytes,
     priority: i32, // Priority for the stream
-  ) -> Result<Arc<Mutex<SendStream>>> {
-    let send_stream = {
-      let send_stream_map = self.get_stream_map(stream_id);
+  ) -> Result<Arc<Mutex<TransportSendStream>>> {
+    let (send_stream, newly_created) = {
+      let send_stream_map = self.get_stream_map(stream_key);
       let mut send_streams = send_stream_map.write().await;
-      match send_streams.entry(stream_id.get_stream_id().to_string()) {
+      match send_streams.entry(stream_key.clone()) {
         std::collections::hash_map::Entry::Vacant(entry) => {
-          let result = self
+          let send_stream = self
             .connection
             .open_uni()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to open send stream 1: {:?}", e))?;
-
-          let send_stream = result
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to open send stream 2: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to open send stream: {:?}", e))?;
 
           send_stream.set_priority(priority);
           let s = Arc::new(Mutex::new(send_stream));
           entry.insert(s.clone());
-          info!(
+          debug!(
             "open_stream | added send_stream to send streams ({}) connection_id: {}",
-            stream_id, self.connection_id
+            stream_key, self.connection_id
           );
-          s
+          (s, true)
         }
         std::collections::hash_map::Entry::Occupied(s) => {
-          debug!(
+          trace!(
             "open_stream | Send stream for {} already exists connection_id: {}",
-            stream_id, self.connection_id
+            stream_key, self.connection_id
           );
-          s.get().clone()
+          (s.get().clone(), false)
         }
       }
     };
 
-    debug!(
+    // A subgroup header belongs at the beginning of a stream and must be
+    // written exactly once. A concurrent caller reuses the existing stream.
+    if !newly_created {
+      return Ok(send_stream);
+    }
+
+    // Only the creator counts against the switching set, mirroring the
+    // release on every path that drops the stream from the map.
+    self
+      .ssts
+      .on_stream_opened(stream_key.stream_id.relay_track_id)
+      .await;
+
+    trace!(
       "open_stream |  writing to stream ({}) connection_id: {}",
-      stream_id, self.connection_id
+      stream_key, self.connection_id
     );
 
     // Write the header payload to the stream
     match send_stream.lock().await.write_all(&header_payload).await {
       Ok(..) => {
-        debug!(
+        trace!(
           "open_stream |  wrote to stream ({}) connection_id: {}",
-          stream_id, self.connection_id
+          stream_key, self.connection_id
         );
       }
       Err(e) => {
         error!(
           "open_stream |  Failed to write header payload to send stream ({}) connection_id: {}",
-          stream_id, self.connection_id
+          stream_key, self.connection_id
         );
 
         // remove this from the streams
-        let send_stream_map = self.get_stream_map(stream_id);
+        let send_stream_map = self.get_stream_map(stream_key);
         let mut send_streams = send_stream_map.write().await;
-        send_streams.remove(&stream_id.get_stream_id().to_string());
+        send_streams.remove(stream_key);
+        self
+          .ssts
+          .on_stream_closed(stream_key.stream_id.relay_track_id)
+          .await;
 
         return Err(anyhow::anyhow!(
           "Failed to write header payload to send stream ({}): {:?} connection_id: {}",
-          stream_id,
+          stream_key,
           self.connection_id,
           e
         ));
@@ -337,70 +461,139 @@ impl MOQTClient {
 
   // Remove the stream from the map and finish it
   // if the stream is found, return true, else false
-  pub async fn close_stream(&self, stream_id: &StreamId) -> Result<bool> {
-    let stream = self.remove_stream_by_stream_id(stream_id).await;
+  pub async fn close_stream(&self, stream_key: &SendStreamKey) -> Result<bool> {
+    // Taken without releasing the slot: the stream stays counted against its
+    // switching set until it has actually finished or been reset below, so the
+    // set's depth reflects the bandwidth the stream is still occupying.
+    let stream = self.take_stream(stream_key).await;
+    let group_id = stream_key.stream_id.group_id.unwrap_or(0);
 
     if let Some(send_stream) = stream {
-      // gracefully close the stream
       let mut stream = send_stream.lock().await;
+      // Only SSTS clients use a discard timeout: a connection that never
+      // negotiated the feature always closes gracefully, so in-flight data is
+      // never discarded for traffic that never opted in.
+      let timeout_ms = if self.ssts_enabled() {
+        self.config.ssts_discard_timeout_ms
+      } else {
+        0
+      };
 
-      // gracefully close the stream
-      // No new data may be written after calling this method.
-      // Completes when the peer has acknowledged all sent data, retransmitting data as needed.
-      stream
-        .finish()
-        .await
-        .map_err(|e| {
+      if timeout_ms == 0 {
+        // No discard timeout: always close gracefully.
+        // No new data may be written after calling this method.
+        // Completes when the peer has acknowledged all sent data, retransmitting data as needed.
+        stream.finish().await.map_err(|e| {
           error!(
             "close_stream | Failed to finish send stream ({}): {:?} connection_id: {}",
-            stream_id, e, self.connection_id
+            stream_key, e, self.connection_id
           );
-          anyhow::anyhow!("Failed to finish send stream ({}): {:?}", stream_id, e)
-        })
-        .map(|_| true)
+          anyhow::anyhow!("Failed to finish send stream ({}): {:?}", stream_key, e)
+        })?;
+        self
+          .ssts
+          .on_stream_closed(stream_key.stream_id.relay_track_id)
+          .await;
+        return Ok(true);
+      }
+
+      tokio::select! {
+        finish_result = stream.finish() => {
+            self.ssts.on_stream_closed(stream_key.stream_id.relay_track_id).await;
+            finish_result.map_err(|e| anyhow::anyhow!(
+                "close_stream | Failed to finish ({}): {:?}", stream_key, e
+            )).map(|_| true)
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => {
+            warn!(
+                connection_id = %self.connection_id,
+                group_id = %group_id,
+                "Stream timeout on close — resetting"
+            );
+            self.ssts.on_stream_closed(stream_key.stream_id.relay_track_id).await;
+            // The stream was discarded because it did not finish in time,
+            // which is what this code is for: the peer must be able to tell a
+            // late delivery apart from a cancelled or failed one.
+            let _ = stream.reset(StreamResetCode::DeliveryTimeout.to_u64());
+            let _ = self.ssts.abr_tx.try_send(ssts::AbrMessage::StreamTimeout {
+                group_id,
+            });
+            Ok(true)
+        }
+      }
     } else {
       // it is possible that no stream was created for this stream id
       // because the subscription can be in no forwarding state
-      debug!(
+      trace!(
         "close_stream | Send stream not found for {} connection_id: {}",
-        stream_id, self.connection_id
+        stream_key, self.connection_id
       );
       Ok(false)
     }
   }
 
-  // Just remove the stream from the stream_map
-  // The caller finishes the stream and calls this to remove it from the map
-  pub async fn remove_stream_by_stream_id(
+  /// Take a stream out of the map without releasing its switching-set stream
+  /// slot. Private because leaving the slot held is only correct for
+  /// `close_stream`, which keeps the stream counted until it has actually
+  /// finished; everything else goes through `release_stream`.
+  async fn take_stream(
     &self,
-    stream_id: &StreamId,
-  ) -> Option<Arc<Mutex<SendStream>>> {
-    let send_stream_map = self.get_stream_map(stream_id);
+    stream_key: &SendStreamKey,
+  ) -> Option<Arc<Mutex<TransportSendStream>>> {
+    let send_stream_map = self.get_stream_map(stream_key);
     let mut send_streams = send_stream_map.write().await;
-    send_streams.remove(stream_id.get_stream_id().as_str())
+    send_streams.remove(stream_key)
+  }
+
+  /// Take a stream out of the map once the caller has finished or reset it,
+  /// and release the switching-set stream slot it held. Returns the stream so
+  /// the caller can still act on it.
+  ///
+  /// The slot is released only when a stream was actually in the map, so a
+  /// second removal cannot borrow the count of another stream of the same set.
+  pub async fn release_stream(
+    &self,
+    stream_key: &SendStreamKey,
+  ) -> Option<Arc<Mutex<TransportSendStream>>> {
+    let removed = self.take_stream(stream_key).await;
+    if removed.is_some() {
+      self
+        .ssts
+        .on_stream_closed(stream_key.stream_id.relay_track_id)
+        .await;
+    }
+    removed
+  }
+
+  /// Reset a data stream with an application error code (QUIC RESET_STREAM) and
+  /// drop it from the send-stream map, releasing its switching-set stream slot.
+  pub async fn reset_stream(&self, stream_key: &SendStreamKey, code: u64) {
+    if let Some(stream) = self.release_stream(stream_key).await
+      && let Err(e) = stream.lock().await.reset(code)
+    {
+      warn!("Error resetting data stream {}: {:?}", stream_key, e);
+    }
   }
 
   pub async fn write_stream_object(
     &self,
-    stream_id: &StreamId,
+    stream_key: &SendStreamKey,
     object_id: u64,
     object: Bytes,
-    the_stream: Option<Arc<Mutex<SendStream>>>,
+    the_stream: Option<Arc<Mutex<TransportSendStream>>>,
   ) -> Result<(), anyhow::Error> {
-    debug!(
+    trace!(
       "write_stream_object | Writing object to stream ({} - {}) connection_id: {}",
-      object_id, stream_id, self.connection_id
+      object_id, stream_key, self.connection_id
     );
 
     let send_stream = {
       if let Some(send_stream) = the_stream {
         Some(send_stream)
       } else {
-        let stream_map = self.get_stream_map(stream_id);
+        let stream_map = self.get_stream_map(stream_key);
         let send_streams = stream_map.read().await;
-        send_streams
-          .get(stream_id.get_stream_id().as_str())
-          .cloned()
+        send_streams.get(stream_key).cloned()
       }
     };
 
@@ -416,19 +609,16 @@ impl MOQTClient {
       match stream.write_all(&object).await {
         Ok(..) => {}
         Err(e) => {
-          match &e {
-            StreamWriteError::Closed | StreamWriteError::Stopped(_) => {
-              warn!(
-                "write_stream_object | Send stream is closed or stopped ({})",
-                stream_id.get_stream_id()
-              );
-              drop(stream);
-              // remove this from the streams
-              let stream_map = self.get_stream_map(stream_id);
-              let mut send_streams = stream_map.write().await;
-              send_streams.remove(stream_id.get_stream_id().as_str());
-            }
-            _ => {}
+          if let TransportWriteError::ClosedOrStopped = &e {
+            warn!(
+              "write_stream_object | Send stream is closed or stopped ({})",
+              stream_key
+            );
+            drop(stream);
+            // The peer stopped the stream, so it is gone even if a close for
+            // it arrives later: drop it from the map and release its
+            // switching-set slot now.
+            self.release_stream(stream_key).await;
           }
         }
       };
@@ -436,16 +626,16 @@ impl MOQTClient {
     } else {
       warn!(
         "write_stream_object | Send stream not found for {} connection_id: {}",
-        stream_id, self.connection_id
+        stream_key, self.connection_id
       );
       // This is not an error. The stream already started, wait for the next group...
-      // Err(anyhow::anyhow!("Send stream not found ({})", stream_id))
+      // Err(anyhow::anyhow!("Send stream not found ({})", stream_key))
       Ok(())
     }
   }
 
   pub async fn write_datagram_object(&self, object: Bytes) -> Result<(), anyhow::Error> {
-    debug!(
+    trace!(
       "write_datagram_object | Writing datagram object connection_id: {}",
       self.connection_id
     );
@@ -454,11 +644,35 @@ impl MOQTClient {
     self.connection.send_datagram(object)?;
     Ok(())
   }
+
+  /// SSTS was negotiated for this connection.
+  pub fn ssts_enabled(&self) -> bool {
+    self.ssts.enabled()
+  }
+
+  pub fn start_abr_controller(self: Arc<Self>) {
+    ssts::controller::start(self);
+  }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn per_track_gives_every_subscription_the_tracks_alias() {
+    let next = AtomicU64::new(0);
+    assert_eq!(pick_track_alias(TrackAliasMode::PerTrack, 7, &next), 7);
+    assert_eq!(pick_track_alias(TrackAliasMode::PerTrack, 7, &next), 7);
+  }
+
+  #[test]
+  fn per_subscription_gives_each_subscription_its_own_alias() {
+    let next = AtomicU64::new(0);
+    let first = pick_track_alias(TrackAliasMode::PerSubscription, 7, &next);
+    let second = pick_track_alias(TrackAliasMode::PerSubscription, 7, &next);
+    assert_ne!(first, second);
+  }
   use crate::server::stream_id::{StreamId, StreamType};
 
   /// Test helper struct that exposes the partition logic for testing

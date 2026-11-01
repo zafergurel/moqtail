@@ -15,37 +15,29 @@
  */
 
 import { ProtocolViolationError } from '@/model/error'
-import { FetchOk, FetchType } from '../../model/control'
+import { FetchOk } from '../../model/control'
 import { FetchRequest } from '../request/fetch'
 import { SubscribeRequest } from '../request/subscribe'
-import { ControlMessageHandler } from './handler'
+import { RequestStreamMessageHandler } from './handler'
 import { logger } from '../../util/logger'
 
-export const handlerFetchOk: ControlMessageHandler<FetchOk> = async (client, msg) => {
-  logger.log('handler/fetch_ok', 'requestId', msg.requestId)
-  const request = client.requests.get(msg.requestId)
+export const handlerFetchOk: RequestStreamMessageHandler<FetchOk> = async (client, msg, _stream, requestId) => {
+  logger.log('handler/fetch_ok', 'requestId', requestId)
+  // FETCH_OK carries no request id of its own: the stream it arrived on names the FETCH
+  // it answers (§10.1).
+  const request = client.requests.get(requestId)
   if (request instanceof FetchRequest) {
-    if (msg.trackExtensions.length > 0) {
-      const fetchMsg = request.message
-      let fullTrackName =
-        fetchMsg.typeAndProps.type === FetchType.Standalone
-          ? fetchMsg.typeAndProps.props.fullTrackName
-          : (() => {
-              const joiningReq = client.requests.get(fetchMsg.typeAndProps.props.joiningRequestId)
-              return joiningReq instanceof SubscribeRequest ? joiningReq.fullTrackName : undefined
-            })()
-      if (fullTrackName !== undefined) {
-        const track = client.trackSources.get(fullTrackName.toString())
-        if (track !== undefined) {
-          track.trackExtensions = msg.trackExtensions
-        }
+    if (msg.trackProperties.length > 0) {
+      const track = client.trackSources.get(request.message.fullTrackName.toString())
+      if (track !== undefined) {
+        track.trackProperties = msg.trackProperties
       }
     }
     request.resolve(msg)
   } else {
     throw new ProtocolViolationError(
       'handlerFetchOk',
-      `No fetch request was found with the given request id: ${msg.requestId}`,
+      `FETCH_OK on a stream with no pending fetch request (request id ${requestId})`,
     )
   }
 }

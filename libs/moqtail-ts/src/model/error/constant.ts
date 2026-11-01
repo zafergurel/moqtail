@@ -24,7 +24,6 @@ export enum TerminationCode {
   INVALID_REQUEST_ID = 0x4,
   DUPLICATE_TRACK_ALIAS = 0x5,
   KEY_VALUE_FORMATTING_ERROR = 0x6,
-  TOO_MANY_REQUESTS = 0x7,
   INVALID_PATH = 0x8,
   MALFORMED_PATH = 0x9,
   GOAWAY_TIMEOUT = 0x10,
@@ -32,12 +31,12 @@ export enum TerminationCode {
   DATA_STREAM_TIMEOUT = 0x12,
   AUTH_TOKEN_CACHE_OVERFLOW = 0x13,
   DUPLICATE_AUTH_TOKEN_ALIAS = 0x14,
-  VERSION_NEGOTIATION_FAILED = 0x15,
   MALFORMED_AUTH_TOKEN = 0x16,
   UNKNOWN_AUTH_TOKEN_ALIAS = 0x17,
   EXPIRED_AUTH_TOKEN = 0x18,
   INVALID_AUTHORITY = 0x19,
   MALFORMED_AUTHORITY = 0x1a,
+  TOO_MANY_REQUEST_UPDATES = 0x1b,
 }
 
 export namespace TerminationCode {
@@ -63,8 +62,6 @@ export namespace TerminationCode {
         return TerminationCode.DUPLICATE_TRACK_ALIAS
       case TerminationCode.KEY_VALUE_FORMATTING_ERROR:
         return TerminationCode.KEY_VALUE_FORMATTING_ERROR
-      case TerminationCode.TOO_MANY_REQUESTS:
-        return TerminationCode.TOO_MANY_REQUESTS
       case TerminationCode.INVALID_PATH:
         return TerminationCode.INVALID_PATH
       case TerminationCode.MALFORMED_PATH:
@@ -79,10 +76,37 @@ export namespace TerminationCode {
         return TerminationCode.AUTH_TOKEN_CACHE_OVERFLOW
       case TerminationCode.DUPLICATE_AUTH_TOKEN_ALIAS:
         return TerminationCode.DUPLICATE_AUTH_TOKEN_ALIAS
-      case TerminationCode.VERSION_NEGOTIATION_FAILED:
-        return TerminationCode.VERSION_NEGOTIATION_FAILED
+      case TerminationCode.MALFORMED_AUTH_TOKEN:
+        return TerminationCode.MALFORMED_AUTH_TOKEN
+      case TerminationCode.UNKNOWN_AUTH_TOKEN_ALIAS:
+        return TerminationCode.UNKNOWN_AUTH_TOKEN_ALIAS
+      case TerminationCode.EXPIRED_AUTH_TOKEN:
+        return TerminationCode.EXPIRED_AUTH_TOKEN
+      case TerminationCode.INVALID_AUTHORITY:
+        return TerminationCode.INVALID_AUTHORITY
+      case TerminationCode.MALFORMED_AUTHORITY:
+        return TerminationCode.MALFORMED_AUTHORITY
+      case TerminationCode.TOO_MANY_REQUEST_UPDATES:
+        return TerminationCode.TOO_MANY_REQUEST_UPDATES
       default:
         throw new InvalidTypeError('TerminationCode.tryFrom', `Unknown termination code: ${code}`)
     }
   }
+}
+
+if (import.meta.vitest) {
+  const { describe, test, expect } = import.meta.vitest
+
+  describe('TerminationCode.tryFrom', () => {
+    test('round-trips every enum member', () => {
+      for (const [name, code] of Object.entries(TerminationCode)) {
+        if (typeof code !== 'number') continue
+        expect(TerminationCode.tryFrom(code), name).toBe(code)
+      }
+    })
+
+    test('throws on a code outside the enum', () => {
+      expect(() => TerminationCode.tryFrom(0x1c)).toThrow(InvalidTypeError)
+    })
+  })
 }

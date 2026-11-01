@@ -15,22 +15,50 @@
  */
 
 import { ControlMessage } from '../model/control/control_message'
+import { ControlMessageType } from '../model/control/constant'
 import { FrozenByteBuffer, ByteBuffer } from '../model/common/byte_buffer'
-import { NotEnoughBytesError, TerminationError } from '../model/error/error'
+import { NotEnoughBytesError, ProtocolViolationError, TerminationError } from '../model/error/error'
 import { TerminationCode } from '../model/error/constant'
+import { StreamResetCode } from '../model/error/stream_reset'
+import { asStreamResetError, streamResetReason } from './util/stream_reset'
 import { logger } from '../util/logger'
 
+/** Observers for the messages a request stream carries, for logging or debugging. */
+export type RequestStreamHooks = {
+  onMessageSent?: (msg: ControlMessage) => void
+  onMessageReceived?: (msg: ControlMessage) => void
+}
+
 /**
- * Wraps a WebTransport bidirectional stream for request-style MOQT streams
- * such as SUBSCRIBE_NAMESPACE.
+ * Wraps a WebTransport bidirectional stream carrying one MOQT request.
+ * Because a response is correlated by the stream it arrives on, nothing here needs a
+ * request id.
  */
 export class RequestStream {
   readonly stream: ReadableStream<ControlMessage>
+  /**
+   * The message this side opened the stream with, kept so the request can be re-issued
+   * on a fresh stream when the peer migrates it with a GOAWAY (§10.4). Undefined on a
+   * peer-opened stream, which is the peer's request to re-issue, not ours.
+   */
+  first?: ControlMessage
+  /**
+   * The type of the message that opened this stream, whichever side opened it. It is
+   * what the request on this stream *is*, which decides what may follow — a
+   * REQUEST_UPDATE is only valid for the types §10.9 lists.
+   */
+  openingType?: ControlMessageType
+  /** Set when the request this stream carried has been re-issued on a new stream. */
+  migrated = false
   readonly #reader: ReadableStreamDefaultReader<Uint8Array>
   readonly #writer: WritableStreamDefaultWriter<Uint8Array>
   #receiveBuffer: ByteBuffer
+  /** Held for the stream's lifetime once {@link next} is first called. */
+  #messageReader?: ReadableStreamDefaultReader<ControlMessage>
+  readonly #hooks: RequestStreamHooks
 
-  constructor(biStream: WebTransportBidirectionalStream) {
+  constructor(biStream: WebTransportBidirectionalStream, hooks: RequestStreamHooks = {}) {
+    this.#hooks = hooks
     this.#receiveBuffer = new ByteBuffer()
     this.#reader = biStream.readable.getReader()
     this.#writer = biStream.writable.getWriter()
@@ -41,12 +69,50 @@ export class RequestStream {
     logger.debug('request_stream', 'opened')
   }
 
+  /**
+   * Opens a new bidi stream and writes `first` on it.
+   *
+   * @throws :{@link ProtocolViolationError} If `first` is not one of the seven types
+   * Table 5 marks `First`; those are the only ones allowed to open a request stream.
+   */
+  static async open(
+    webTransport: WebTransport,
+    first: ControlMessage,
+    hooks: RequestStreamHooks = {},
+  ): Promise<RequestStream> {
+    if (!ControlMessageType.isFirst(first.getType()))
+      throw new ProtocolViolationError(
+        'RequestStream.open',
+        `${first.constructor.name} may not open a request stream: only First-marked types can`,
+      )
+    const biStream = await webTransport.createBidirectionalStream()
+    const requestStream = new RequestStream(biStream, hooks)
+    requestStream.first = first
+    requestStream.openingType = first.getType()
+    await requestStream.send(first)
+    return requestStream
+  }
+
+  /**
+   * Reads the next control message off this stream, or `undefined` once the peer has
+   * closed or reset it.
+   *
+   * Takes ownership of {@link RequestStream.stream}'s reader on first use, so callers
+   * must not mix `next()` with `stream.getReader()`.
+   */
+  async next(): Promise<ControlMessage | undefined> {
+    this.#messageReader ??= this.stream.getReader()
+    const { value, done } = await this.#messageReader.read()
+    return done ? undefined : value
+  }
+
   async send(message: ControlMessage): Promise<void> {
     try {
       const serialized = ControlMessage.serialize(message)
       await this.#writer.ready
       await this.#writer.write(serialized.toUint8Array())
       logger.debug('request_stream', `sent ${message.constructor.name}`)
+      this.#hooks.onMessageSent?.(message)
     } catch (error: any) {
       await this.close()
       const msg = error instanceof Error ? error.message : String(error)
@@ -58,6 +124,15 @@ export class RequestStream {
   async close(): Promise<void> {
     logger.debug('request_stream', 'closed')
     await Promise.allSettled([this.#writer.close().catch(() => {}), this.#reader.cancel().catch(() => {})])
+  }
+
+  /**
+   * Cancels the request by resetting its stream with `code`.
+   */
+  async reset(code: StreamResetCode): Promise<void> {
+    logger.debug('request_stream', `reset code=${code}`)
+    const reason = streamResetReason(code)
+    await Promise.allSettled([this.#writer.abort(reason).catch(() => {}), this.#reader.cancel(reason).catch(() => {})])
   }
 
   async #ingestLoop(controller: ReadableStreamDefaultController<ControlMessage>) {
@@ -82,6 +157,7 @@ export class RequestStream {
             this.#receiveBuffer.commit()
             const msg = ControlMessage.deserialize(new FrozenByteBuffer(messageBytes))
             controller.enqueue(msg)
+            this.#hooks.onMessageReceived?.(msg)
             continue
           }
           const readResult = await this.#reader.read()
@@ -107,7 +183,7 @@ export class RequestStream {
       }
     } catch (error) {
       logger.error('request_stream', 'ingest loop error', error)
-      controller.error(error)
+      controller.error(asStreamResetError('RequestStream', error))
       await this.close()
     } finally {
       controller.close()
@@ -121,4 +197,44 @@ export class RequestStream {
       this.#receiveBuffer.putBytes(readResult.value)
     }
   }
+}
+
+if (import.meta.vitest) {
+  const { describe, it, expect } = import.meta.vitest
+  const { RequestOk } = await import('../model/control/request_ok')
+
+  /** A bidi stream whose readable side yields `incoming` and whose writes are dropped. */
+  function fakeBiStream(incoming: Uint8Array[]): WebTransportBidirectionalStream {
+    return {
+      readable: new ReadableStream<Uint8Array>({
+        start(controller) {
+          incoming.forEach((chunk) => controller.enqueue(chunk))
+          controller.close()
+        },
+      }),
+      writable: {
+        getWriter: () => ({ ready: Promise.resolve(), write: async () => {}, close: async () => {} }),
+      },
+    } as unknown as WebTransportBidirectionalStream
+  }
+
+  describe('RequestStream hooks', () => {
+    it('reports each message it sends', async () => {
+      const sent: ControlMessage[] = []
+      const stream = new RequestStream(fakeBiStream([]), { onMessageSent: (m) => sent.push(m) })
+      const msg = new RequestOk()
+      await stream.send(msg)
+      expect(sent).toEqual([msg])
+    })
+
+    it('reports each message it receives', async () => {
+      const received: ControlMessage[] = []
+      const msg = new RequestOk()
+      const stream = new RequestStream(fakeBiStream([ControlMessage.serialize(msg).toUint8Array()]), {
+        onMessageReceived: (m) => received.push(m),
+      })
+      expect(await stream.next()).toEqual(msg)
+      expect(received).toEqual([msg])
+    })
+  })
 }

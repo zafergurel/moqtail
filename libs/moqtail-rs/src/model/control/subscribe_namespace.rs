@@ -18,7 +18,7 @@ use crate::model::common::tuple::Tuple;
 use crate::model::common::varint::{BufMutVarIntExt, BufVarIntExt};
 use crate::model::error::ParseError;
 use crate::model::parameter::message_parameter::{
-  MessageParameter, deserialize_message_parameters,
+  MessageParameter, deserialize_message_parameters, serialize_message_parameters,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -26,7 +26,6 @@ use bytes::{BufMut, Bytes, BytesMut};
 pub struct SubscribeNamespace {
   pub request_id: u64,
   pub track_namespace_prefix: Tuple,
-  pub subscribe_options: u64,
   pub parameters: Vec<MessageParameter>,
 }
 
@@ -34,13 +33,11 @@ impl SubscribeNamespace {
   pub fn new(
     request_id: u64,
     track_namespace_prefix: Tuple,
-    subscribe_options: u64,
     parameters: Vec<MessageParameter>,
   ) -> Self {
     Self {
       request_id,
       track_namespace_prefix,
-      subscribe_options,
       parameters,
     }
   }
@@ -54,12 +51,9 @@ impl ControlMessageTrait for SubscribeNamespace {
     let mut payload = BytesMut::new();
     payload.put_vi(self.request_id)?;
     payload.extend_from_slice(&self.track_namespace_prefix.serialize()?);
-    payload.put_vi(self.subscribe_options)?;
 
     payload.put_vi(self.parameters.len())?;
-    for param in &self.parameters {
-      payload.extend_from_slice(&param.serialize()?);
-    }
+    payload.extend_from_slice(&serialize_message_parameters(&self.parameters)?);
 
     let payload_len: u16 = payload
       .len()
@@ -76,19 +70,10 @@ impl ControlMessageTrait for SubscribeNamespace {
   }
 
   fn parse_payload(payload: &mut Bytes) -> Result<Box<Self>, ParseError> {
+    // The 0-32 field bound is a relay policy answered with NAMESPACE_TOO_LARGE, not
+    // a parse error, so it is enforced by the handler rather than here.
     let request_id = payload.get_vi()?;
     let track_namespace_prefix = Tuple::deserialize(payload)?;
-    if track_namespace_prefix.fields.len() > 32 {
-      return Err(ParseError::ProtocolViolation {
-        context: "SubscribeNamespace::parse_payload",
-        details: format!(
-          "Track namespace prefix has {} fields, maximum is 32",
-          track_namespace_prefix.fields.len()
-        ),
-      });
-    }
-    let subscribe_options = payload.get_vi()?;
-
     let param_count = payload.get_vi()?;
     let parameters =
       deserialize_message_parameters(payload, param_count, ControlMessageType::SubscribeNamespace)?;
@@ -96,7 +81,6 @@ impl ControlMessageTrait for SubscribeNamespace {
     Ok(Box::new(SubscribeNamespace {
       request_id,
       track_namespace_prefix,
-      subscribe_options,
       parameters,
     }))
   }
@@ -117,7 +101,6 @@ mod tests {
   fn test_roundtrip() {
     let request_id = 241421;
     let track_namespace_prefix = Tuple::from_utf8_path("pre/fix/me");
-    let subscribe_options = 0x02u64; // Both
     let parameters = vec![
       MessageParameter::new_authorization_token(AuthorizationToken::new_use_value(
         0,
@@ -128,7 +111,6 @@ mod tests {
     let subscribe_namespace = SubscribeNamespace {
       request_id,
       track_namespace_prefix,
-      subscribe_options,
       parameters,
     };
 
@@ -146,7 +128,6 @@ mod tests {
   fn test_excess_roundtrip() {
     let request_id = 241421;
     let track_namespace_prefix = Tuple::from_utf8_path("pre/fix/me");
-    let subscribe_options = 0x01u64; // NamespaceOnly
     let parameters = vec![
       MessageParameter::new_authorization_token(AuthorizationToken::new_use_value(
         0,
@@ -157,7 +138,6 @@ mod tests {
     let subscribe_namespace = SubscribeNamespace {
       request_id,
       track_namespace_prefix,
-      subscribe_options,
       parameters,
     };
 
@@ -181,7 +161,6 @@ mod tests {
   fn test_partial_message() {
     let request_id = 241421;
     let track_namespace_prefix = Tuple::from_utf8_path("pre/fix/me");
-    let subscribe_options = 0x00u64; // PublishOnly
     let parameters = vec![
       MessageParameter::new_authorization_token(AuthorizationToken::new_use_value(
         0,
@@ -192,7 +171,6 @@ mod tests {
     let subscribe_namespace = SubscribeNamespace {
       request_id,
       track_namespace_prefix,
-      subscribe_options,
       parameters,
     };
 

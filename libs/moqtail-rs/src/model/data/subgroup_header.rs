@@ -16,7 +16,7 @@ use crate::model::common::varint::{BufMutVarIntExt, BufVarIntExt};
 use crate::model::error::ParseError;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use super::constant::SubgroupHeaderType;
+use super::constant::{SubgroupHeaderType, SubgroupIdMode};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub struct SubgroupHeader {
@@ -34,15 +34,17 @@ impl SubgroupHeader {
     track_alias: u64,
     group_id: u64,
     publisher_priority: Option<u8>,
-    has_extensions: bool,
+    has_properties: bool,
     contains_end_of_group: bool,
+    first_object: bool,
   ) -> Self {
     let has_default_priority = publisher_priority.is_none();
     let header_type = SubgroupHeaderType::from_properties(
-      has_extensions,
-      0,
+      has_properties,
+      SubgroupIdMode::Zero,
       contains_end_of_group,
       has_default_priority,
+      first_object,
     );
 
     Self {
@@ -59,15 +61,17 @@ impl SubgroupHeader {
     track_alias: u64,
     group_id: u64,
     publisher_priority: Option<u8>,
-    has_extensions: bool,
+    has_properties: bool,
     contains_end_of_group: bool,
+    first_object: bool,
   ) -> Self {
     let has_default_priority = publisher_priority.is_none();
     let header_type = SubgroupHeaderType::from_properties(
-      has_extensions,
-      1,
+      has_properties,
+      SubgroupIdMode::FirstObjectId,
       contains_end_of_group,
       has_default_priority,
+      first_object,
     );
 
     Self {
@@ -85,15 +89,17 @@ impl SubgroupHeader {
     group_id: u64,
     subgroup_id: u64,
     publisher_priority: Option<u8>,
-    has_extensions: bool,
+    has_properties: bool,
     contains_end_of_group: bool,
+    first_object: bool,
   ) -> Self {
     let has_default_priority = publisher_priority.is_none();
     let header_type = SubgroupHeaderType::from_properties(
-      has_extensions,
-      2,
+      has_properties,
+      SubgroupIdMode::Explicit,
       contains_end_of_group,
       has_default_priority,
+      first_object,
     );
 
     Self {
@@ -102,6 +108,29 @@ impl SubgroupHeader {
       group_id,
       subgroup_id: Some(subgroup_id),
       publisher_priority,
+    }
+  }
+
+  /// The header for a stream carrying this subgroup from some object after its first,
+  /// e.g. a relay opening a downstream stream mid-subgroup. Such a stream cannot claim
+  /// FIRST_OBJECT, and a Subgroup ID taken from the first Object ID would be read from
+  /// the wrong object, so a resolved ID is stated explicitly instead. All other bits are
+  /// kept. A first-object-ID header whose ID is not yet resolved keeps its mode.
+  pub fn for_mid_subgroup_stream(&self) -> Self {
+    let header_type = self.header_type;
+    let subgroup_id_mode = match header_type.subgroup_id_mode() {
+      SubgroupIdMode::FirstObjectId if self.subgroup_id.is_some() => SubgroupIdMode::Explicit,
+      mode => mode,
+    };
+    Self {
+      header_type: SubgroupHeaderType::from_properties(
+        header_type.has_properties(),
+        subgroup_id_mode,
+        header_type.contains_end_of_group(),
+        header_type.has_default_priority(),
+        false,
+      ),
+      ..*self
     }
   }
 
@@ -195,7 +224,87 @@ impl SubgroupHeader {
 mod tests {
 
   use super::*;
+  use crate::model::data::constant::DEFAULT_PUBLISHER_PRIORITY;
   use bytes::Buf;
+
+  #[test]
+  fn first_object_bit_survives_a_header_round_trip() {
+    // A new subgroup: the publisher marks its first object with FIRST_OBJECT (0x40).
+    let new_subgroup =
+      SubgroupHeader::new_with_explicit_id(87, 9, 11, Some(255), true, false, true);
+    assert!(new_subgroup.header_type.is_first_object());
+    let mut buf = new_subgroup.serialize(None).unwrap();
+    let parsed = SubgroupHeader::deserialize(&mut buf).unwrap();
+    assert_eq!(parsed, new_subgroup);
+    assert!(parsed.header_type.is_first_object());
+
+    // A reopened subgroup: same header without the bit.
+    let reopened = SubgroupHeader::new_with_explicit_id(87, 9, 11, Some(255), true, false, false);
+    assert!(!reopened.header_type.is_first_object());
+    let mut buf = reopened.serialize(None).unwrap();
+    assert!(
+      !SubgroupHeader::deserialize(&mut buf)
+        .unwrap()
+        .header_type
+        .is_first_object()
+    );
+  }
+
+  #[test]
+  fn for_mid_subgroup_stream_clears_the_bit_in_each_mode() {
+    // (header, expected type after) for every SUBGROUP_ID_MODE, with all other bits set.
+    let cases = [
+      (
+        SubgroupHeader::new_fixed_zero_id(87, 9, None, true, true, true),
+        0x39,
+      ),
+      (
+        SubgroupHeader::new_with_explicit_id(87, 9, 11, None, true, true, true),
+        0x3D,
+      ),
+    ];
+    for (header, expected) in cases {
+      let mid = header.for_mid_subgroup_stream();
+      assert_eq!(mid.header_type.value(), expected);
+      assert_eq!(mid.subgroup_id, header.subgroup_id);
+      assert_eq!(mid.publisher_priority, header.publisher_priority);
+      let mut buf = mid.serialize(None).unwrap();
+      assert_eq!(SubgroupHeader::deserialize(&mut buf).unwrap(), mid);
+    }
+  }
+
+  #[test]
+  fn for_mid_subgroup_stream_states_a_resolved_first_object_id() {
+    // As the receiving side leaves it: mode first-object-ID, ID resolved from object 5.
+    let mut header = SubgroupHeader::new_first_object_id(87, 9, Some(7), true, true, true);
+    header.subgroup_id = Some(5);
+    assert_eq!(header.header_type.value(), 0x5B);
+
+    let mid = header.for_mid_subgroup_stream();
+    assert_eq!(mid.header_type.value(), 0x1D);
+    assert!(mid.header_type.has_explicit_subgroup_id());
+    assert!(!mid.header_type.is_first_object());
+    assert_eq!(mid.subgroup_id, Some(5));
+    assert_eq!(mid.publisher_priority, Some(7));
+    let mut buf = mid.serialize(Some(3)).unwrap();
+    let parsed = SubgroupHeader::deserialize(&mut buf).unwrap();
+    assert_eq!(parsed.subgroup_id, Some(5));
+    assert_eq!(parsed.track_alias, 3);
+    assert!(!buf.has_remaining());
+
+    // Default priority and no properties carry through the mode change too.
+    let mut header = SubgroupHeader::new_first_object_id(87, 9, None, false, false, false);
+    header.subgroup_id = Some(0);
+    assert_eq!(header.for_mid_subgroup_stream().header_type.value(), 0x34);
+  }
+
+  #[test]
+  fn for_mid_subgroup_stream_keeps_an_unresolved_first_object_id_mode() {
+    let header = SubgroupHeader::new_first_object_id(87, 9, Some(7), false, false, true);
+    let mid = header.for_mid_subgroup_stream();
+    assert_eq!(mid.header_type.value(), 0x12);
+    assert_eq!(mid.subgroup_id, None);
+  }
 
   #[test]
   fn test_roundtrip() {
@@ -434,13 +543,13 @@ mod tests {
         .contains_end_of_group()
     );
 
-    // Test has_extensions
-    assert!(SubgroupHeaderType::try_new(0x11).unwrap().has_extensions());
-    assert!(SubgroupHeaderType::try_new(0x13).unwrap().has_extensions());
-    assert!(SubgroupHeaderType::try_new(0x15).unwrap().has_extensions());
-    assert!(SubgroupHeaderType::try_new(0x19).unwrap().has_extensions());
-    assert!(SubgroupHeaderType::try_new(0x1B).unwrap().has_extensions());
-    assert!(SubgroupHeaderType::try_new(0x1D).unwrap().has_extensions());
+    // Test has_properties
+    assert!(SubgroupHeaderType::try_new(0x11).unwrap().has_properties());
+    assert!(SubgroupHeaderType::try_new(0x13).unwrap().has_properties());
+    assert!(SubgroupHeaderType::try_new(0x15).unwrap().has_properties());
+    assert!(SubgroupHeaderType::try_new(0x19).unwrap().has_properties());
+    assert!(SubgroupHeaderType::try_new(0x1B).unwrap().has_properties());
+    assert!(SubgroupHeaderType::try_new(0x1D).unwrap().has_properties());
   }
 
   #[test]
@@ -450,32 +559,56 @@ mod tests {
     let publisher_priority = Some(255);
 
     // Test new_fixed_zero_id
-    let header =
-      SubgroupHeader::new_fixed_zero_id(track_alias, group_id, publisher_priority, false, false);
+    let header = SubgroupHeader::new_fixed_zero_id(
+      track_alias,
+      group_id,
+      publisher_priority,
+      false,
+      false,
+      false,
+    );
     assert_eq!(
       header.header_type,
       SubgroupHeaderType::try_new(0x10).unwrap()
     );
     assert_eq!(header.subgroup_id, Some(0));
 
-    let header =
-      SubgroupHeader::new_fixed_zero_id(track_alias, group_id, publisher_priority, true, false);
+    let header = SubgroupHeader::new_fixed_zero_id(
+      track_alias,
+      group_id,
+      publisher_priority,
+      true,
+      false,
+      false,
+    );
     assert_eq!(
       header.header_type,
       SubgroupHeaderType::try_new(0x11).unwrap()
     );
     assert_eq!(header.subgroup_id, Some(0));
 
-    let header =
-      SubgroupHeader::new_fixed_zero_id(track_alias, group_id, publisher_priority, false, true);
+    let header = SubgroupHeader::new_fixed_zero_id(
+      track_alias,
+      group_id,
+      publisher_priority,
+      false,
+      true,
+      false,
+    );
     assert_eq!(
       header.header_type,
       SubgroupHeaderType::try_new(0x18).unwrap()
     );
     assert_eq!(header.subgroup_id, Some(0));
 
-    let header =
-      SubgroupHeader::new_fixed_zero_id(track_alias, group_id, publisher_priority, true, true);
+    let header = SubgroupHeader::new_fixed_zero_id(
+      track_alias,
+      group_id,
+      publisher_priority,
+      true,
+      true,
+      false,
+    );
     assert_eq!(
       header.header_type,
       SubgroupHeaderType::try_new(0x19).unwrap()
@@ -483,32 +616,56 @@ mod tests {
     assert_eq!(header.subgroup_id, Some(0));
 
     // Test new_first_object_id
-    let header =
-      SubgroupHeader::new_first_object_id(track_alias, group_id, publisher_priority, false, false);
+    let header = SubgroupHeader::new_first_object_id(
+      track_alias,
+      group_id,
+      publisher_priority,
+      false,
+      false,
+      false,
+    );
     assert_eq!(
       header.header_type,
       SubgroupHeaderType::try_new(0x12).unwrap()
     );
     assert_eq!(header.subgroup_id, None);
 
-    let header =
-      SubgroupHeader::new_first_object_id(track_alias, group_id, publisher_priority, true, false);
+    let header = SubgroupHeader::new_first_object_id(
+      track_alias,
+      group_id,
+      publisher_priority,
+      true,
+      false,
+      false,
+    );
     assert_eq!(
       header.header_type,
       SubgroupHeaderType::try_new(0x13).unwrap()
     );
     assert_eq!(header.subgroup_id, None);
 
-    let header =
-      SubgroupHeader::new_first_object_id(track_alias, group_id, publisher_priority, false, true);
+    let header = SubgroupHeader::new_first_object_id(
+      track_alias,
+      group_id,
+      publisher_priority,
+      false,
+      true,
+      false,
+    );
     assert_eq!(
       header.header_type,
       SubgroupHeaderType::try_new(0x1A).unwrap()
     );
     assert_eq!(header.subgroup_id, None);
 
-    let header =
-      SubgroupHeader::new_first_object_id(track_alias, group_id, publisher_priority, true, true);
+    let header = SubgroupHeader::new_first_object_id(
+      track_alias,
+      group_id,
+      publisher_priority,
+      true,
+      true,
+      false,
+    );
     assert_eq!(
       header.header_type,
       SubgroupHeaderType::try_new(0x1B).unwrap()
@@ -522,6 +679,7 @@ mod tests {
       group_id,
       subgroup_id,
       publisher_priority,
+      false,
       false,
       false,
     );
@@ -538,6 +696,7 @@ mod tests {
       publisher_priority,
       true,
       false,
+      false,
     );
     assert_eq!(
       header.header_type,
@@ -552,6 +711,7 @@ mod tests {
       publisher_priority,
       false,
       true,
+      false,
     );
     assert_eq!(
       header.header_type,
@@ -566,6 +726,7 @@ mod tests {
       publisher_priority,
       true,
       true,
+      false,
     );
     assert_eq!(
       header.header_type,
@@ -586,8 +747,14 @@ mod tests {
     let publisher_priority = Some(255);
 
     // Test a header type with fixed subgroup ID = 0
-    let header =
-      SubgroupHeader::new_fixed_zero_id(track_alias, group_id, publisher_priority, false, false);
+    let header = SubgroupHeader::new_fixed_zero_id(
+      track_alias,
+      group_id,
+      publisher_priority,
+      false,
+      false,
+      false,
+    );
     assert_eq!(
       header.header_type,
       SubgroupHeaderType::try_new(0x10).unwrap()
@@ -597,7 +764,7 @@ mod tests {
     // Create a subgroup object
     let subgroup_obj = SubgroupObject {
       object_id: 42,
-      extension_headers: None,
+      properties: None,
       payload: Some(Bytes::from_static(b"test payload")),
       object_status: None,
     };
@@ -609,6 +776,7 @@ mod tests {
       header.group_id,
       header.subgroup_id,
       header.publisher_priority,
+      DEFAULT_PUBLISHER_PRIORITY,
     )
     .unwrap();
 
@@ -626,6 +794,7 @@ mod tests {
       publisher_priority,
       true,
       false,
+      false,
     );
     assert_eq!(
       header.header_type,
@@ -636,7 +805,7 @@ mod tests {
     let object = Object::try_from_subgroup(
       SubgroupObject {
         object_id: 43,
-        extension_headers: None,
+        properties: None,
         payload: Some(Bytes::from_static(b"test payload 2")),
         object_status: None,
       },
@@ -644,6 +813,7 @@ mod tests {
       header.group_id,
       header.subgroup_id,
       header.publisher_priority,
+      DEFAULT_PUBLISHER_PRIORITY,
     )
     .unwrap();
 
@@ -651,8 +821,14 @@ mod tests {
     assert_eq!(object.subgroup_id, Some(123));
 
     // Test a header type where subgroup ID = first object ID
-    let header =
-      SubgroupHeader::new_first_object_id(track_alias, group_id, publisher_priority, false, true);
+    let header = SubgroupHeader::new_first_object_id(
+      track_alias,
+      group_id,
+      publisher_priority,
+      false,
+      true,
+      false,
+    );
     assert_eq!(
       header.header_type,
       SubgroupHeaderType::try_new(0x1A).unwrap()
@@ -662,7 +838,7 @@ mod tests {
     let object = Object::try_from_subgroup(
       SubgroupObject {
         object_id: 55,
-        extension_headers: None,
+        properties: None,
         payload: Some(Bytes::from_static(b"test payload 3")),
         object_status: None,
       },
@@ -670,6 +846,7 @@ mod tests {
       header.group_id,
       header.subgroup_id, // This should be None, meaning subgroup_id = first object ID
       header.publisher_priority,
+      DEFAULT_PUBLISHER_PRIORITY,
     )
     .unwrap();
 

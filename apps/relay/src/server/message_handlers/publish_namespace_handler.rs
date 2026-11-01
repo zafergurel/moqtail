@@ -14,45 +14,114 @@
 
 use crate::server::client::MOQTClient;
 use crate::server::session_context::{PendingRequest, SessionContext};
+use crate::server::track_manager::SubscribeKind;
 use core::result::Result;
+use moqtail::model::common::reason_phrase::ReasonPhrase;
+use moqtail::model::common::tuple::Tuple;
 use moqtail::model::control::namespace::Namespace;
+use moqtail::model::control::namespace_done::NamespaceDone;
+use moqtail::model::control::request_error::RequestError;
 use moqtail::model::control::{control_message::ControlMessage, request_ok::RequestOk};
-use moqtail::model::error::TerminationCode;
+use moqtail::model::error::{RequestErrorCode, StreamResetCode, TerminationCode};
 use moqtail::model::parameter::message_parameter::apply_message_parameter_update;
 use moqtail::transport::control_stream_handler::ControlStreamHandler;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
+
+/// Sends one message per matching discovery subscriber, naming the namespace by the
+/// suffix that subscriber's own prefix leaves. The announcer is skipped so it is never
+/// told about its own namespace.
+pub(crate) async fn announce_to_namespace_subscribers(
+  context: &Arc<SessionContext>,
+  namespace: &Tuple,
+  announcer_connection_id: usize,
+  message_for: impl Fn(Tuple) -> ControlMessage,
+) {
+  let subs_map = context.track_manager.namespace_subscribers.read().await;
+  for (prefix, subscribers) in subs_map.iter() {
+    if !namespace.starts_with(prefix) {
+      continue;
+    }
+    let Some(suffix) = namespace.suffix(prefix) else {
+      continue;
+    };
+    for (sub, kind, _params, namespace_tx) in subscribers {
+      if *kind != SubscribeKind::Namespace || sub.connection_id == announcer_connection_id {
+        continue;
+      }
+      info!(
+        "Forwarding namespace suffix {:?} to subscriber {}",
+        suffix, sub.connection_id
+      );
+      let _ = namespace_tx.send(message_for(suffix.clone()));
+    }
+  }
+}
+
+/// A namespace is announced for as long as its request stream is open, so closing that
+/// stream withdraws it. Everything that named the publisher for this namespace is
+/// dropped, and the subscribers that heard the announcement are told it is over.
+pub async fn cancel(client: Arc<MOQTClient>, request_id: u64, context: &Arc<SessionContext>) {
+  let namespace = {
+    let mut map = client.inbound_requests.write().await;
+    match map.remove(&request_id) {
+      Some(PendingRequest::PublishNamespace { message, .. }) => Some(message.track_namespace),
+      _ => None,
+    }
+  };
+  let Some(namespace) = namespace else {
+    return;
+  };
+
+  client.remove_announced_track_namespace(&namespace).await;
+
+  // A publisher whose announcement was already replaced by another's has nothing to
+  // withdraw, and must not send a NAMESPACE_DONE for a namespace that is still served.
+  if !context
+    .track_manager
+    .remove_announcement(&namespace, client.connection_id)
+    .await
+  {
+    return;
+  }
+
+  announce_to_namespace_subscribers(context, &namespace, client.connection_id, |s| {
+    ControlMessage::NamespaceDone(Box::new(NamespaceDone::new(s)))
+  })
+  .await;
+}
 
 pub async fn handle(
   client: Arc<MOQTClient>,
-  control_stream_handler: &mut ControlStreamHandler,
+  stream_handler: &mut ControlStreamHandler,
   msg: ControlMessage,
   context: Arc<SessionContext>,
+  opening_request_id: Option<u64>,
 ) -> Result<(), TerminationCode> {
   match msg {
     ControlMessage::PublishNamespace(m) => {
       // TODO: the namespace is already announced, return error
       info!("received PublishNamespace message");
-      let request_id = m.request_id;
 
-      // check request id
-      {
-        let max_request_id = context
-          .max_request_id
-          .load(std::sync::atomic::Ordering::Relaxed);
-        if request_id >= max_request_id {
-          warn!(
-            "request id ({}) is greater than max request id ({})",
-            request_id, max_request_id
-          );
-          return Err(TerminationCode::TooManyRequests);
-        }
+      // Namespaces MUST NOT be published under a reserved namespace.
+      if m.track_namespace.is_reserved_dot() || m.track_namespace.is_session_namespace() {
+        info!("Rejecting PUBLISH_NAMESPACE for reserved namespace");
+        let err = RequestError::new(
+          RequestErrorCode::DoesNotExist,
+          0,
+          ReasonPhrase::try_new("reserved namespace cannot be published".to_string()).unwrap(),
+        );
+        stream_handler
+          .send(&ControlMessage::RequestError(Box::new(err)))
+          .await?;
+        return Ok(());
       }
 
       // this is a publisher, add it to the client manager
       client
         .add_announced_track_namespace(m.track_namespace.clone())
         .await;
+      context.client_manager.publishers_changed();
 
       // save the namespace among announcements
       // so we can forward it to clients who later come in with subscribe_namespace
@@ -61,8 +130,10 @@ pub async fn handle(
         .add_announcement(m.track_namespace.clone(), client.clone(), (*m).clone())
         .await;
 
+      // Track in inbound_requests so a REQUEST_UPDATE on this request's stream can find it,
+      // and so closing that stream can find the namespace to withdraw.
       {
-        let mut map = context.relay_pending_requests.write().await;
+        let mut map = client.inbound_requests.write().await;
         map.insert(
           m.request_id,
           PendingRequest::PublishNamespace {
@@ -72,82 +143,25 @@ pub async fn handle(
           },
         );
       }
-      // TODO: Remove this request_id from relay_pending_requests when a PUBLISH_NAMESPACE_DONE
-      // is received for this namespace, or if the client disconnects. Until then this is a memory leak.
 
-      // Forward the announcement to namespace subscribers via their bi-stream channels
-      {
-        let subs_map = context.track_manager.namespace_subscribers.read().await;
-        for (prefix, subscribers) in subs_map.iter() {
-          if m.track_namespace.starts_with(prefix) {
-            for (sub, _subscribe_ns_message, namespace_tx) in subscribers {
-              // Don't echo back to announcer
-              if sub.connection_id == client.connection_id {
-                continue;
-              }
+      announce_to_namespace_subscribers(&context, &m.track_namespace, client.connection_id, |s| {
+        ControlMessage::Namespace(Box::new(Namespace::new(s)))
+      })
+      .await;
 
-              if let Some(suffix) = m.track_namespace.suffix(prefix) {
-                info!(
-                  "Forwarding NAMESPACE suffix {:?} to subscriber {}",
-                  suffix, sub.connection_id
-                );
-                let ns_msg = ControlMessage::Namespace(Box::new(Namespace::new(suffix)));
-                let _ = namespace_tx.send(ns_msg);
-              }
-            }
-          }
-        }
-      }
+      let request_ok = Box::new(RequestOk::new(vec![]));
 
-      let request_ok = Box::new(RequestOk::new(
-        m.request_id,
-        vec![], // No parameters needed for a basic namespace OK
-      ));
-
-      control_stream_handler
+      stream_handler
         .send(&ControlMessage::RequestOk(request_ok))
         .await
     }
 
-    ControlMessage::RequestOk(m) => {
-      let msg = *m;
-
-      let mapping = {
-        let mut map = context.relay_pending_requests.write().await;
-        match map.remove(&msg.request_id) {
-          Some(PendingRequest::PublishNamespace {
-            client_connection_id,
-            ..
-          }) => Some(client_connection_id),
-          Some(_) => {
-            warn!(
-              "Mismatched request type for RequestOk (PublishNamespace): {}",
-              msg.request_id
-            );
-            None
-          }
-          None => None,
-        }
-      };
-
-      if let Some(client_connection_id) = mapping {
-        debug!(
-          "Received acknowledgment (RequestOk) from subscriber {} for PublishNamespace broadcast",
-          client_connection_id
-        );
-      } else {
-        debug!(
-          "PublishNamespace handler received RequestOk for untracked ID: {}",
-          msg.request_id
-        );
-      }
-      Ok(())
-    }
-
     ControlMessage::RequestUpdate(m) => {
       let update_msg = *m;
-      let existing_req_id = update_msg.existing_request_id;
-      let update_req_id = update_msg.request_id;
+      let Some(target_request_id) = opening_request_id else {
+        return Err(TerminationCode::ProtocolViolation);
+      };
+      let existing_req_id = target_request_id;
 
       let target_namespace = {
         let mut map = client.inbound_requests.write().await;
@@ -158,10 +172,11 @@ pub async fn handle(
           }
           _ => {
             warn!(
-              "Request {} is not a valid PublishNamespace request",
+              "REQUEST_UPDATE for PUBLISH_NAMESPACE request {} cannot be applied; closing the stream",
               existing_req_id
             );
-            return Err(TerminationCode::ProtocolViolation);
+            stream_handler.reset(StreamResetCode::Cancelled.to_u64());
+            return Ok(());
           }
         }
       };
@@ -178,10 +193,10 @@ pub async fn handle(
 
       let downstream_sessions = context
         .track_manager
-        .get_namespace_subscribers(&target_namespace)
+        .get_namespace_subscribers(&target_namespace, SubscribeKind::Namespace)
         .await;
 
-      for session in downstream_sessions {
+      for (session, _) in downstream_sessions {
         if let Some(downstream_req_id) = session.get_outbound_announce_id(&target_namespace).await {
           let relay_update_id = crate::server::session::Session::get_next_relay_request_id(
             context.relay_next_request_id.clone(),
@@ -190,24 +205,16 @@ pub async fn handle(
 
           let fanout_msg = moqtail::model::control::request_update::RequestUpdate::new(
             relay_update_id,
-            downstream_req_id,
             update_msg.parameters.clone(),
           );
 
-          {
-            let mut map = context.relay_pending_requests.write().await;
-            map.insert(
-              relay_update_id,
-              PendingRequest::RequestUpdate {
-                client_connection_id: session.connection_id,
-                original_request_id: relay_update_id,
-                message: fanout_msg.clone(),
-              },
-            );
-          }
-
+          // Goes on the namespace subscription's own request stream, which is
+          // what names the request being updated.
           session
-            .queue_message(ControlMessage::RequestUpdate(Box::new(fanout_msg)))
+            .send_response(
+              downstream_req_id,
+              ControlMessage::RequestUpdate(Box::new(fanout_msg)),
+            )
             .await;
         } else {
           warn!(
@@ -217,8 +224,8 @@ pub async fn handle(
         }
       }
 
-      let ok_msg = RequestOk::new(update_req_id, vec![]);
-      control_stream_handler
+      let ok_msg = RequestOk::new(vec![]);
+      stream_handler
         .send(&ControlMessage::RequestOk(Box::new(ok_msg)))
         .await?;
 

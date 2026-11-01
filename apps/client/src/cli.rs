@@ -12,9 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::filter_spec::{
+  FetchMarkerSpec, ObjectPropertySpec, parse_fetch_end_of_range, parse_location,
+  parse_object_property, parse_range_filter, parse_track_property,
+};
 use crate::switcher::SwitchMethod;
 use clap::{Parser, ValueEnum};
-use moqtail::model::control::constant::GroupOrder;
+use moqtail::model::common::location::Location;
+use moqtail::model::control::constant::{GroupOrder, SwitchMode};
+use moqtail::model::parameter::message_parameter::MessageParameter;
+use moqtail::model::property::track_property::TrackProperty;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliGroupOrder {
@@ -33,6 +40,50 @@ impl From<CliGroupOrder> for GroupOrder {
   }
 }
 
+/// Which Location Filter a subscribe uses.
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+pub enum CliFilter {
+  /// No filter: every Object
+  None,
+  /// From --filter-start-group groups before the next group (0 = the next group, 1 = the current one)
+  RelativeStart,
+  /// From --filter-start-group/--filter-start-object
+  AbsoluteStart,
+  /// As above, ending with group Start Group plus --end-group-delta
+  AbsoluteStartGroupEnd,
+  /// As above, ending with Object --filter-end-object of that group
+  AbsoluteRange,
+  /// Objects published from now on
+  NextObject,
+}
+
+/// How a switch stops the subscription it suspends.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliSwitchMode {
+  /// Stop it at the cutover: Forward State 0 and its streams reset
+  Hard,
+  /// Let it drain to the group before the new subscription's Start Group
+  Soft,
+}
+
+impl From<CliSwitchMode> for SwitchMode {
+  fn from(mode: CliSwitchMode) -> Self {
+    match mode {
+      CliSwitchMode::Hard => SwitchMode::Hard,
+      CliSwitchMode::Soft => SwitchMode::Soft,
+    }
+  }
+}
+
+/// Which of the two prefix subscriptions a request is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PrefixKind {
+  /// Namespace discovery: NAMESPACE and NAMESPACE_DONE come back on the stream
+  Namespace,
+  /// Track delivery: a PUBLISH per matching track comes back on its own stream
+  Tracks,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum DeliveryMode {
   /// Send/receive objects via unidirectional streams with subgroup headers
@@ -43,12 +94,10 @@ pub enum DeliveryMode {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliSwitchMethod {
-  /// SWITCH message (1 control message)
+  /// SUBSCRIBE carrying SWITCH_FROM (1 control message; see --switch-mode)
   Switch,
   /// Pre-subscribe B; enable B at timer fire, tear down A on first live B group boundary (3 control messages)
   SubUpdateForward,
-  /// Joining Fetch warm-up then stop A on first live B group boundary (4–5 control messages)
-  JoiningFetch,
 }
 
 impl From<CliSwitchMethod> for SwitchMethod {
@@ -56,9 +105,16 @@ impl From<CliSwitchMethod> for SwitchMethod {
     match m {
       CliSwitchMethod::Switch => SwitchMethod::Switch,
       CliSwitchMethod::SubUpdateForward => SwitchMethod::SubUpdateForward,
-      CliSwitchMethod::JoiningFetch => SwitchMethod::JoiningFetch,
     }
   }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum Transport {
+  /// WebTransport over HTTP/3 (derives an https:// URI from the moqt:// URL)
+  WebTransport,
+  /// Native QUIC (carries authority/path in Setup Options)
+  Quic,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -71,6 +127,10 @@ pub enum Command {
   PublishMulti,
   /// Subscribe to a track and receive objects
   Subscribe,
+  /// Discover the namespaces under a prefix (SUBSCRIBE_NAMESPACE)
+  SubscribeNamespace,
+  /// Subscribe to all tracks under a namespace prefix (SUBSCRIBE_TRACKS)
+  SubscribeTracks,
   /// Fetch specific object ranges from a track
   Fetch,
   /// Run a track-switching experiment and emit JSON stats
@@ -85,13 +145,18 @@ pub enum Command {
   about = "MOQtail test client"
 )]
 pub struct Cli {
-  /// Command to run
+  /// Command to run (publish, publish-namespace, subscribe, subscribe-namespace,
+  /// subscribe-tracks, or fetch)
   #[arg(long, short, value_enum)]
   pub command: Command,
 
-  /// Server address
-  #[arg(long, short, default_value = "https://127.0.0.1:4433")]
+  /// Server address (moqt:// URI, e.g. moqt://127.0.0.1:4433/path#type:value)
+  #[arg(long, short, default_value = "moqt://127.0.0.1:4433")]
   pub server: String,
+
+  /// Transport to establish the moqt:// session over
+  #[arg(long, value_enum, default_value = "web-transport")]
+  pub transport: Transport,
 
   /// Track namespace
   #[arg(long, short, default_value = "moqtail")]
@@ -113,6 +178,12 @@ pub struct Cli {
   #[arg(long, default_value_t = 1000)]
   pub group_count: u64,
 
+  /// How many of the first groups are published before the session starts (publish and
+  /// publish-namespace). They are served to a FETCH at once, and live delivery starts
+  /// after them. Capped at --group-count.
+  #[arg(long, default_value_t = 0)]
+  pub pre_published_groups: u64,
+
   /// Interval between objects in milliseconds (publish / publish-multi only)
   #[arg(long, short, default_value_t = 40)]
   pub interval: u64,
@@ -121,15 +192,98 @@ pub struct Cli {
   #[arg(long, default_value_t = 25)]
   pub objects_per_group: u64,
 
-  /// Payload size in bytes (publish only — ignored for publish-multi)
+  /// Stride between object IDs within a group (publish only). >1 leaves gaps in
+  /// the object IDs (e.g. 2 emits 0, 2, 4) and sets the Prior Object ID Gap
+  /// property so gaps are communicated explicitly.
+  #[arg(long, default_value_t = 1)]
+  pub object_id_step: u64,
+
+  /// Stride between group IDs (publish only). >1 leaves gaps in the group IDs
+  /// (e.g. 2 emits 0, 2, 4) and sets the Prior Group ID Gap property
+  /// so gaps are communicated explicitly.
+  #[arg(long, default_value_t = 1)]
+  pub group_id_step: u64,
+
+  /// Payload size in bytes (publish only)
   #[arg(long, default_value_t = 1200)]
   pub payload_size: usize,
+
+  /// Subgroups each group is split into, Object i going to subgroup i mod N, each
+  /// on its own stream (publish only)
+  #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+  pub subgroups_per_group: u64,
+
+  /// Publisher priority of each subgroup in turn, cycling: 0,64,128 gives subgroup 0
+  /// priority 0, subgroup 1 priority 64 and so on; a datagram takes the one for the
+  /// subgroup it would have gone to (publish only; default --publisher-priority)
+  #[arg(long, value_delimiter = ',')]
+  pub priorities: Vec<u8>,
+
+  /// An Object Property to set on every Object, as TYPE=SOURCE; repeatable (publish
+  /// only). TYPE is even; SOURCE is group, object, subgroup, mod:M (the Object ID
+  /// modulo M) or a number. Example: 0x3c=mod:3
+  #[arg(long, value_parser = parse_object_property)]
+  pub object_property: Vec<ObjectPropertySpec>,
+
+  /// A Track Property to advertise in PUBLISH, SUBSCRIBE_OK and FETCH_OK, as
+  /// TYPE=VALUE with TYPE even; repeatable (publish only). Example: 0x3c=1
+  #[arg(long, value_parser = parse_track_property)]
+  pub track_property: Vec<TrackProperty>,
+
+  /// Reset the stream an Object would go on when the publisher reaches it, as G.O,
+  /// so that Object and the rest of its subgroup never arrive live; repeatable
+  /// (publish and publish-namespace). A FETCH still serves them.
+  #[arg(long, value_parser = parse_location)]
+  pub reset_stream_at: Vec<Location>,
+
+  /// Do not send the datagram for this Object, as G.O; repeatable (publish and
+  /// publish-namespace). A FETCH still serves it.
+  #[arg(long, value_parser = parse_location)]
+  pub drop_datagram: Vec<Location>,
+
+  /// Leave out the Prior Group and Object ID Gap properties, so the gaps that
+  /// --group-id-step and --object-id-step leave are not signalled (publish and
+  /// publish-namespace).
+  #[arg(long, default_value_t = false)]
+  pub no_gap_properties: bool,
+
+  /// Send an End of Group object after each group's last Object (publish and
+  /// publish-namespace).
+  #[arg(long, default_value_t = false)]
+  pub end_of_group_objects: bool,
+
+  /// Send an End of Track object after the last group (publish and
+  /// publish-namespace). It ends that group too, so it takes the place of the
+  /// group's End of Group object.
+  #[arg(long, default_value_t = false)]
+  pub end_of_track_object: bool,
+
+  /// Reset each FETCH response's stream after this many Objects, cutting the response
+  /// short. The Objects already written are given a moment to leave first (publish and
+  /// publish-namespace; 0 = never).
+  #[arg(long, default_value_t = 0)]
+  pub fetch_reset_after: u64,
+
+  /// A span of Objects that the publisher's FETCH responses replace with an End of
+  /// Range marker, as KIND:G.O-G.O with KIND non-existent, unknown or timed-out;
+  /// repeatable (publish and publish-namespace). The Objects after a marker are encoded
+  /// against it. In a descending FETCH, keep a span within one group. Example:
+  /// unknown:2.1-2.2
+  #[arg(long, value_parser = parse_fetch_end_of_range)]
+  pub fetch_end_of_range: Vec<FetchMarkerSpec>,
 
   /// Track alias (publish only, random if not specified)
   #[arg(long)]
   pub track_alias: Option<u64>,
 
-  /// Duration to listen in seconds, 0 = indefinite (subscribe only)
+  /// Seconds after announcing to withdraw the namespace, by resetting its request
+  /// stream while the session stays open (publish-namespace only, 0 = never).
+  #[arg(long, default_value_t = 0)]
+  pub withdraw_after: u64,
+
+  /// Duration to listen in seconds, 0 = indefinite (subscribe and the prefix
+  /// subscriptions). A prefix subscription cancels itself when it elapses, by
+  /// resetting its request stream while the session stays open.
   #[arg(long, short, default_value_t = 0)]
   pub duration: u64,
 
@@ -145,7 +299,7 @@ pub struct Cli {
   #[arg(long, default_value_t = 5)]
   pub end_group: u64,
 
-  /// End object ID (fetch only)
+  /// Last object ID of the end group, inclusive (fetch only)
   #[arg(long, default_value_t = 3)]
   pub end_object: u64,
 
@@ -161,7 +315,7 @@ pub struct Cli {
   #[arg(long, default_value_t = 128)]
   pub publisher_priority: u8,
 
-  /// Group order for the track
+  /// Group order for the track (subscribe and fetch)
   #[arg(long, value_enum, default_value = "ascending")]
   pub group_order: CliGroupOrder,
 
@@ -205,7 +359,7 @@ pub struct Cli {
 
   /// Milliseconds to receive each track before triggering the next switch
   #[arg(long, default_value_t = 15000)]
-  pub switch_after: u64,
+  pub switch_after_ms: u64,
 
   /// Bandwidth cap in bps recorded in the output JSON (0 = no limit)
   #[arg(long, default_value_t = 0)]
@@ -219,4 +373,122 @@ pub struct Cli {
   /// their expected playout time are dropped, causing a stall of at least one GoP.
   #[arg(long, default_value_t = 0)]
   pub jitter_buffer_ms: u64,
+
+  /// Subscription Forward State (subscribe, and each track subscribe-tracks brings).
+  #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+  pub forward: bool,
+
+  /// Whether the response should carry Track Properties; false sends
+  /// INCLUDE_PROPERTIES=0 (subscribe, subscribe-tracks and fetch)
+  #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+  pub include_properties: bool,
+
+  /// Milliseconds the relay may wait for a publisher to appear; 0 sends none (subscribe only)
+  #[arg(long, default_value_t = 0)]
+  pub rendezvous_timeout: u64,
+
+  /// Refuse every pushed PUBLISH with UNINTERESTED (subscribe-tracks only)
+  #[arg(long, default_value_t = false)]
+  pub refuse_publish: bool,
+
+  /// Location Filter to subscribe with (subscribe: defaults to next-object;
+  /// subscribe-tracks: sent only when given, as where each pushed track starts)
+  #[arg(long, value_enum)]
+  pub filter: Option<CliFilter>,
+
+  /// Start group for the absolute filters, or groups back from the next group for
+  /// --filter relative-start (subscribe and subscribe-tracks)
+  #[arg(long, default_value_t = 0)]
+  pub filter_start_group: u64,
+
+  /// Start object for the absolute filters (subscribe and subscribe-tracks)
+  #[arg(long, default_value_t = 0)]
+  pub filter_start_object: u64,
+
+  /// Groups after the Start Group that the absolute filters with an end end at
+  #[arg(long, default_value_t = 0)]
+  pub end_group_delta: u64,
+
+  /// Last Object of the End Group for --filter absolute-range
+  #[arg(long, default_value_t = 0)]
+  pub filter_end_object: u64,
+
+  /// Also retrieve what is already published over --filter's range, on a fill
+  /// fetch stream (subscribe, and each track subscribe-tracks brings)
+  #[arg(long, default_value_t = false)]
+  pub fill: bool,
+
+  /// Fill from this many groups before the next group instead of over --filter's
+  /// range (1 = the current group); implies --fill (subscribe and subscribe-tracks)
+  #[arg(long)]
+  pub fill_start_group: Option<u64>,
+
+  /// Seconds after subscribing to switch to --switch-track (subscribe only, 0 = never)
+  #[arg(long, default_value_t = 0)]
+  pub switch_after: u64,
+
+  /// Track to switch to with SWITCH_FROM (subscribe + --switch-after only)
+  #[arg(long)]
+  pub switch_track: Option<String>,
+
+  /// How the switch stops the subscription it suspends
+  #[arg(long, value_enum, default_value = "hard")]
+  pub switch_mode: CliSwitchMode,
+
+  /// Whether the switch asks for PUBLISH_DONE on the suspended subscription
+  #[arg(long, default_value_t = false)]
+  pub switch_publish_done: bool,
+
+  /// Start group the switch asks to begin at, to switch at a future group
+  /// boundary rather than at the next one (0 = subscribe with --filter instead)
+  #[arg(long, default_value_t = 0)]
+  pub switch_start_group: u64,
+
+  /// A Range Filter to request with; repeatable (subscribe, fetch and
+  /// subscribe-tracks). Every object received is checked against the filters, and
+  /// one that does not pass is reported as a filter violation.
+  ///
+  /// KIND:SET[:PROPERTY]:RANGES, or KIND:clear. KIND is subgroup, object, priority,
+  /// object-property or track-property; SET is the SetID (0-255); PROPERTY is the
+  /// Property Type, for the two property kinds only; RANGES is a comma-separated
+  /// list of A-B, A- (open-ended, last only) or A, in decimal or 0x hex. Examples:
+  /// object:0:0-2,5-  object-property:1:0x3c:10-20  priority:clear
+  #[arg(long, value_parser = parse_range_filter)]
+  pub range_filter: Vec<MessageParameter>,
+
+  /// A Range Filter for the fill fetch stream, inside FILL_PARAMETERS; repeatable.
+  /// Implies --fill (subscribe and subscribe-tracks)
+  #[arg(long, value_parser = parse_range_filter)]
+  pub fill_range_filter: Vec<MessageParameter>,
+
+  /// Seconds after subscribing to send a REQUEST_UPDATE carrying
+  /// --update-range-filter (subscribe only, 0 = never)
+  #[arg(long, default_value_t = 0)]
+  pub update_filters_after: u64,
+
+  /// A Range Filter for that REQUEST_UPDATE; repeatable. KIND:clear removes a kind
+  /// (subscribe only)
+  #[arg(long, value_parser = parse_range_filter)]
+  pub update_range_filter: Vec<MessageParameter>,
+
+  /// Send Range Filters even past the server's MAX_FILTER_RANGES (0 when it sent
+  /// none), to test that the server refuses them. Without this the client refuses
+  /// to send them.
+  #[arg(long, default_value_t = false)]
+  pub ignore_filter_limit: bool,
+
+  /// Seconds after subscribing to send a REQUEST_UPDATE setting Forward State 1
+  /// (subscribe only, 0 = never). Use with --forward false to test that delivery
+  /// resumes after Forward flips 0->1.
+  #[arg(long, default_value_t = 0)]
+  pub update_forward_after: u64,
+
+  /// Once the prefix subscription is live, issue a second one of this kind on the
+  /// same prefix and the same session, and log what comes back (subscribe-namespace
+  /// and subscribe-tracks only). Overlap is judged per session, so this is what
+  /// shows whether two prefix subscriptions are allowed to share a prefix: the two
+  /// kinds keep separate spaces and both succeed, while a second of the same kind
+  /// is refused with PREFIX_OVERLAP.
+  #[arg(long, value_enum)]
+  pub overlap: Option<PrefixKind>,
 }

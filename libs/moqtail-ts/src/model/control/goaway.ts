@@ -16,20 +16,34 @@
 
 import { BaseByteBuffer, ByteBuffer, FrozenByteBuffer } from '../common/byte_buffer'
 import { ControlMessageType } from './constant'
-import { InvalidUTF8Error, LengthExceedsMaxError, NotEnoughBytesError } from '../error/error'
+import { InvalidUTF8Error, LengthExceedsMaxError, NotEnoughBytesError, ProtocolViolationError } from '../error/error'
 
+/** §10.4: a longer New Session URI is a protocol violation. */
+export const MAX_NEW_SESSION_URI_LENGTH = 8192
+
+/**
+ * GOAWAY (0x10) winds down a session, or — on a request stream — migrates that one
+ * request.
+ */
 export class GoAway {
   newSessionUri?: string | undefined
+  /**
+   * Milliseconds the sender waits for graceful closure; 0 means no specific timeout.
+   * On the control stream the sender closes the session with `GOAWAY_TIMEOUT` after it,
+   * on a request stream it resets the stream with `GOING_AWAY`.
+   */
+  readonly timeout: bigint
 
-  constructor(newSessionUri?: string) {
+  constructor(newSessionUri?: string, timeout: bigint = 0n) {
     if (newSessionUri && newSessionUri.length === 0) {
       this.newSessionUri = undefined
     } else {
       this.newSessionUri = newSessionUri
     }
+    this.timeout = timeout
   }
 
-  static getType(): ControlMessageType {
+  getType(): ControlMessageType {
     return ControlMessageType.GoAway
   }
 
@@ -52,6 +66,8 @@ export class GoAway {
     } else {
       payload.putVI(0)
     }
+    payload.putVI(this.timeout)
+
     const payloadBytes = payload.toUint8Array()
     if (payloadBytes.length > 0xffff) {
       throw new LengthExceedsMaxError('GoAway::serialize(payloadBytes.length)', 0xffff, payloadBytes.length)
@@ -63,26 +79,32 @@ export class GoAway {
 
   static parsePayload(buf: BaseByteBuffer): GoAway {
     const uriLength = buf.getNumberVI()
-    if (uriLength === 0) {
-      return new GoAway(undefined)
-    }
-    if (buf.remaining < uriLength) {
-      throw new NotEnoughBytesError('GoAway::parsePayload(uriLength)', uriLength, buf.remaining)
-    }
-    const uriBytes = buf.getBytes(uriLength)
-
-    let newSessionUri: string
-    try {
-      const decoder = new TextDecoder()
-      newSessionUri = decoder.decode(uriBytes)
-    } catch (error: unknown) {
-      throw new InvalidUTF8Error(
-        'GoAway::parsePayload(newSessionUri)',
-        error instanceof Error ? error.message : String(error),
+    if (uriLength > MAX_NEW_SESSION_URI_LENGTH) {
+      throw new ProtocolViolationError(
+        'GoAway::parsePayload(uriLength)',
+        `New Session URI length ${uriLength} exceeds ${MAX_NEW_SESSION_URI_LENGTH}`,
       )
     }
+    let newSessionUri: string | undefined
+    if (uriLength > 0) {
+      if (buf.remaining < uriLength) {
+        throw new NotEnoughBytesError('GoAway::parsePayload(uriLength)', uriLength, buf.remaining)
+      }
+      const uriBytes = buf.getBytes(uriLength)
+      try {
+        const decoder = new TextDecoder()
+        newSessionUri = decoder.decode(uriBytes)
+      } catch (error: unknown) {
+        throw new InvalidUTF8Error(
+          'GoAway::parsePayload(newSessionUri)',
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+    }
 
-    return new GoAway(newSessionUri)
+    const timeout = buf.getVI()
+
+    return new GoAway(newSessionUri, timeout)
   }
 }
 
@@ -90,24 +112,7 @@ if (import.meta.vitest) {
   const { describe, test, expect } = import.meta.vitest
   describe('GoAway', () => {
     test('roundtrip', () => {
-      const newSessionUri = 'Begone wreched monster'
-      const goAway = new GoAway(newSessionUri)
-      const serialized = goAway.serialize()
-      const buf = new ByteBuffer()
-      buf.putBytes(serialized.toUint8Array())
-      const frozen = buf.freeze()
-      const msgType = frozen.getVI()
-      expect(msgType).toBe(BigInt(ControlMessageType.GoAway))
-      const msgLength = frozen.getU16()
-      expect(msgLength).toBe(frozen.remaining)
-      const deserialized = GoAway.parsePayload(frozen)
-      expect(deserialized.newSessionUri).toBe(goAway.newSessionUri)
-      expect(frozen.remaining).toBe(0)
-    })
-
-    test('excess roundtrip', () => {
-      const newSessionUri = 'Begone wreched monster'
-      const goAway = new GoAway(newSessionUri)
+      const goAway = new GoAway('Begone wreched monster', 0n)
       const serialized = goAway.serialize().toUint8Array()
       const excess = new Uint8Array(serialized.length + 3)
       excess.set(serialized, 0)
@@ -119,9 +124,18 @@ if (import.meta.vitest) {
       expect(msgType).toBe(BigInt(ControlMessageType.GoAway))
       const msgLength = frozen.getU16()
       expect(msgLength).toBe(frozen.remaining - 3)
-      const deserialized = GoAway.parsePayload(frozen)
+      // The trailing Request ID is bounded by Length, so the payload must be sliced off
+      // before parsing it — exactly what ControlMessage.deserialize does.
+      const payload = new FrozenByteBuffer(frozen.getBytes(msgLength))
+      const deserialized = GoAway.parsePayload(payload)
       expect(deserialized.newSessionUri).toBe(goAway.newSessionUri)
       expect(Array.from(frozen.getBytes(3))).toEqual([9, 1, 1])
+    })
+
+    test('a New Session URI over 8192 bytes is a protocol violation', () => {
+      const payload = new ByteBuffer()
+      payload.putVI(MAX_NEW_SESSION_URI_LENGTH + 1)
+      expect(() => GoAway.parsePayload(payload.freeze())).toThrow(ProtocolViolationError)
     })
 
     test('partial message', () => {

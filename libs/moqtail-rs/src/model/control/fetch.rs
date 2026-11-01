@@ -12,77 +12,83 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::constant::{ControlMessageType, FetchType};
+use super::constant::{ControlMessageType, GroupOrder};
 use super::control_message::ControlMessageTrait;
-use crate::model::common::location::Location;
 use crate::model::common::tuple::{Tuple, TupleField};
 use crate::model::common::varint::{BufMutVarIntExt, BufVarIntExt};
+use crate::model::data::full_track_name::FullTrackName;
 use crate::model::error::ParseError;
+use crate::model::parameter::location_filter::LocationFilter;
 use crate::model::parameter::message_parameter::{
-  MessageParameter, deserialize_message_parameters,
+  MessageParameter, deserialize_message_parameters, serialize_message_parameters,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct StandaloneFetchProps {
-  pub track_namespace: Tuple,
-  pub track_name: TupleField,
-  pub start_location: Location,
-  pub end_location: Location,
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct JoiningFetchProps {
-  pub joining_request_id: u64,
-  pub joining_start: u64,
-}
-
-#[derive(Debug, PartialEq, Clone)]
 pub struct Fetch {
   pub request_id: u64,
-  pub fetch_type: FetchType,
-  pub standalone_fetch_props: Option<StandaloneFetchProps>,
-  pub joining_fetch_props: Option<JoiningFetchProps>,
+  pub track_namespace: Tuple,
+  pub track_name: TupleField,
   pub parameters: Vec<MessageParameter>,
 }
 
 impl Fetch {
-  /// Create a new standalone fetch request
-  pub fn new_standalone(
+  pub fn new(
     request_id: u64,
-    standalone_fetch_props: StandaloneFetchProps,
+    track_namespace: Tuple,
+    track_name: TupleField,
     parameters: Vec<MessageParameter>,
   ) -> Self {
     Self {
       request_id,
-      fetch_type: FetchType::Standalone,
-      standalone_fetch_props: Some(standalone_fetch_props),
-      joining_fetch_props: None,
+      track_namespace,
+      track_name,
       parameters,
     }
   }
 
-  /// Create a new joining fetch request (absolute or relative)
-  pub fn new_joining(
+  /// A FETCH whose range is `filter`, carried in a LOCATION_FILTER parameter.
+  pub fn new_with_location_filter(
     request_id: u64,
-    fetch_type: FetchType,
-    joining_request_id: u64,
-    joining_start: u64,
+    track_namespace: Tuple,
+    track_name: TupleField,
+    filter: LocationFilter,
     parameters: Vec<MessageParameter>,
-  ) -> Result<Self, &'static str> {
-    match fetch_type {
-      FetchType::AbsoluteFetch | FetchType::RelativeFetch => Ok(Self {
-        request_id,
-        fetch_type,
-        standalone_fetch_props: None,
-        joining_fetch_props: Some(JoiningFetchProps {
-          joining_request_id,
-          joining_start,
-        }),
-        parameters,
-      }),
-      FetchType::Standalone => Err("Use new_standalone for standalone fetch requests"),
+  ) -> Self {
+    let mut params = parameters;
+    params.push(MessageParameter::new_location_filter(filter));
+    Self::new(request_id, track_namespace, track_name, params)
+  }
+
+  /// The requested range. A FETCH without a LOCATION_FILTER parameter asks for the
+  /// whole track up to the Largest Object, the same as [`LocationFilter::None`].
+  pub fn get_location_filter(&self) -> &LocationFilter {
+    self
+      .parameters
+      .iter()
+      .find_map(|p| match p {
+        MessageParameter::LocationFilter { filter } => Some(filter),
+        _ => None,
+      })
+      .unwrap_or(&LocationFilter::None)
+  }
+
+  pub fn get_full_track_name(&self) -> FullTrackName {
+    FullTrackName {
+      namespace: self.track_namespace.clone(),
+      name: self.track_name.clone(),
     }
+  }
+
+  pub fn group_order(&self) -> GroupOrder {
+    self
+      .parameters
+      .iter()
+      .find_map(|p| match p {
+        MessageParameter::GroupOrder { order } => Some(*order),
+        _ => None,
+      })
+      .unwrap_or(GroupOrder::Ascending)
   }
 }
 
@@ -93,32 +99,12 @@ impl ControlMessageTrait for Fetch {
 
     let mut payload = BytesMut::new();
     payload.put_vi(self.request_id)?;
-    payload.put_vi(self.fetch_type)?;
-    match &self.fetch_type {
-      FetchType::AbsoluteFetch => {
-        let props = self.joining_fetch_props.as_ref().unwrap();
-        payload.put_vi(props.joining_request_id)?;
-        payload.put_vi(props.joining_start)?;
-      }
-      FetchType::RelativeFetch => {
-        let props = self.joining_fetch_props.as_ref().unwrap();
-        payload.put_vi(props.joining_request_id)?;
-        payload.put_vi(props.joining_start)?;
-      }
-      FetchType::Standalone => {
-        let props = self.standalone_fetch_props.as_ref().unwrap();
-        payload.extend_from_slice(&props.track_namespace.serialize()?);
-        payload.put_vi(props.track_name.len())?;
-        payload.extend_from_slice(props.track_name.as_bytes());
-        payload.extend_from_slice(&props.start_location.serialize()?);
-        payload.extend_from_slice(&props.end_location.serialize()?);
-      }
-    }
+    payload.extend_from_slice(&self.track_namespace.serialize()?);
+    payload.put_vi(self.track_name.len())?;
+    payload.extend_from_slice(self.track_name.as_bytes());
 
     payload.put_vi(self.parameters.len())?;
-    for param in &self.parameters {
-      payload.extend_from_slice(&param.serialize()?);
-    }
+    payload.extend_from_slice(&serialize_message_parameters(&self.parameters)?);
 
     let payload_len: u16 = payload
       .len()
@@ -138,52 +124,17 @@ impl ControlMessageTrait for Fetch {
 
   fn parse_payload(payload: &mut Bytes) -> Result<Box<Self>, ParseError> {
     let request_id = payload.get_vi()?;
+    let track_namespace = Tuple::deserialize(payload)?;
 
-    let fetch_type_raw = payload.get_vi()?;
-    let fetch_type = FetchType::try_from(fetch_type_raw)?;
-
-    let mut standalone_fetch_props: Option<StandaloneFetchProps> = None;
-    let mut joining_fetch_props: Option<JoiningFetchProps> = None;
-
-    match fetch_type {
-      FetchType::AbsoluteFetch => {
-        let joining_request_id = payload.get_vi()?;
-        let joining_start = payload.get_vi()?;
-        joining_fetch_props = Some(JoiningFetchProps {
-          joining_request_id,
-          joining_start,
-        });
-      }
-      FetchType::RelativeFetch => {
-        let joining_request_id = payload.get_vi()?;
-        let joining_start = payload.get_vi()?;
-        joining_fetch_props = Some(JoiningFetchProps {
-          joining_request_id,
-          joining_start,
-        });
-      }
-      FetchType::Standalone => {
-        let track_namespace = Tuple::deserialize(payload)?;
-        let track_name_len = payload.get_vi()? as usize;
-        if payload.remaining() < track_name_len {
-          return Err(ParseError::NotEnoughBytes {
-            context: "Fetch::parse_payload(track_name)",
-            needed: track_name_len,
-            available: payload.remaining(),
-          });
-        }
-        let track_name = TupleField::new(payload.copy_to_bytes(track_name_len));
-        let start_location = Location::deserialize(payload)?;
-        let end_location = Location::deserialize(payload)?;
-
-        standalone_fetch_props = Some(StandaloneFetchProps {
-          track_namespace,
-          track_name,
-          start_location,
-          end_location,
-        });
-      }
+    let track_name_len = payload.get_vi()? as usize;
+    if payload.remaining() < track_name_len {
+      return Err(ParseError::NotEnoughBytes {
+        context: "Fetch::parse_payload(track_name)",
+        needed: track_name_len,
+        available: payload.remaining(),
+      });
     }
+    let track_name = TupleField::new(payload.copy_to_bytes(track_name_len));
 
     let param_count = payload.get_vi()?;
     let parameters =
@@ -191,9 +142,8 @@ impl ControlMessageTrait for Fetch {
 
     Ok(Box::new(Fetch {
       request_id,
-      fetch_type,
-      standalone_fetch_props,
-      joining_fetch_props,
+      track_namespace,
+      track_name,
       parameters,
     }))
   }
@@ -208,30 +158,36 @@ mod tests {
 
   use super::*;
   use crate::model::{
-    common::tuple::TupleField, control::constant::GroupOrder,
+    common::location::Location, common::tuple::TupleField, control::constant::GroupOrder,
     parameter::authorization_token::AuthorizationToken,
   };
   use bytes::Buf;
 
-  #[test]
-  fn test_roundtrip() {
-    let fetch = Fetch {
-      request_id: 161803,
-      fetch_type: FetchType::AbsoluteFetch,
-      standalone_fetch_props: None,
-      joining_fetch_props: Some(JoiningFetchProps {
-        joining_request_id: 119,
-        joining_start: 73,
-      }),
-      parameters: vec![
+  fn sample_fetch() -> Fetch {
+    // Parameters are serialized sorted by type and parse back in that order, so they
+    // are listed sorted here for the roundtrip comparison to hold.
+    Fetch::new(
+      161803,
+      Tuple::from_utf8_path("un/deux/trois"),
+      TupleField::from_utf8("quatre"),
+      vec![
         MessageParameter::new_authorization_token(AuthorizationToken::new_use_value(
           0,
           Bytes::from_static(b"test-token"),
         )),
         MessageParameter::new_subscriber_priority(42),
+        MessageParameter::new_location_filter(LocationFilter::AbsoluteRange {
+          start: Location::new(12, 5),
+          end: Location::new(20, 3),
+        }),
         MessageParameter::new_group_order(GroupOrder::Ascending),
       ],
-    };
+    )
+  }
+
+  #[test]
+  fn test_roundtrip() {
+    let fetch = sample_fetch();
 
     let mut buf = fetch.serialize().unwrap();
     let msg_type = buf.get_vi().unwrap();
@@ -245,23 +201,7 @@ mod tests {
 
   #[test]
   fn test_excess_roundtrip() {
-    let fetch = Fetch {
-      request_id: 161803,
-      fetch_type: FetchType::AbsoluteFetch,
-      standalone_fetch_props: None,
-      joining_fetch_props: Some(JoiningFetchProps {
-        joining_request_id: 119,
-        joining_start: 73,
-      }),
-      parameters: vec![
-        MessageParameter::new_authorization_token(AuthorizationToken::new_use_value(
-          0,
-          Bytes::from_static(b"test-token"),
-        )),
-        MessageParameter::new_subscriber_priority(42),
-        MessageParameter::new_group_order(GroupOrder::Ascending),
-      ],
-    };
+    let fetch = sample_fetch();
 
     let serialized = fetch.serialize().unwrap();
     let mut excess = BytesMut::new();
@@ -281,23 +221,7 @@ mod tests {
 
   #[test]
   fn test_partial_message() {
-    let fetch = Fetch {
-      request_id: 161803,
-      fetch_type: FetchType::AbsoluteFetch,
-      standalone_fetch_props: None,
-      joining_fetch_props: Some(JoiningFetchProps {
-        joining_request_id: 119,
-        joining_start: 73,
-      }),
-      parameters: vec![
-        MessageParameter::new_authorization_token(AuthorizationToken::new_use_value(
-          0,
-          Bytes::from_static(b"test-token"),
-        )),
-        MessageParameter::new_subscriber_priority(42),
-        MessageParameter::new_group_order(GroupOrder::Ascending),
-      ],
-    };
+    let fetch = sample_fetch();
 
     let mut buf = fetch.serialize().unwrap();
     let msg_type = buf.get_vi().unwrap();
@@ -312,89 +236,62 @@ mod tests {
   }
 
   #[test]
-  fn test_new_standalone_constructor() {
-    let mut track_namespace = Tuple::new();
-    track_namespace.add(TupleField::from_utf8("test"));
-    track_namespace.add(TupleField::from_utf8("namespace"));
-    let track_name = TupleField::from_utf8("video_track");
-    let start_location = Location::new(5, 10);
-    let end_location = Location::new(15, 20);
-    let parameters: Vec<MessageParameter> = vec![
-      MessageParameter::new_authorization_token(AuthorizationToken::new_use_value(
-        0,
-        Bytes::from_static(b"test-token"),
-      )),
-      MessageParameter::new_subscriber_priority(42),
-      MessageParameter::new_group_order(GroupOrder::Ascending),
-    ];
-    let standalone_fetch_props = StandaloneFetchProps {
-      track_namespace,
-      track_name,
-      start_location,
-      end_location,
+  fn test_group_order_defaults_to_ascending() {
+    let fetch = Fetch::new(
+      1,
+      Tuple::from_utf8_path("ns"),
+      TupleField::from_utf8("track"),
+      vec![],
+    );
+    assert_eq!(fetch.group_order(), GroupOrder::Ascending);
+  }
+
+  #[test]
+  fn test_range_is_carried_in_the_location_filter() {
+    let fetch = sample_fetch();
+    assert_eq!(
+      fetch.get_location_filter(),
+      &LocationFilter::AbsoluteRange {
+        start: Location::new(12, 5),
+        end: Location::new(20, 3),
+      }
+    );
+
+    // Request ID, Track Namespace and Track Name are followed directly by the
+    // parameters: no Start or End Location fields.
+    let mut buf = fetch.serialize().unwrap();
+    buf.get_vi().unwrap();
+    buf.get_u16();
+    buf.get_vi().unwrap();
+    Tuple::deserialize(&mut buf).unwrap();
+    let name_len = buf.get_vi().unwrap() as usize;
+    buf.advance(name_len);
+    assert_eq!(buf.get_vi().unwrap(), fetch.parameters.len() as u64);
+  }
+
+  #[test]
+  fn test_new_with_location_filter_adds_the_parameter() {
+    let filter = LocationFilter::AbsoluteStart {
+      start: Location::new(3, 0),
     };
-
-    let fetch = Fetch::new_standalone(42, standalone_fetch_props.clone(), parameters.clone());
-
-    assert_eq!(fetch.request_id, 42);
-    assert_eq!(fetch.fetch_type, FetchType::Standalone);
-    assert!(fetch.standalone_fetch_props.is_some());
-    assert!(fetch.joining_fetch_props.is_none());
-
-    let props = fetch.standalone_fetch_props.unwrap();
-    assert_eq!(
-      props.track_namespace,
-      standalone_fetch_props.track_namespace
+    let fetch = Fetch::new_with_location_filter(
+      1,
+      Tuple::from_utf8_path("ns"),
+      TupleField::from_utf8("track"),
+      filter.clone(),
+      vec![],
     );
-    assert_eq!(props.track_name, standalone_fetch_props.track_name);
-    assert_eq!(props.start_location, standalone_fetch_props.start_location);
-    assert_eq!(props.end_location, standalone_fetch_props.end_location);
-    assert_eq!(fetch.parameters, parameters);
+    assert_eq!(fetch.get_location_filter(), &filter);
   }
 
   #[test]
-  fn test_new_joining_constructor_absolute() {
-    let parameters: Vec<MessageParameter> = vec![
-      MessageParameter::new_authorization_token(AuthorizationToken::new_use_value(
-        0,
-        Bytes::from_static(b"test-token"),
-      )),
-      MessageParameter::new_subscriber_priority(42),
-      MessageParameter::new_group_order(GroupOrder::Ascending),
-    ];
-
-    let fetch =
-      Fetch::new_joining(123, FetchType::AbsoluteFetch, 456, 789, parameters.clone()).unwrap();
-
-    assert_eq!(fetch.request_id, 123);
-    assert_eq!(fetch.fetch_type, FetchType::AbsoluteFetch);
-    assert!(fetch.standalone_fetch_props.is_none());
-    assert!(fetch.joining_fetch_props.is_some());
-
-    let props = fetch.joining_fetch_props.unwrap();
-    assert_eq!(props.joining_request_id, 456);
-    assert_eq!(props.joining_start, 789);
-    assert_eq!(fetch.parameters, parameters);
-  }
-
-  #[test]
-  fn test_new_joining_constructor_relative() {
-    let fetch = Fetch::new_joining(111, FetchType::RelativeFetch, 222, 333, vec![]).unwrap();
-
-    assert_eq!(fetch.fetch_type, FetchType::RelativeFetch);
-    let props = fetch.joining_fetch_props.unwrap();
-    assert_eq!(props.joining_request_id, 222);
-    assert_eq!(props.joining_start, 333);
-  }
-
-  #[test]
-  fn test_new_joining_constructor_rejects_standalone() {
-    let result = Fetch::new_joining(111, FetchType::Standalone, 222, 333, vec![]);
-
-    assert!(result.is_err());
-    assert_eq!(
-      result.unwrap_err(),
-      "Use new_standalone for standalone fetch requests"
+  fn test_no_location_filter_is_the_whole_track() {
+    let fetch = Fetch::new(
+      1,
+      Tuple::from_utf8_path("ns"),
+      TupleField::from_utf8("track"),
+      vec![],
     );
+    assert_eq!(fetch.get_location_filter(), &LocationFilter::None);
   }
 }

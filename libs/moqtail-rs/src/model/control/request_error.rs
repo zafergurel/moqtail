@@ -12,33 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::constant::{ControlMessageType, RequestErrorCode};
+use super::constant::ControlMessageType;
 use super::control_message::ControlMessageTrait;
 use crate::model::common::reason_phrase::ReasonPhrase;
+use crate::model::common::redirect::Redirect;
 use crate::model::common::varint::{BufMutVarIntExt, BufVarIntExt};
-use crate::model::error::ParseError;
+use crate::model::error::{ParseError, RequestErrorCode};
 use bytes::{BufMut, Bytes, BytesMut};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct RequestError {
-  pub request_id: u64,
   pub error_code: RequestErrorCode,
   pub retry_interval: u64,
   pub reason_phrase: ReasonPhrase,
+  /// Present only when `error_code` is `Redirect`.
+  pub redirect: Option<Redirect>,
 }
 
 impl RequestError {
   pub fn new(
-    request_id: u64,
     error_code: RequestErrorCode,
     retry_interval: u64,
     reason_phrase: ReasonPhrase,
   ) -> Self {
     Self {
-      request_id,
       error_code,
       retry_interval,
       reason_phrase,
+      redirect: None,
+    }
+  }
+
+  /// A REDIRECT error carrying the retry target.
+  pub fn new_redirect(
+    retry_interval: u64,
+    reason_phrase: ReasonPhrase,
+    redirect: Redirect,
+  ) -> Self {
+    Self {
+      error_code: RequestErrorCode::Redirect,
+      retry_interval,
+      reason_phrase,
+      redirect: Some(redirect),
     }
   }
 }
@@ -49,10 +64,12 @@ impl ControlMessageTrait for RequestError {
     buf.put_vi(ControlMessageType::RequestError)?;
 
     let mut payload = BytesMut::new();
-    payload.put_vi(self.request_id)?;
     payload.put_vi(self.error_code as u64)?;
     payload.put_vi(self.retry_interval)?;
     payload.extend_from_slice(&self.reason_phrase.serialize()?);
+    if let Some(redirect) = &self.redirect {
+      payload.extend_from_slice(&redirect.serialize()?);
+    }
 
     let payload_len: u16 = payload
       .len()
@@ -71,20 +88,26 @@ impl ControlMessageTrait for RequestError {
   }
 
   fn parse_payload(payload: &mut Bytes) -> Result<Box<Self>, ParseError> {
-    let request_id = payload.get_vi()?;
-
+    // An unknown or GREASE error code is not fatal; treat it as InternalError.
     let error_code_raw = payload.get_vi()?;
-    let error_code = RequestErrorCode::try_from(error_code_raw)?;
+    let error_code = RequestErrorCode::from_wire(error_code_raw);
 
     let retry_interval = payload.get_vi()?;
 
     let reason_phrase = ReasonPhrase::deserialize(payload)?;
 
+    // A Redirect is present only for a REDIRECT error.
+    let redirect = if error_code == RequestErrorCode::Redirect {
+      Some(Redirect::deserialize(payload)?)
+    } else {
+      None
+    };
+
     Ok(Box::new(RequestError {
-      request_id,
       error_code,
       retry_interval,
       reason_phrase,
+      redirect,
     }))
   }
 
@@ -96,20 +119,35 @@ impl ControlMessageTrait for RequestError {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::model::common::grease::grease_value;
+  use crate::model::common::varint::BufMutVarIntExt;
   use bytes::Buf;
+
+  /// A REQUEST_ERROR carrying a grease (unknown) error code must parse, not fail,
+  /// and is surfaced as InternalError.
+  #[test]
+  fn grease_error_code_parses_as_internal_error() {
+    let mut payload = BytesMut::new();
+    payload.put_vi(grease_value(3).unwrap()).unwrap(); // grease error code
+    payload.put_vi(0).unwrap(); // retry_interval
+    payload.extend_from_slice(
+      &ReasonPhrase::try_new("grease".to_string())
+        .unwrap()
+        .serialize()
+        .unwrap(),
+    );
+    let mut buf = payload.freeze();
+    let parsed = RequestError::parse_payload(&mut buf).unwrap();
+    assert_eq!(parsed.error_code, RequestErrorCode::InternalError);
+    assert!(!buf.has_remaining());
+  }
 
   #[test]
   fn test_roundtrip() {
-    let request_id = 160669;
     let error_code = RequestErrorCode::InternalError; // Update to match your new constant
     let retry_interval = 0; // As requested, set to 0 to state no retries for now
     let reason_phrase = ReasonPhrase::try_new("They see me rollin'".to_string()).unwrap();
-    let request_error = RequestError {
-      request_id,
-      error_code,
-      retry_interval,
-      reason_phrase,
-    };
+    let request_error = RequestError::new(error_code, retry_interval, reason_phrase);
     let mut buf = request_error.serialize().unwrap();
     let msg_type = buf.get_vi().unwrap();
     assert_eq!(msg_type, ControlMessageType::RequestError as u64);
@@ -122,16 +160,10 @@ mod tests {
 
   #[test]
   fn test_excess_roundtrip() {
-    let request_id = 160669;
     let error_code = RequestErrorCode::InternalError;
     let retry_interval = 0;
     let reason_phrase = ReasonPhrase::try_new("They see me rollin'".to_string()).unwrap();
-    let request_error = RequestError {
-      request_id,
-      error_code,
-      retry_interval,
-      reason_phrase,
-    };
+    let request_error = RequestError::new(error_code, retry_interval, reason_phrase);
     let serialized = request_error.serialize().unwrap();
     let mut excess = BytesMut::new();
     excess.extend_from_slice(&serialized);
@@ -150,16 +182,10 @@ mod tests {
 
   #[test]
   fn test_partial_message() {
-    let request_id = 160669;
     let error_code = RequestErrorCode::InternalError;
     let retry_interval = 0;
     let reason_phrase = ReasonPhrase::try_new("They see me rollin'".to_string()).unwrap();
-    let request_error = RequestError {
-      request_id,
-      error_code,
-      retry_interval,
-      reason_phrase,
-    };
+    let request_error = RequestError::new(error_code, retry_interval, reason_phrase);
     let mut buf = request_error.serialize().unwrap();
     let msg_type = buf.get_vi().unwrap();
     assert_eq!(msg_type, ControlMessageType::RequestError as u64);
@@ -170,5 +196,30 @@ mod tests {
     let mut partial = buf.slice(..upper);
     let deserialized = RequestError::parse_payload(&mut partial);
     assert!(deserialized.is_err());
+  }
+
+  #[test]
+  fn redirect_error_round_trips() {
+    use crate::model::common::redirect::Redirect;
+    use crate::model::common::tuple::{Tuple, TupleField};
+
+    let request_error = RequestError::new_redirect(
+      0,
+      ReasonPhrase::try_new("try elsewhere".to_string()).unwrap(),
+      Redirect::new(
+        Some("moqt://other.example".to_string()),
+        Tuple::from_utf8_path("room1/audio"),
+        TupleField::from_utf8("track-9"),
+      ),
+    );
+    assert_eq!(request_error.error_code, RequestErrorCode::Redirect);
+
+    let mut buf = request_error.serialize().unwrap();
+    let _ = buf.get_vi().unwrap();
+    let msg_length = buf.get_u16();
+    let mut payload = buf.copy_to_bytes(msg_length as usize);
+    let deserialized = RequestError::parse_payload(&mut payload).unwrap();
+    assert_eq!(*deserialized, request_error);
+    assert!(deserialized.redirect.is_some());
   }
 }

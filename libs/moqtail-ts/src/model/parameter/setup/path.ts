@@ -15,11 +15,11 @@
  */
 
 import { KeyValuePair } from '../../common/pair'
-import { SetupParameterType } from '../constant'
+import { SetupOptionType } from '../constant'
 import { Parameter } from '../parameter'
 
 export class Path implements Parameter {
-  static readonly TYPE = SetupParameterType.Path
+  static readonly TYPE = SetupOptionType.Path
   constructor(public readonly moqtPath: string) {}
 
   toKeyValuePair(): KeyValuePair {
@@ -46,7 +46,7 @@ if (import.meta.vitest) {
       expect(param?.moqtPath).toBe('abc')
     })
     test('fromKeyValuePair returns undefined for wrong type', () => {
-      const pair = KeyValuePair.tryNewVarInt(SetupParameterType.MaxRequestId, 1n)
+      const pair = KeyValuePair.tryNewVarInt(SetupOptionType.MaxAuthTokenCacheSize, 1n)
       const param = Path.fromKeyValuePair(pair)
       expect(param).toBeUndefined()
     })

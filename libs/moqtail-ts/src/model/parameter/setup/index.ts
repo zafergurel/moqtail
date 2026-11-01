@@ -15,5 +15,9 @@
  */
 
 export * from './path'
-export { MaxRequestId as MaxRequestIdParameter } from './max_request_id'
 export * from './max_auth_token_cache_size'
+export * from './authority'
+export * from './max_filter_ranges'
+export * from './moqt_implementation'
+export * from './max_request_updates'
+export * from './ssts_algorithms'

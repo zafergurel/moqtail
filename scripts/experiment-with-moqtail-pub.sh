@@ -51,14 +51,14 @@ PUB_PROJECT="${PUB_PROJECT:-}"   # only needed when PUB_SSH is set
 
 # Derive relay host IP from RELAY_SSH (strips "user@" prefix)
 RELAY_HOST_IP="${RELAY_SSH##*@}"
-RELAY_URL="https://${RELAY_HOST_IP}:${RELAY_PORT}"
+RELAY_URL="moqt://${RELAY_HOST_IP}:${RELAY_PORT}"
 
 # Namespace published by moqtail-pub
 NAMESPACE="${NAMESPACE:-moqtail-watch-party-live}"
 
 # ── Experiment defaults ────────────────────────────────────────────────────────
 
-ALL_METHODS=("switch-message" "sub-update-forward" "joining-fetch")
+ALL_METHODS=("switch-message" "sub-update-forward")
 # Bandwidth ladder (bps). 0 = unlimited baseline (no tc rule applied).
 ALL_BANDWIDTHS=(0 5000000 3000000 2000000 1500000 1000000)
 # Track sequence: lower index = lower bitrate (matches ffmpeg.sh ordering)
@@ -244,7 +244,7 @@ run_one() {
     --no-cert-validation \
     --track-sequence "$TRACK_SEQUENCE" \
     --method "$method" \
-    --switch-after "$SWITCH_AFTER" \
+    --switch-after-ms "$SWITCH_AFTER" \
     --jitter-buffer-ms "$JITTER_BUFFER_MS" \
     --bandwidth-cap-bps 0 \
     --output-json "$outfile" \

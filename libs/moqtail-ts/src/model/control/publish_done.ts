@@ -17,23 +17,23 @@
 import { BaseByteBuffer, ByteBuffer, FrozenByteBuffer } from '../common/byte_buffer'
 import { ReasonPhrase } from '../common/reason_phrase'
 import { LengthExceedsMaxError } from '../error/error'
-import { ControlMessageType, PublishDoneStatusCode, publishDoneStatusCodeFromBigInt } from './constant'
+import { ControlMessageType, PublishDoneStatusCode } from './constant'
 
 export class PublishDone {
+  /**
+   * The Stream Count a publisher sends when it cannot name the exact number of streams
+   * it opened. Receivers fall back on a timeout to end the subscription.
+   */
+  static readonly UNKNOWN_STREAM_COUNT = 2n ** 64n - 1n
+
   constructor(
-    public readonly requestId: bigint,
     public readonly statusCode: PublishDoneStatusCode,
     public readonly streamCount: bigint,
     public readonly errorReason: ReasonPhrase,
   ) {}
 
-  static new(
-    requestId: bigint | number,
-    statusCode: PublishDoneStatusCode,
-    streamCount: bigint,
-    errorReason: ReasonPhrase,
-  ): PublishDone {
-    return new PublishDone(BigInt(requestId), statusCode, streamCount, errorReason)
+  static new(statusCode: PublishDoneStatusCode, streamCount: bigint, errorReason: ReasonPhrase): PublishDone {
+    return new PublishDone(statusCode, streamCount, errorReason)
   }
 
   getType(): ControlMessageType {
@@ -44,7 +44,6 @@ export class PublishDone {
     const buf = new ByteBuffer()
     buf.putVI(ControlMessageType.PublishDone)
     const payload = new ByteBuffer()
-    payload.putVI(this.requestId)
     payload.putVI(this.statusCode)
     payload.putVI(this.streamCount)
     payload.putReasonPhrase(this.errorReason)
@@ -58,12 +57,11 @@ export class PublishDone {
   }
 
   static parsePayload(buf: BaseByteBuffer): PublishDone {
-    const requestId = buf.getVI()
-    const statusCodeRaw = buf.getVI()
-    const statusCode = publishDoneStatusCodeFromBigInt(statusCodeRaw)
+    // An unknown or GREASE status code is not fatal; treat it as InternalError.
+    const statusCode = PublishDoneStatusCode.fromWire(buf.getVI())
     const streamCount = buf.getVI()
     const errorReason = buf.getReasonPhrase()
-    return new PublishDone(requestId, statusCode, streamCount, errorReason)
+    return new PublishDone(statusCode, streamCount, errorReason)
   }
 }
 
@@ -72,11 +70,10 @@ if (import.meta.vitest) {
 
   describe('PublishDone', () => {
     test('roundtrip', () => {
-      const requestId = 12345n
-      const statusCode = PublishDoneStatusCode.SubscriptionEnded
+      const statusCode = PublishDoneStatusCode.TrackEnded
       const streamCount = 123n
       const errorReason = new ReasonPhrase('Lorem ipsum dolor sit amet')
-      const publishDone = PublishDone.new(requestId, statusCode, streamCount, errorReason)
+      const publishDone = PublishDone.new(statusCode, streamCount, errorReason)
 
       const frozen = publishDone.serialize()
       const msgType = frozen.getVI()
@@ -84,7 +81,6 @@ if (import.meta.vitest) {
       const msgLength = frozen.getU16()
       expect(msgLength).toBe(frozen.remaining)
       const deserialized = PublishDone.parsePayload(frozen)
-      expect(deserialized.requestId).toBe(publishDone.requestId)
       expect(deserialized.statusCode).toBe(publishDone.statusCode)
       expect(deserialized.streamCount).toBe(publishDone.streamCount)
       expect(deserialized.errorReason.phrase).toBe(publishDone.errorReason.phrase)
@@ -92,11 +88,10 @@ if (import.meta.vitest) {
     })
 
     test('excess roundtrip', () => {
-      const requestId = 12345n
       const statusCode = PublishDoneStatusCode.Expired
       const streamCount = 123n
       const errorReason = new ReasonPhrase('Lorem ipsum dolor sit amet')
-      const publishDone = PublishDone.new(requestId, statusCode, streamCount, errorReason)
+      const publishDone = PublishDone.new(statusCode, streamCount, errorReason)
       const serialized = publishDone.serialize().toUint8Array()
       const excess = new Uint8Array([9, 1, 1])
       const buf = new ByteBuffer()
@@ -108,7 +103,6 @@ if (import.meta.vitest) {
       const msgLength = frozen.getU16()
       expect(msgLength).toBe(frozen.remaining - 3)
       const deserialized = PublishDone.parsePayload(frozen)
-      expect(deserialized.requestId).toBe(publishDone.requestId)
       expect(deserialized.statusCode).toBe(publishDone.statusCode)
       expect(deserialized.streamCount).toBe(publishDone.streamCount)
       expect(deserialized.errorReason.phrase).toBe(publishDone.errorReason.phrase)
@@ -116,12 +110,32 @@ if (import.meta.vitest) {
       expect(Array.from(frozen.getBytes(3))).toEqual([9, 1, 1])
     })
 
+    test('the removed SUBSCRIPTION_ENDED code reads as internal error', () => {
+      // 0x3 was SUBSCRIPTION_ENDED. A peer that still sends it gets the same treatment
+      // as any other code this side does not know.
+      expect(() => PublishDoneStatusCode.tryFrom(0x3n)).toThrow()
+      expect(PublishDoneStatusCode.fromWire(0x3n)).toBe(PublishDoneStatusCode.InternalError)
+    })
+
+    test('unknown stream count roundtrip', () => {
+      const publishDone = new PublishDone(
+        PublishDoneStatusCode.TrackEnded,
+        PublishDone.UNKNOWN_STREAM_COUNT,
+        new ReasonPhrase('unknown'),
+      )
+      const frozen = publishDone.serialize()
+      frozen.getVI()
+      frozen.getU16()
+      const deserialized = PublishDone.parsePayload(frozen)
+      expect(deserialized.streamCount).toBe(2n ** 64n - 1n)
+      expect(frozen.remaining).toBe(0)
+    })
+
     test('partial message', () => {
-      const requestId = 12345n
       const statusCode = PublishDoneStatusCode.Expired
       const streamCount = 123n
       const errorReason = new ReasonPhrase('Lorem ipsum dolor sit amet')
-      const publishDone = PublishDone.new(requestId, statusCode, streamCount, errorReason)
+      const publishDone = PublishDone.new(statusCode, streamCount, errorReason)
       const serialized = publishDone.serialize().toUint8Array()
       const upper = Math.floor(serialized.length / 2)
       const partial = serialized.slice(0, upper)

@@ -16,8 +16,14 @@
 
 import { KeyValuePair } from '../common/pair'
 import { CastingError, ProtocolViolationError } from '../error/error'
-import { ExtensionHeaders } from '../extension_header'
-import { ObjectDatagramType, ObjectForwardingPreference, ObjectStatus, SubgroupHeaderType } from './constant'
+import { LOCProperties } from '../property'
+import {
+  DEFAULT_PUBLISHER_PRIORITY,
+  ObjectDatagramType,
+  ObjectForwardingPreference,
+  ObjectStatus,
+  SubgroupHeaderType,
+} from './constant'
 import { Datagram } from './datagram'
 import { FetchObject } from './fetch_object'
 import { FullTrackName } from './full_track_name'
@@ -35,7 +41,7 @@ export class MoqtObject {
     public readonly objectForwardingPreference: ObjectForwardingPreference,
     subgroupId: bigint | number | null,
     public readonly objectStatus: ObjectStatus,
-    public readonly extensionHeaders: KeyValuePair[] | null,
+    public readonly properties: KeyValuePair[] | null,
     public readonly payload: Uint8Array | null,
   ) {
     this.location = location
@@ -49,8 +55,12 @@ export class MoqtObject {
     return this.location.object
   }
 
-  getSubgroupHeaderType(containsEnd: boolean, useDefaultPriority: boolean = false): SubgroupHeaderType {
-    const hasExtensions = !!this.extensionHeaders && this.extensionHeaders.length > 0
+  getSubgroupHeaderType(
+    containsEnd: boolean,
+    useDefaultPriority: boolean = false,
+    firstObject: boolean = false,
+  ): SubgroupHeaderType {
+    const hasProperties = !!this.properties && this.properties.length > 0
 
     // Determine SUBGROUP_ID_MODE (bits 1-2):
     // 0b00 (0): Subgroup ID = 0 (absent from header)
@@ -65,7 +75,13 @@ export class MoqtObject {
       subgroupIdMode = 2 // explicit mode
     }
 
-    return SubgroupHeaderType.fromProperties(hasExtensions, subgroupIdMode, containsEnd, useDefaultPriority)
+    return SubgroupHeaderType.fromProperties(
+      hasProperties,
+      subgroupIdMode,
+      containsEnd,
+      useDefaultPriority,
+      firstObject,
+    )
   }
 
   isDatagram(): boolean {
@@ -93,7 +109,7 @@ export class MoqtObject {
     publisherPriority: number,
     objectForwardingPreference: ObjectForwardingPreference,
     subgroupId: bigint | number | null,
-    extensionHeaders: KeyValuePair[] | null,
+    properties: KeyValuePair[] | null,
     payload: Uint8Array,
   ): MoqtObject {
     return new MoqtObject(
@@ -103,7 +119,7 @@ export class MoqtObject {
       objectForwardingPreference,
       subgroupId,
       ObjectStatus.Normal,
-      extensionHeaders,
+      properties,
       payload,
     )
   }
@@ -114,7 +130,7 @@ export class MoqtObject {
     publisherPriority: number,
     objectForwardingPreference: ObjectForwardingPreference,
     subgroupId: bigint | number | null,
-    extensionHeaders: KeyValuePair[] | null,
+    properties: KeyValuePair[] | null,
     objectStatus: ObjectStatus,
   ): MoqtObject {
     return new MoqtObject(
@@ -124,13 +140,13 @@ export class MoqtObject {
       objectForwardingPreference,
       subgroupId,
       objectStatus,
-      extensionHeaders,
+      properties,
       null,
     )
   }
 
   /**
-   * Create a MoqtObject from a Datagram (Draft-16).
+   * Create a MoqtObject from a Datagram.
    * @param datagram - The received Datagram.
    * @param fullTrackName - The resolved full track name.
    * @param defaultPriority - The default publisher priority from the control message (used when DEFAULT_PRIORITY bit is set).
@@ -145,7 +161,7 @@ export class MoqtObject {
         ObjectForwardingPreference.Datagram,
         null,
         datagram.objectStatus!,
-        datagram.extensionHeaders,
+        datagram.properties,
         null,
       )
     } else {
@@ -156,7 +172,7 @@ export class MoqtObject {
         ObjectForwardingPreference.Datagram,
         null,
         ObjectStatus.Normal,
-        datagram.extensionHeaders,
+        datagram.properties,
         datagram.payload,
       )
     }
@@ -187,7 +203,7 @@ export class MoqtObject {
       fetchObject.forwardingPreference,
       subgroupId,
       ObjectStatus.Normal,
-      fetchObject.extensionHeaders,
+      fetchObject.properties,
       fetchObject.payload && fetchObject.payload.length > 0 ? fetchObject.payload : null,
     )
   }
@@ -202,16 +218,16 @@ export class MoqtObject {
     return new MoqtObject(
       fullTrackName,
       new Location(groupId, subgroupObject.objectId),
-      publisherPriority ?? 0,
+      publisherPriority ?? DEFAULT_PUBLISHER_PRIORITY,
       ObjectForwardingPreference.Subgroup,
       subgroupId,
       subgroupObject.objectStatus || ObjectStatus.Normal,
-      subgroupObject.extensionHeaders,
+      subgroupObject.properties,
       subgroupObject.payload,
     )
   }
   /**
-   * Convert to Datagram for wire transmission (Draft-16).
+   * Convert to Datagram for wire transmission.
    * Automatically creates a payload or status Datagram based on the object's state.
    * @param trackAlias - The track alias to use.
    * @param endOfGroup - Whether this is the last object in the group (only for payload datagrams).
@@ -232,7 +248,7 @@ export class MoqtObject {
       defaultPriority !== undefined && defaultPriority === this.publisherPriority ? null : this.publisherPriority
 
     if (this.hasStatus()) {
-      return Datagram.newStatus(alias, this.groupId, this.objectId, priority, this.extensionHeaders, this.objectStatus)
+      return Datagram.newStatus(alias, this.groupId, this.objectId, priority, this.properties, this.objectStatus)
     } else {
       if (!this.payload) {
         throw new ProtocolViolationError(
@@ -245,14 +261,14 @@ export class MoqtObject {
         this.groupId,
         this.objectId,
         priority,
-        this.extensionHeaders,
+        this.properties,
         this.payload,
         endOfGroup,
       )
     }
   }
   tryIntoFetchObject(): FetchObject {
-    // Draft-16 §10.4.4 FETCH objects carry no status; non-Normal status must be
+    // ETCH objects carry no status; non-Normal status must be
     // surfaced as an EndOfRange marker by the caller instead.
     if (this.objectStatus !== ObjectStatus.Normal) {
       throw new CastingError(
@@ -286,7 +302,7 @@ export class MoqtObject {
       this.objectId,
       this.publisherPriority,
       this.objectForwardingPreference,
-      this.extensionHeaders,
+      this.properties,
       this.payload ?? new Uint8Array(0),
     )
   }
@@ -300,9 +316,9 @@ export class MoqtObject {
       )
     }
     if (this.objectStatus === ObjectStatus.Normal && this.payload) {
-      return SubgroupObject.newWithPayload(this.location.object, this.extensionHeaders, this.payload)
+      return SubgroupObject.newWithPayload(this.location.object, this.properties, this.payload)
     } else {
-      return SubgroupObject.newWithStatus(this.location.object, this.extensionHeaders, this.objectStatus)
+      return SubgroupObject.newWithStatus(this.location.object, this.properties, this.objectStatus)
     }
   }
 }
@@ -313,7 +329,7 @@ if (import.meta.vitest) {
   describe('MoqtObject', () => {
     test('create object with payload', () => {
       const payload = new TextEncoder().encode('test payload')
-      const extensionHeaders = new ExtensionHeaders().addAudioLevel(100).addCaptureTimestamp(0).build()
+      const properties = new LOCProperties().addAudioLevel(100).addTimestamp(0).build()
       const fullTrackName = FullTrackName.tryNew('test/demo', 'track1')
       const location = new Location(100n, 10n)
       const obj = MoqtObject.newWithPayload(
@@ -322,7 +338,7 @@ if (import.meta.vitest) {
         128,
         ObjectForwardingPreference.Subgroup,
         5n,
-        extensionHeaders,
+        properties,
         payload,
       )
 
@@ -333,7 +349,7 @@ if (import.meta.vitest) {
       expect(obj.objectForwardingPreference).toBe(ObjectForwardingPreference.Subgroup)
       expect(obj.subgroupId).toBe(5n)
       expect(obj.objectStatus).toBe(ObjectStatus.Normal)
-      expect(obj.extensionHeaders).toEqual(extensionHeaders)
+      expect(obj.properties).toEqual(properties)
       expect(obj.payload).toEqual(payload)
       expect(obj.hasPayload()).toBe(true)
       expect(obj.hasStatus()).toBe(false)
@@ -359,13 +375,13 @@ if (import.meta.vitest) {
       expect(obj.objectForwardingPreference).toBe(ObjectForwardingPreference.Datagram)
       expect(obj.subgroupId).toBe(null)
       expect(obj.objectStatus).toBe(ObjectStatus.EndOfGroup)
-      expect(obj.extensionHeaders).toBe(null)
+      expect(obj.properties).toBe(null)
       expect(obj.payload).toBe(null)
       expect(obj.hasPayload()).toBe(false)
       expect(obj.hasStatus()).toBe(true)
     })
 
-    test('convert from/to Datagram payload (Draft-16)', () => {
+    test('convert from/to Datagram payload', () => {
       const payload = new TextEncoder().encode('datagram payload')
       const fullTrackName = FullTrackName.tryNew('test/demo', 'track3')
       const datagram = Datagram.newPayload(42n, 100n, 10n, 128, null, payload, false)
@@ -383,7 +399,7 @@ if (import.meta.vitest) {
       expect(backToDatagram.payload).toEqual(payload)
     })
 
-    test('convert from/to Datagram with endOfGroup (Draft-16)', () => {
+    test('convert from/to Datagram with endOfGroup', () => {
       const payload = new TextEncoder().encode('last in group')
       const fullTrackName = FullTrackName.tryNew('test/demo', 'track3')
       const datagram = Datagram.newPayload(42n, 100n, 10n, 128, null, payload, true)
@@ -395,7 +411,7 @@ if (import.meta.vitest) {
       expect(backToDatagram.endOfGroup).toBe(true)
     })
 
-    test('convert from/to Datagram status (Draft-16)', () => {
+    test('convert from/to Datagram status', () => {
       const fullTrackName = FullTrackName.tryNew('test/demo', 'track3')
       const datagram = Datagram.newStatus(42n, 100n, 10n, 128, null, ObjectStatus.EndOfGroup)
 
@@ -408,7 +424,7 @@ if (import.meta.vitest) {
       expect(backToDatagram.payload).toBeNull()
     })
 
-    test('convert Datagram with DEFAULT_PRIORITY (Draft-16)', () => {
+    test('convert Datagram with DEFAULT_PRIORITY', () => {
       const payload = new TextEncoder().encode('default prio')
       const fullTrackName = FullTrackName.tryNew('test/demo', 'track3')
       const datagram = Datagram.newPayload(42n, 100n, 10n, null, null, payload, false)

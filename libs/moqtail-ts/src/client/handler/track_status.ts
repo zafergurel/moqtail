@@ -14,11 +14,14 @@
  * limitations under the License.
  */
 
-import { TrackStatus } from '../../model/control'
-import { ControlMessageHandler } from './handler'
+import { RequestOk, TrackStatus } from '../../model/control'
+import { RequestStreamMessageHandler } from './handler'
 import { logger } from '../../util/logger'
 
-export const handlerTrackStatus: ControlMessageHandler<TrackStatus> = async (_client, msg) => {
-  logger.debug('handler/track_status', 'not implemented', msg)
-  // TODO: Implement TrackStatus handler logic
+export const handlerTrackStatus: RequestStreamMessageHandler<TrackStatus> = async (_client, msg, stream) => {
+  logger.debug('handler/track_status', `requestId=${msg.requestId} ftn="${msg.fullTrackName}"`)
+  // TODO (#273): report the real track status. REQUEST_OK now carries the Track
+  // Properties that would hold it, but nothing populates them yet, so this stays a bare
+  // acknowledgement.
+  await stream.send(new RequestOk())
 }

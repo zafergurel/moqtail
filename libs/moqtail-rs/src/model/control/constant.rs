@@ -16,37 +16,31 @@ use core::convert::From;
 
 use crate::model::error::ParseError;
 
-pub const SUPPORTED_VERSIONS: &str = "moqt-16";
+pub const SUPPORTED_VERSIONS: &str = "moqt-22";
 
+/// Control message types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum ControlMessageType {
-  ClientSetup = 0x20,
-  ServerSetup = 0x21,
-  GoAway = 0x10,
-  MaxRequestId = 0x15,
-  RequestsBlocked = 0x1A,
-  Subscribe = 0x03,
-  SubscribeOk = 0x04,
-  RequestError = 0x05,
-  Unsubscribe = 0x0A,
-  RequestUpdate = 0x02,
-  Fetch = 0x16,
-  FetchOk = 0x18,
-  FetchCancel = 0x17,
-  TrackStatus = 0x0D,
-  PublishNamespace = 0x06,
-  RequestOk = 0x07,
-  Namespace = 0x08,
-  PublishNamespaceDone = 0x09,
-  NamespaceDone = 0x0E,
-  PublishNamespaceCancel = 0x0C,
-  SubscribeNamespace = 0x11,
-  UnsubscribeNamespace = 0x14,
-  Publish = 0x1D,
-  PublishDone = 0x0B,
-  PublishOk = 0x1E,
-  Switch = 0x22,
+  Setup = 0x2F00,            // Control
+  GoAway = 0x10,             // Control, Request
+  Subscribe = 0x03,          // Request, First
+  SubscribeOk = 0x04,        // Request
+  RequestError = 0x05,       // Request
+  RequestUpdate = 0x02,      // Request
+  Fetch = 0x16,              // Request, First
+  FetchOk = 0x18,            // Request
+  TrackStatus = 0x0D,        // Request, First
+  PublishNamespace = 0x06,   // Request, First
+  RequestOk = 0x07,          // Request
+  Namespace = 0x08,          // Request
+  NamespaceDone = 0x0E,      // Request
+  SubscribeNamespace = 0x50, // Request, First
+  SubscribeTracks = 0x51,    // Request, First
+  Publish = 0x1D,            // Request, First
+  PublishDone = 0x0B,        // Request
+  PublishOk = 0x1E,          // Request; an alias of RequestOk, not its own body
+  PublishSkipped = 0x0F,     // Request
 }
 
 impl TryFrom<u64> for ControlMessageType {
@@ -54,32 +48,25 @@ impl TryFrom<u64> for ControlMessageType {
 
   fn try_from(value: u64) -> Result<Self, Self::Error> {
     match value {
-      0x20 => Ok(ControlMessageType::ClientSetup),
-      0x21 => Ok(ControlMessageType::ServerSetup),
+      0x2F00 => Ok(ControlMessageType::Setup),
       0x10 => Ok(ControlMessageType::GoAway),
-      0x15 => Ok(ControlMessageType::MaxRequestId),
-      0x1A => Ok(ControlMessageType::RequestsBlocked),
       0x03 => Ok(ControlMessageType::Subscribe),
       0x04 => Ok(ControlMessageType::SubscribeOk),
       0x05 => Ok(ControlMessageType::RequestError),
-      0x0A => Ok(ControlMessageType::Unsubscribe),
       0x02 => Ok(ControlMessageType::RequestUpdate),
       0x0B => Ok(ControlMessageType::PublishDone),
       0x16 => Ok(ControlMessageType::Fetch),
       0x18 => Ok(ControlMessageType::FetchOk),
-      0x17 => Ok(ControlMessageType::FetchCancel),
       0x0D => Ok(ControlMessageType::TrackStatus),
       0x06 => Ok(ControlMessageType::PublishNamespace),
       0x07 => Ok(ControlMessageType::RequestOk),
       0x08 => Ok(ControlMessageType::Namespace),
-      0x09 => Ok(ControlMessageType::PublishNamespaceDone),
       0x0E => Ok(ControlMessageType::NamespaceDone),
-      0x0C => Ok(ControlMessageType::PublishNamespaceCancel),
-      0x11 => Ok(ControlMessageType::SubscribeNamespace),
-      0x14 => Ok(ControlMessageType::UnsubscribeNamespace),
+      0x50 => Ok(ControlMessageType::SubscribeNamespace),
+      0x51 => Ok(ControlMessageType::SubscribeTracks),
       0x1D => Ok(ControlMessageType::Publish),
       0x1E => Ok(ControlMessageType::PublishOk),
-      0x22 => Ok(ControlMessageType::Switch),
+      0x0F => Ok(ControlMessageType::PublishSkipped),
       _ => Err(ParseError::InvalidType {
         context: " ControlMessageType::try_from(u64)",
         details: format!("Invalid type, got {value}"),
@@ -94,64 +81,87 @@ impl From<ControlMessageType> for u64 {
   }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(u64)]
-pub enum FilterType {
-  NextGroupStart = 0x1,
-  LatestObject = 0x2,
-  AbsoluteStart = 0x3,
-  AbsoluteRange = 0x4,
+impl ControlMessageType {
+  /// True if this message type MUST be the first on a new bidirectional request
+  /// stream. A request stream that opens with any other type is a protocol
+  /// violation and MUST be reset.
+  pub fn is_first(self) -> bool {
+    matches!(
+      self,
+      Self::Subscribe
+        | Self::Fetch
+        | Self::TrackStatus
+        | Self::PublishNamespace
+        | Self::SubscribeNamespace
+        | Self::SubscribeTracks
+        | Self::Publish
+    )
+  }
 }
 
-impl TryFrom<u64> for FilterType {
+/// Which fields of a LOCATION_FILTER follow its type, and how they are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum LocationFilterType {
+  None = 0x0,
+  RelativeStart = 0x1,
+  AbsoluteStart = 0x2,
+  AbsoluteStartGroupEnd = 0x3,
+  AbsoluteRange = 0x4,
+  NextObject = 0x5,
+}
+
+impl TryFrom<u64> for LocationFilterType {
   type Error = ParseError;
 
   fn try_from(value: u64) -> Result<Self, Self::Error> {
     match value {
-      0x1 => Ok(FilterType::NextGroupStart),
-      0x2 => Ok(FilterType::LatestObject),
-      0x3 => Ok(FilterType::AbsoluteStart),
-      0x4 => Ok(FilterType::AbsoluteRange),
+      0x0 => Ok(LocationFilterType::None),
+      0x1 => Ok(LocationFilterType::RelativeStart),
+      0x2 => Ok(LocationFilterType::AbsoluteStart),
+      0x3 => Ok(LocationFilterType::AbsoluteStartGroupEnd),
+      0x4 => Ok(LocationFilterType::AbsoluteRange),
+      0x5 => Ok(LocationFilterType::NextObject),
       _ => Err(ParseError::InvalidType {
-        context: "FilterType::try_from(u64)",
+        context: "LocationFilterType::try_from(u64)",
         details: format!("Invalid type, got {value}"),
       }),
     }
   }
 }
 
-impl From<FilterType> for u64 {
-  fn from(value: FilterType) -> Self {
+impl From<LocationFilterType> for u64 {
+  fn from(value: LocationFilterType) -> Self {
     value as u64
   }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// How a switch stops delivery on the subscription it suspends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
-pub enum FetchType {
-  Standalone = 0x1,
-  RelativeFetch = 0x2,
-  AbsoluteFetch = 0x3,
+pub enum SwitchMode {
+  /// Forward State goes to 0 and the subscription's open streams are reset.
+  Hard = 0x0,
+  Soft = 0x1,
 }
 
-impl TryFrom<u64> for FetchType {
+impl TryFrom<u64> for SwitchMode {
   type Error = ParseError;
 
   fn try_from(value: u64) -> Result<Self, Self::Error> {
     match value {
-      0x1 => Ok(FetchType::Standalone),
-      0x2 => Ok(FetchType::RelativeFetch),
-      0x3 => Ok(FetchType::AbsoluteFetch),
+      0x0 => Ok(SwitchMode::Hard),
+      0x1 => Ok(SwitchMode::Soft),
       _ => Err(ParseError::InvalidType {
-        context: "FetchType::try_from(u64)",
-        details: format!("Invalid type, got {value}"),
+        context: "SwitchMode::try_from(u64)",
+        details: format!("Invalid mode, got {value}"),
       }),
     }
   }
 }
 
-impl From<FetchType> for u64 {
-  fn from(value: FetchType) -> Self {
+impl From<SwitchMode> for u64 {
+  fn from(value: SwitchMode) -> Self {
     value as u64
   }
 }
@@ -183,56 +193,6 @@ impl TryFrom<u8> for GroupOrder {
 impl From<GroupOrder> for u8 {
   fn from(value: GroupOrder) -> Self {
     value as u8
-  }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
-pub enum RequestErrorCode {
-  InternalError = 0x0,
-  Unauthorized = 0x1,
-  Timeout = 0x2,
-  NotSupported = 0x3,
-  MalformedAuthToken = 0x4,
-  ExpiredAuthToken = 0x5,
-  DoesNotExist = 0x10,
-  InvalidRange = 0x11,
-  MalformedTrack = 0x12,
-  DuplicateSubscription = 0x19,
-  Uninterested = 0x20,
-  PrefixOverlap = 0x30,
-  InvalidJoiningRequestId = 0x32,
-}
-
-impl TryFrom<u64> for RequestErrorCode {
-  type Error = ParseError;
-
-  fn try_from(value: u64) -> Result<Self, Self::Error> {
-    match value {
-      0x0 => Ok(RequestErrorCode::InternalError),
-      0x1 => Ok(RequestErrorCode::Unauthorized),
-      0x2 => Ok(RequestErrorCode::Timeout),
-      0x3 => Ok(RequestErrorCode::NotSupported),
-      0x4 => Ok(RequestErrorCode::MalformedAuthToken),
-      0x5 => Ok(RequestErrorCode::ExpiredAuthToken),
-      0x10 => Ok(RequestErrorCode::DoesNotExist),
-      0x11 => Ok(RequestErrorCode::InvalidRange),
-      0x12 => Ok(RequestErrorCode::MalformedTrack),
-      0x19 => Ok(RequestErrorCode::DuplicateSubscription),
-      0x20 => Ok(RequestErrorCode::Uninterested),
-      0x30 => Ok(RequestErrorCode::PrefixOverlap),
-      0x32 => Ok(RequestErrorCode::InvalidJoiningRequestId),
-      _ => Err(ParseError::InvalidType {
-        context: "RequestErrorCode::try_from(u64)",
-        details: format!("Invalid type, got {value}"),
-      }),
-    }
-  }
-}
-
-impl From<RequestErrorCode> for u64 {
-  fn from(value: RequestErrorCode) -> Self {
-    value as u64
   }
 }
 
@@ -272,52 +232,15 @@ impl From<TrackStatusCode> for u64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
-pub enum SubscribeDoneStatusCode {
-  InternalError = 0x0,
-  Unauthorized = 0x1,
-  TrackEnded = 0x2,
-  SubscriptionEnded = 0x3,
-  GoingAway = 0x4,
-  Expired = 0x5,
-  TooFarBehind = 0x6,
-}
-impl TryFrom<u64> for SubscribeDoneStatusCode {
-  type Error = ParseError;
-
-  fn try_from(value: u64) -> Result<Self, Self::Error> {
-    match value {
-      0x0 => Ok(SubscribeDoneStatusCode::InternalError),
-      0x1 => Ok(SubscribeDoneStatusCode::Unauthorized),
-      0x2 => Ok(SubscribeDoneStatusCode::TrackEnded),
-      0x3 => Ok(SubscribeDoneStatusCode::SubscriptionEnded),
-      0x4 => Ok(SubscribeDoneStatusCode::GoingAway),
-      0x5 => Ok(SubscribeDoneStatusCode::Expired),
-      0x6 => Ok(SubscribeDoneStatusCode::TooFarBehind),
-      _ => Err(ParseError::InvalidType {
-        context: "SubscribeDoneStatusCode::try_from(u64)",
-        details: format!("Invalid type, got {value}"),
-      }),
-    }
-  }
-}
-
-impl From<SubscribeDoneStatusCode> for u64 {
-  fn from(value: SubscribeDoneStatusCode) -> Self {
-    value as u64
-  }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
 pub enum PublishDoneStatusCode {
   InternalError = 0x0,
   Unauthorized = 0x1,
   TrackEnded = 0x2,
-  SubscriptionEnded = 0x3,
   GoingAway = 0x4,
-  Expired = 0x5,
-  TooFarBehind = 0x6,
+  TooFarBehind = 0x5,
+  Expired = 0x6,
   UpdateFailed = 0x8,
+  ExcessiveLoad = 0x9,
   MalformedTrack = 0x12,
 }
 
@@ -329,11 +252,11 @@ impl TryFrom<u64> for PublishDoneStatusCode {
       0x0 => Ok(PublishDoneStatusCode::InternalError),
       0x1 => Ok(PublishDoneStatusCode::Unauthorized),
       0x2 => Ok(PublishDoneStatusCode::TrackEnded),
-      0x3 => Ok(PublishDoneStatusCode::SubscriptionEnded),
       0x4 => Ok(PublishDoneStatusCode::GoingAway),
-      0x5 => Ok(PublishDoneStatusCode::Expired),
-      0x6 => Ok(PublishDoneStatusCode::TooFarBehind),
+      0x5 => Ok(PublishDoneStatusCode::TooFarBehind),
+      0x6 => Ok(PublishDoneStatusCode::Expired),
       0x8 => Ok(PublishDoneStatusCode::UpdateFailed),
+      0x9 => Ok(PublishDoneStatusCode::ExcessiveLoad),
       0x12 => Ok(PublishDoneStatusCode::MalformedTrack),
       _ => Err(ParseError::InvalidType {
         context: "PublishDoneStatusCode::try_from(u64)",
@@ -343,8 +266,66 @@ impl TryFrom<u64> for PublishDoneStatusCode {
   }
 }
 
+impl PublishDoneStatusCode {
+  /// Maps a received status code to a known variant, treating any unknown value
+  /// (including GREASE) as `InternalError`. An unknown code is never fatal.
+  pub fn from_wire(value: u64) -> Self {
+    Self::try_from(value).unwrap_or(Self::InternalError)
+  }
+}
+
 impl From<PublishDoneStatusCode> for u64 {
   fn from(value: PublishDoneStatusCode) -> Self {
     value as u64
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::model::common::grease::grease_value;
+
+  #[test]
+  fn is_first_matches_the_request_opening_types() {
+    let first = [
+      ControlMessageType::Subscribe,
+      ControlMessageType::Fetch,
+      ControlMessageType::TrackStatus,
+      ControlMessageType::PublishNamespace,
+      ControlMessageType::SubscribeNamespace,
+      ControlMessageType::SubscribeTracks,
+      ControlMessageType::Publish,
+    ];
+    for t in first {
+      assert!(t.is_first(), "{t:?} should open a request stream");
+    }
+    // A response / control type must not open a request stream.
+    for t in [
+      ControlMessageType::Setup,
+      ControlMessageType::GoAway,
+      ControlMessageType::SubscribeOk,
+      ControlMessageType::RequestOk,
+      ControlMessageType::RequestError,
+      ControlMessageType::FetchOk,
+    ] {
+      assert!(!t.is_first(), "{t:?} must not open a request stream");
+    }
+  }
+
+  #[test]
+  fn publish_done_from_wire_maps_unknown_and_grease_to_internal_error() {
+    // Known codes are preserved.
+    assert_eq!(
+      PublishDoneStatusCode::from_wire(0x2),
+      PublishDoneStatusCode::TrackEnded
+    );
+
+    // Unknown and grease codes fall back to InternalError instead of failing.
+    for raw in [0x7Eu64, grease_value(0).unwrap(), grease_value(5).unwrap()] {
+      assert_eq!(
+        PublishDoneStatusCode::from_wire(raw),
+        PublishDoneStatusCode::InternalError
+      );
+    }
   }
 }

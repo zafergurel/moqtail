@@ -17,11 +17,11 @@ use super::control_message::ControlMessageTrait;
 use crate::model::common::tuple::{Tuple, TupleField};
 use crate::model::common::varint::{BufMutVarIntExt, BufVarIntExt};
 use crate::model::error::ParseError;
-use crate::model::extension_header::track_extension::{
-  TrackExtension, deserialize_track_extensions, serialize_track_extensions,
-};
 use crate::model::parameter::message_parameter::{
-  MessageParameter, deserialize_message_parameters,
+  MessageParameter, deserialize_message_parameters, serialize_message_parameters,
+};
+use crate::model::property::track_property::{
+  TrackProperty, deserialize_track_properties, serialize_track_properties,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -32,7 +32,7 @@ pub struct Publish {
   pub track_name: TupleField,
   pub track_alias: u64,
   pub parameters: Vec<MessageParameter>,
-  pub track_extensions: Vec<TrackExtension>,
+  pub track_properties: Vec<TrackProperty>,
 }
 
 impl Publish {
@@ -42,7 +42,7 @@ impl Publish {
     track_name: TupleField,
     track_alias: u64,
     parameters: Vec<MessageParameter>,
-    track_extensions: Vec<TrackExtension>,
+    track_properties: Vec<TrackProperty>,
   ) -> Self {
     Self {
       request_id,
@@ -50,7 +50,7 @@ impl Publish {
       track_name,
       track_alias,
       parameters,
-      track_extensions,
+      track_properties,
     }
   }
 }
@@ -72,12 +72,10 @@ impl ControlMessageTrait for Publish {
 
     // Parameters
     payload.put_vi(self.parameters.len() as u64)?;
-    for param in &self.parameters {
-      payload.extend_from_slice(&param.serialize()?);
-    }
+    payload.extend_from_slice(&serialize_message_parameters(&self.parameters)?);
 
-    // Track Extensions (no length prefix; bounded by outer message Length field)
-    payload.extend_from_slice(&serialize_track_extensions(&self.track_extensions)?);
+    // Track Properties (no length prefix; bounded by outer message Length field)
+    payload.extend_from_slice(&serialize_track_properties(&self.track_properties)?);
 
     let payload_len: u16 = payload
       .len()
@@ -115,8 +113,8 @@ impl ControlMessageTrait for Publish {
     let parameters =
       deserialize_message_parameters(payload, param_count, ControlMessageType::Publish)?;
 
-    // Track Extensions: consume whatever remains in the payload
-    let track_extensions = deserialize_track_extensions(payload)?;
+    // Track Properties: consume whatever remains in the payload
+    let track_properties = deserialize_track_properties(payload)?;
 
     Ok(Box::new(Publish {
       request_id,
@@ -124,7 +122,7 @@ impl ControlMessageTrait for Publish {
       track_name,
       track_alias,
       parameters,
-      track_extensions,
+      track_properties,
     }))
   }
 
@@ -138,13 +136,13 @@ mod tests {
   use super::*;
   use crate::model::common::location::Location;
   use crate::model::control::constant::GroupOrder;
-  use crate::model::extension_header::track_extension::TrackExtension;
   use crate::model::parameter::message_parameter::MessageParameter;
+  use crate::model::property::track_property::TrackProperty;
   use bytes::Buf;
 
   #[test]
   fn test_roundtrip() {
-    let publish = Publish::new(
+    let mut publish = Publish::new(
       123,
       Tuple::from_utf8_path("example/track"),
       TupleField::from_utf8("video"),
@@ -157,6 +155,8 @@ mod tests {
       ],
       vec![],
     );
+    // Wire encoding canonicalizes parameter order ascending by type (delta-encoding requirement).
+    publish.parameters.sort_by_key(|p| p.type_value());
 
     let mut buf = publish.serialize().unwrap();
     let msg_type = buf.get_vi().unwrap();
@@ -190,7 +190,7 @@ mod tests {
   }
 
   #[test]
-  fn test_roundtrip_with_track_extensions() {
+  fn test_roundtrip_with_track_properties() {
     let publish = Publish::new(
       1,
       Tuple::from_utf8_path("ns/track"),
@@ -198,8 +198,8 @@ mod tests {
       7,
       vec![],
       vec![
-        TrackExtension::DeliveryTimeout { timeout_ms: 3000 },
-        TrackExtension::DefaultPublisherPriority { priority: 100 },
+        TrackProperty::ObjectDeliveryTimeout { timeout_ms: 3000 },
+        TrackProperty::DefaultPublisherPriority { priority: 100 },
       ],
     );
 

@@ -14,33 +14,65 @@
 
 use bytes::{Buf, BufMut, BytesMut};
 use tokio::time::{Duration, Instant, sleep_until};
-use tracing::{error, info, warn};
-use wtransport::error::StreamReadError;
-use wtransport::{RecvStream, SendStream};
+use tracing::{debug, error, info, warn};
 
 use crate::model::control::control_message::{ControlMessage, ControlMessageTrait};
+use crate::model::control::setup::Setup;
 use crate::model::error::{ParseError, TerminationCode};
+use crate::transport::connection::{TransportReadError, TransportRecvStream, TransportSendStream};
 
 const CONTROL_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MTU_SIZE: usize = 1500; // Standard MTU size, max 2^16-1
 
+/// Formats bytes as space-separated lowercase hex, for tracing raw control
+/// messages on the wire (paste straight into tools/moq_decode.py).
+fn to_hex(bytes: &[u8]) -> String {
+  use std::fmt::Write;
+  let mut s = String::with_capacity(bytes.len() * 3);
+  for b in bytes {
+    let _ = write!(s, "{b:02x} ");
+  }
+  s.pop();
+  s
+}
+
 pub struct ControlStreamHandler {
-  send: SendStream,
-  recv: RecvStream,
+  send: TransportSendStream,
+  recv: TransportRecvStream,
   recv_bytes: BytesMut,
   recv_buf: Box<[u8; MTU_SIZE]>,
   partial_message_deadline: Option<Instant>,
+  /// Id of the peer connection on the other end of this stream, used to label
+  /// control-message traces. `None` when the caller did not set one.
+  peer_id: Option<usize>,
 }
 
 impl ControlStreamHandler {
-  pub fn new(send: SendStream, recv: RecvStream) -> Self {
+  pub fn new(send: TransportSendStream, recv: TransportRecvStream) -> Self {
     Self {
       send,
       recv,
       recv_bytes: BytesMut::new(),
       recv_buf: Box::new([0; MTU_SIZE]),
       partial_message_deadline: None,
+      peer_id: None,
+    }
+  }
+
+  /// Associates the peer connection id with this stream so control-message
+  /// traces can name the other endpoint. RX lines read as "received from" this
+  /// peer, TX lines as "sending to" it.
+  pub fn with_peer_id(mut self, peer_id: usize) -> Self {
+    self.peer_id = Some(peer_id);
+    self
+  }
+
+  /// Renders the peer connection for trace lines, e.g. `conn 12` or `conn ?`.
+  fn peer(&self) -> String {
+    match self.peer_id {
+      Some(id) => format!("conn {id}"),
+      None => "conn ?".to_string(),
     }
   }
 
@@ -48,11 +80,49 @@ impl ControlStreamHandler {
     let bytes = message
       .serialize()
       .map_err(|_| TerminationCode::InternalError)?;
+    info!(
+      "control message sending to {} — {:?} ({} bytes): {}",
+      self.peer(),
+      message.get_type(),
+      bytes.len(),
+      to_hex(&bytes)
+    );
     if (self.send.write_all(&bytes).await).is_err() {
       warn!("Error sending message: {:?}", message);
       return Err(TerminationCode::InternalError);
     }
     Ok(())
+  }
+
+  /// Resets this request stream with an application error code (QUIC
+  /// RESET_STREAM). Used to abort a request, e.g. a failed REQUEST_UPDATE.
+  pub fn reset(&mut self, code: u64) {
+    if let Err(e) = self.send.reset(code) {
+      warn!("Error resetting request stream: {:?}", e);
+    }
+  }
+
+  /// Ends this request stream cleanly: FIN on the send half, so everything already
+  /// written is delivered. Dropping the handler instead resets the send stream, and
+  /// a reset discards bytes the peer has not read yet — which loses the last message
+  /// written, PUBLISH_DONE being the one that ends a request.
+  pub async fn finish(&mut self) {
+    if let Err(e) = self.send.finish().await {
+      debug!("Error finishing request stream: {:?}", e);
+    }
+  }
+
+  /// Aborts this bidirectional request stream in both directions with the same
+  /// application error code: RESET_STREAM on the send half and STOP_SENDING on
+  /// the recv half. Consumes the handler, since stopping the recv half takes
+  /// ownership. Prefer this over `reset` when cancelling a bidi request, so the
+  /// peer observes a coherent code on both halves instead of a STOP_SENDING(0)
+  /// (InternalError) emitted when the handler is later dropped.
+  pub fn reset_and_stop(mut self, code: u64) {
+    if let Err(e) = self.send.reset(code) {
+      warn!("Error resetting request stream: {:?}", e);
+    }
+    self.recv.stop(code);
   }
 
   // TODO: refactor here, implement Serializable trait for ControlMessage
@@ -63,11 +133,33 @@ impl ControlStreamHandler {
     let bytes = message
       .serialize()
       .map_err(|_| TerminationCode::InternalError)?;
+    info!(
+      "control message sending to {} — {:?} ({} bytes): {}",
+      self.peer(),
+      message.get_type(),
+      bytes.len(),
+      to_hex(&bytes)
+    );
     if (self.send.write_all(&bytes).await).is_err() {
       warn!("Error sending (send_impl) message: {:?}", message);
       return Err(TerminationCode::InternalError);
     }
     Ok(())
+  }
+
+  /// Reads the first message on a control stream, which must be SETUP. Any other
+  /// first message closes the session with PROTOCOL_VIOLATION.
+  pub async fn read_setup(&mut self) -> Result<Setup, TerminationCode> {
+    match self.next_message().await? {
+      ControlMessage::Setup(setup) => Ok(*setup),
+      other => {
+        warn!(
+          "Control stream did not begin with SETUP, got {:?}",
+          other.get_type()
+        );
+        Err(TerminationCode::ProtocolViolation)
+      }
+    }
   }
 
   pub async fn next_message(&mut self) -> Result<ControlMessage, TerminationCode> {
@@ -79,6 +171,13 @@ impl ControlStreamHandler {
         match ControlMessage::deserialize(&mut bytes) {
           Ok(msg) => {
             let consumed = original_remaining - bytes.remaining();
+            info!(
+              "control message received from {} — {:?} ({} bytes): {}",
+              self.peer(),
+              msg.get_type(),
+              consumed,
+              to_hex(&self.recv_bytes[..consumed])
+            );
             self.recv_bytes.advance(consumed);
 
             self.partial_message_deadline = None;
@@ -86,6 +185,12 @@ impl ControlStreamHandler {
             return Ok(msg);
           }
           Err(ParseError::ProtocolViolation { .. }) => {
+            warn!(
+              "control message received from {} failed to parse ({} bytes): {}",
+              self.peer(),
+              self.recv_bytes.len(),
+              to_hex(&self.recv_bytes)
+            );
             return Err(TerminationCode::ProtocolViolation);
           }
 
@@ -135,7 +240,7 @@ impl ControlStreamHandler {
   /// Handle the result of a stream read operation
   fn handle_read_result(
     &mut self,
-    res: Result<Option<usize>, wtransport::error::StreamReadError>,
+    res: Result<Option<usize>, TransportReadError>,
     is_partial_message: bool,
   ) -> Result<(), TerminationCode> {
     match res {
@@ -155,12 +260,14 @@ impl ControlStreamHandler {
         } else {
           warn!("Stream closed cleanly while waiting for data");
         }
-        // The stream was closed cleanly by the peer.
-        Err(TerminationCode::InternalError)
+        // A peer that closes the control stream mid-session commits a protocol
+        // violation. On a request stream a clean close is instead the ordinary
+        // cancellation, and those callers act on the close rather than this code.
+        Err(TerminationCode::ProtocolViolation)
       }
       Err(e) => {
         match e {
-          StreamReadError::NotConnected => {
+          TransportReadError::NotConnected => {
             info!("Client disconnected while reading control stream");
             // Client has disconnected - this is not an error, return NoError
             // so the caller knows not to try closing the connection
@@ -185,19 +292,16 @@ mod tests {
   use super::*;
   use crate::model::common::location::Location;
   use crate::model::common::pair::KeyValuePair;
-  use crate::model::common::reason_phrase::ReasonPhrase;
   use crate::model::common::tuple::{Tuple, TupleField};
   use crate::model::common::varint::BufMutVarIntExt;
-  use crate::model::control::client_setup::ClientSetup;
-  use crate::model::control::constant::RequestErrorCode;
   use crate::model::control::constant::{ControlMessageType, GroupOrder};
   use crate::model::control::publish_namespace::PublishNamespace;
-  use crate::model::control::publish_namespace_cancel::PublishNamespaceCancel;
   use crate::model::control::request_ok::RequestOk;
-  use crate::model::control::server_setup::ServerSetup;
+  use crate::model::control::setup::Setup;
   use crate::model::control::subscribe::Subscribe;
   use crate::model::control::subscribe_ok::SubscribeOk;
   use crate::model::parameter::authorization_token::AuthorizationToken;
+  use crate::model::parameter::location_filter::LocationFilter;
   use crate::model::parameter::message_parameter::MessageParameter;
   use bytes::Bytes;
   use std::error::Error;
@@ -205,7 +309,7 @@ mod tests {
   use tokio::sync::Mutex;
   use tokio::time::sleep;
   use wtransport::endpoint::IntoConnectOptions;
-  use wtransport::{ClientConfig, Connection, Endpoint, Identity};
+  use wtransport::{ClientConfig, Connection, Endpoint, Identity, SendStream};
 
   struct TestSetup {
     client: Connection,
@@ -312,7 +416,10 @@ mod tests {
       // Set control stream to max priority
       server_send.set_priority(i32::MAX);
 
-      let plane = ControlStreamHandler::new(client_send, client_recv);
+      let plane = ControlStreamHandler::new(
+        TransportSendStream::WebTransport(client_send),
+        TransportRecvStream::WebTransport(client_recv),
+      );
       Ok((plane, server_send))
     }
   }
@@ -331,20 +438,7 @@ mod tests {
   }
 
   fn create_test_announce_ok() -> RequestOk {
-    let request_id = 12345;
-    RequestOk::new(request_id, vec![])
-  }
-
-  fn create_test_announce_cancel() -> PublishNamespaceCancel {
-    let request_id = 1337;
-    let error_code = RequestErrorCode::InternalError;
-    let reason_phrase = ReasonPhrase::try_new("bomboclad".to_string()).unwrap();
-
-    PublishNamespaceCancel {
-      request_id,
-      error_code,
-      reason_phrase,
-    }
+    RequestOk::new(vec![])
   }
 
   fn create_test_subscribe() -> Subscribe {
@@ -355,54 +449,63 @@ mod tests {
       group: 81,
       object: 81,
     };
-    Subscribe::new_absolute_range(
+    let mut subscribe = Subscribe::new_with_location_filter(
       request_id,
       track_namespace,
       track_name,
-      start_location,
-      100,
+      LocationFilter::AbsoluteStartGroupEnd {
+        start: start_location,
+        end_group: 100,
+      },
       vec![
         MessageParameter::new_subscriber_priority(31),
         MessageParameter::new_group_order(GroupOrder::Original),
         MessageParameter::new_forward(true),
       ],
-    )
+    );
+    // Wire encoding canonicalizes parameter order ascending by type (delta-encoding requirement).
+    subscribe
+      .subscribe_parameters
+      .sort_by_key(|p| p.type_value());
+    subscribe
   }
 
   fn create_test_subscribe_ok() -> SubscribeOk {
-    use crate::model::control::constant::GroupOrder;
-    use crate::model::extension_header::track_extension::TrackExtension;
     use crate::model::parameter::message_parameter::MessageParameter;
-    SubscribeOk::new(
-      145136,
+    use crate::model::property::track_property::TrackProperty;
+    let mut subscribe_ok = SubscribeOk::new(
       999,
       vec![
         MessageParameter::new_expires(16),
-        MessageParameter::new_group_order(GroupOrder::Ascending),
         MessageParameter::new_largest_object(Location {
           group: 34,
           object: 0,
         }),
         MessageParameter::new_expires(100),
       ],
-      vec![TrackExtension::DeliveryTimeout { timeout_ms: 5000 }],
-    )
+      vec![TrackProperty::ObjectDeliveryTimeout { timeout_ms: 5000 }],
+    );
+    // Wire encoding canonicalizes parameter order ascending by type (delta-encoding requirement).
+    subscribe_ok
+      .subscribe_parameters
+      .sort_by_key(|p| p.type_value());
+    subscribe_ok
   }
 
-  fn create_test_client_setup() -> ClientSetup {
-    let setup_parameters = vec![
+  fn create_test_client_setup() -> Setup {
+    let setup_options = vec![
       KeyValuePair::try_new_varint(0, 10).unwrap(),
       KeyValuePair::try_new_bytes(1, Bytes::from_static(b"Set me up!")).unwrap(),
     ];
-    ClientSetup { setup_parameters }
+    Setup { setup_options }
   }
 
-  fn create_test_server_setup() -> ServerSetup {
-    let setup_parameters = vec![
+  fn create_test_server_setup() -> Setup {
+    let setup_options = vec![
       KeyValuePair::try_new_varint(0, 10).unwrap(),
       KeyValuePair::try_new_bytes(1, Bytes::from_static(b"Set me up!")).unwrap(),
     ];
-    ServerSetup { setup_parameters }
+    Setup { setup_options }
   }
 
   #[tokio::test]
@@ -432,6 +535,58 @@ mod tests {
     assert_eq!(buf, [1, 2, 3, 4]);
 
     Ok(())
+  }
+
+  /// The control plane is a pair of uni streams, each beginning with SETUP.
+  /// Drive the full client<->server handshake and assert both sides read SETUP
+  /// as the first message.
+  #[tokio::test]
+  async fn test_setup_handshake_over_two_uni_streams() -> Result<(), Box<dyn Error>> {
+    let setup = TestSetup::new().await?;
+
+    // Client opens its control send stream and writes CLIENT_SETUP first.
+    let mut client_send = setup.client.open_uni().await?.await?;
+    let client_setup = create_test_client_setup();
+    client_send.write_all(&client_setup.serialize()?).await?;
+
+    // Server accepts the client's control stream and opens its own, SETUP first.
+    let server_recv = setup.server.accept_uni().await?;
+    let mut server_send = setup.server.open_uni().await?.await?;
+    let server_setup = create_test_server_setup();
+    server_send.write_all(&server_setup.serialize()?).await?;
+
+    let client_recv = setup.client.accept_uni().await?;
+
+    let mut server_plane = ControlStreamHandler::new(
+      TransportSendStream::WebTransport(server_send),
+      TransportRecvStream::WebTransport(server_recv),
+    );
+    let mut client_plane = ControlStreamHandler::new(
+      TransportSendStream::WebTransport(client_send),
+      TransportRecvStream::WebTransport(client_recv),
+    );
+
+    // Each direction's first message is SETUP.
+    assert_eq!(server_plane.read_setup().await.unwrap(), client_setup);
+    assert_eq!(client_plane.read_setup().await.unwrap(), server_setup);
+
+    Ok(())
+  }
+
+  /// A control stream whose first message is not SETUP is a PROTOCOL_VIOLATION.
+  #[tokio::test]
+  async fn test_first_message_not_setup_is_protocol_violation() -> Result<(), Box<dyn Error>> {
+    let setup = TestSetup::new().await?;
+    let (mut plane, mut server_send) = setup.create_control_plane().await?;
+
+    // Send a non-SETUP message as the first message on the control stream.
+    let announce = ControlMessage::PublishNamespace(Box::new(create_test_publish_namespace()));
+    server_send.write_all(&announce.serialize()?).await?;
+
+    match plane.read_setup().await {
+      Err(TerminationCode::ProtocolViolation) => Ok(()),
+      other => panic!("Expected ProtocolViolation, got {other:?}"),
+    }
   }
 
   #[tokio::test]
@@ -480,8 +635,8 @@ mod tests {
     let (mut plane, mut server_send) = setup.create_control_plane().await?;
 
     // Create a valid message using helper
-    let announce_cancel = Box::new(create_test_announce_cancel());
-    let msg = ControlMessage::PublishNamespaceCancel(announce_cancel.clone()); // Clone for assertion
+    let announce = Box::new(create_test_publish_namespace());
+    let msg = ControlMessage::PublishNamespace(announce.clone()); // Clone for assertion
     let bytes = msg.serialize().unwrap();
 
     // Send first half
@@ -498,11 +653,48 @@ mod tests {
     // Should successfully receive the complete message
     let received = plane.next_message().await.unwrap();
     match received {
-      ControlMessage::PublishNamespaceCancel(rec_cancel) => assert_eq!(rec_cancel, announce_cancel),
+      ControlMessage::PublishNamespace(rec) => assert_eq!(rec, announce),
       _ => panic!("Received incorrect message type"),
     }
 
     Ok(())
+  }
+
+  /// A PUBLISH_DONE written and immediately followed by the stream FIN (so the
+  /// payload and the FIN arrive together) must still be delivered by
+  /// `next_message()` before the FIN is reported on the following call. This is
+  /// what lets the relay forward an upstream's final PUBLISH_DONE instead of
+  /// losing it to the coalesced close.
+  #[tokio::test]
+  async fn test_publish_done_coalesced_with_fin_is_delivered() -> Result<(), Box<dyn Error>> {
+    use crate::model::common::reason_phrase::ReasonPhrase;
+    use crate::model::control::constant::PublishDoneStatusCode;
+    use crate::model::control::publish_done::PublishDone;
+
+    let setup = TestSetup::new().await?;
+    let (mut plane, mut server_send) = setup.create_control_plane().await?;
+
+    let done = PublishDone::new(
+      PublishDoneStatusCode::TrackEnded,
+      3,
+      ReasonPhrase::try_new("bye".to_string()).unwrap(),
+    );
+    let msg = ControlMessage::PublishDone(Box::new(done.clone()));
+
+    // Write the message, then FIN so the payload and the FIN are coalesced.
+    server_send.write_all(&msg.serialize()?).await?;
+    server_send.finish().await?;
+
+    match plane.next_message().await {
+      Ok(ControlMessage::PublishDone(rec)) => assert_eq!(*rec, done),
+      other => panic!("Expected PublishDone, got {other:?}"),
+    }
+
+    // The FIN is only observed as an error on the following call.
+    match plane.next_message().await {
+      Err(_) => Ok(()),
+      Ok(m) => panic!("Expected error after FIN, got {m:?}"),
+    }
   }
 
   #[tokio::test]
@@ -517,18 +709,16 @@ mod tests {
     let announce_ok1 = Box::new(create_test_announce_ok());
     let subscribe1 = Box::new(create_test_subscribe());
     let subscribe_ok1 = Box::new(create_test_subscribe_ok());
-    let announce_cancel1 = Box::new(create_test_announce_cancel());
     let client_setup = Box::new(create_test_client_setup());
     let server_setup = Box::new(create_test_server_setup());
 
     let messages_to_send = vec![
-      ControlMessage::ClientSetup(client_setup),
-      ControlMessage::ServerSetup(server_setup),
+      ControlMessage::Setup(client_setup),
+      ControlMessage::Setup(server_setup),
       ControlMessage::PublishNamespace(announce1),
       ControlMessage::RequestOk(announce_ok1),
       ControlMessage::Subscribe(subscribe1),
       ControlMessage::SubscribeOk(subscribe_ok1),
-      ControlMessage::PublishNamespaceCancel(announce_cancel1),
     ];
 
     // Clone messages for sending task

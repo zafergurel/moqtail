@@ -21,10 +21,7 @@ import { Tuple } from './tuple'
 import { ReasonPhrase } from './reason_phrase'
 import { FullTrackName } from '../data'
 
-const MAX_VARINT_1BYTE = 2n ** 6n - 1n // 0-63 (6 bits)
-const MAX_VARINT_2BYTE = 2n ** 14n - 1n // 0-16383 (14 bits)
-const MAX_VARINT_4BYTE = 2n ** 30n - 1n // 0-1073741823 (30 bits)
-const MAX_VARINT_8BYTE = 2n ** 62n - 1n // 0-4611686018427387903 (62 bits)
+const MAX_VARINT_VALUE = 2n ** 64n - 1n
 
 export abstract class BaseByteBuffer {
   protected buf: Uint8Array
@@ -79,39 +76,40 @@ export abstract class BaseByteBuffer {
     if (this.remaining < 1) throw new NotEnoughBytesError('getVI.first_byte', 1, this.remaining)
 
     const first = this.getU8()
-    const prefix = first >> 6
-    let numBytes: number
-    switch (prefix) {
-      case 0:
-        numBytes = 1
-        break
-      case 1:
-        numBytes = 2
-        break
-      case 2:
-        numBytes = 4
-        break
-      case 3:
-        numBytes = 8
-        break
-      default:
-        throw new Error('Invalid varint prefix')
-    }
 
-    if (numBytes > 1 && this.remaining < numBytes - 1) {
+    const leadingOnes = this.countLeadingOnes(first)
+    const length = leadingOnes + 1
+    const extra = length - 1
+
+    if (this.remaining < extra) {
       this._offset--
-      throw new NotEnoughBytesError('getVI.continuation', numBytes, this.remaining + 1)
+      throw new NotEnoughBytesError('getVI.continuation', length, this.remaining + 1)
     }
 
-    let result = BigInt(first & 0b00111111)
-    if (numBytes > 1) {
-      result <<= BigInt((numBytes - 1) * 8)
-      for (let i = 1; i < numBytes; i++) {
-        const b = BigInt(this.getU8())
-        result |= b << BigInt((numBytes - 1 - i) * 8)
-      }
+    let result = this.firstByteValueBits(first, length)
+    for (let i = 0; i < extra; i++) {
+      result = (result << 8n) | BigInt(this.getU8())
     }
     return result
+  }
+
+  countLeadingOnes(byte: number): number {
+    let count = 0
+    let mask = 0x80 // 1000_0000
+    while (mask !== 0 && (byte & mask) !== 0) {
+      count++
+      mask >>= 1
+    }
+    return count
+  }
+
+  firstByteValueBits(first: number, length: number): bigint {
+    if (length === 9) {
+      return 0n
+    }
+    const dataBitsInFirstByte = 8 - length
+    const mask = (1 << dataBitsInFirstByte) - 1
+    return BigInt(first & mask)
   }
 
   getNumberVI(): number {
@@ -235,48 +233,53 @@ export class ByteBuffer extends BaseByteBuffer {
   }
 
   /**
-   * Write a variable-length integer (QUIC-style varint)
-   * Encoding:
-   * - 2 MSB = 00: 1 byte (6 bits) for values 0-63
-   * - 2 MSB = 01: 2 bytes (14 bits) for values 0-16383
-   * - 2 MSB = 10: 4 bytes (30 bits) for values 0-1073741823
-   * - 2 MSB = 11: 8 bytes (62 bits) for values 0-4611686018427387903
-   */
+  /**
+  * Encode a MOQT varint using the minimal length.
+  */
   putVI(v: bigint | number): void {
     const value = typeof v === 'number' ? BigInt(v) : v
 
-    if (value < 0) {
+    if (value < 0n) {
       throw new CastingError('putVI', typeof v, 'unsigned varint', 'negative values are not supported')
     }
-
-    if (value <= MAX_VARINT_1BYTE) {
-      // 1 byte encoding (6 bits)
-      this.putU8(Number(value))
-    } else if (value <= MAX_VARINT_2BYTE) {
-      // 2 byte encoding (14 bits)
-      this.ensureCapacity(2)
-      this.view.setUint8(this._length++, Number((value >> 8n) | 0b01000000n))
-      this.view.setUint8(this._length++, Number(value & 0xffn))
-    } else if (value <= MAX_VARINT_4BYTE) {
-      // 4 byte encoding (30 bits)
-      this.ensureCapacity(4)
-      this.view.setUint8(this._length++, Number((value >> 24n) | 0b10000000n))
-      this.view.setUint8(this._length++, Number((value >> 16n) & 0xffn))
-      this.view.setUint8(this._length++, Number((value >> 8n) & 0xffn))
-      this.view.setUint8(this._length++, Number(value & 0xffn))
-    } else if (value <= MAX_VARINT_8BYTE) {
-      // 8 byte encoding (62 bits)
-      this.ensureCapacity(8)
-      this.view.setUint8(this._length++, Number((value >> 56n) | 0b11000000n))
-      this.view.setUint8(this._length++, Number((value >> 48n) & 0xffn))
-      this.view.setUint8(this._length++, Number((value >> 40n) & 0xffn))
-      this.view.setUint8(this._length++, Number((value >> 32n) & 0xffn))
-      this.view.setUint8(this._length++, Number((value >> 24n) & 0xffn))
-      this.view.setUint8(this._length++, Number((value >> 16n) & 0xffn))
-      this.view.setUint8(this._length++, Number((value >> 8n) & 0xffn))
-      this.view.setUint8(this._length++, Number(value & 0xffn))
-    } else {
+    if (value > MAX_VARINT_VALUE) {
       throw new VarIntOverflowError('putVI', Number(value))
+    }
+
+    // Choose the minimal length: lengths 1-8 hold 7*length bits, else 9 bytes.
+    let length = 9
+    for (let l = 1; l <= 8; l++) {
+      if (value < 1n << BigInt(7 * l)) {
+        length = l
+        break
+      }
+    }
+
+    this.ensureCapacity(length)
+
+    if (length === 9) {
+      // First byte 0xFF (all leading ones), then the full 64-bit value.
+      this.view.setUint8(this._length++, 0xff)
+      for (let i = 7; i >= 0; i--) {
+        this.view.setUint8(this._length++, Number((value >> BigInt(8 * i)) & 0xffn))
+      }
+      return
+    }
+
+    const bytes: number[] = []
+
+    for (let i = length - 1; i >= 0; i--) {
+      bytes.push(Number((value >> BigInt(8 * i)) & 0xffn))
+    }
+
+    const ones = length - 1
+    if (ones > 0) {
+      const prefix = (((1 << ones) - 1) << (8 - ones)) & 0xff
+      bytes[0] = (bytes[0] ?? 0) | prefix
+    }
+
+    for (const b of bytes) {
+      this.view.setUint8(this._length++, b)
     }
   }
 
@@ -566,73 +569,113 @@ if (import.meta.vitest) {
       })
     })
 
+    // Every vector here comes from dev/conformance/draft22/varint.json, which is shared
+    // with moqtail-rs. Table 1 (the length/range summary) and Table 2 (the example
+    // encodings) live there, not in this file. The loader is imported dynamically so it
+    // stays out of the published bundle: this whole block is dead code once
+    // import.meta.vitest is defined away at build time.
     describe('varint encoding/decoding', () => {
-      test('encodes and decodes small numbers (0-63)', () => {
-        const values = [0, 1, 10, 63]
-        for (const value of values) {
+      const fixture = async () => await import('../../../test/conformance')
+
+      test('Table 2 vectors encode to exact bytes', async () => {
+        const { varint, parseValue, parseBytes } = await fixture()
+        const entries = varint().vectors.entries.filter((v) => v.minimal)
+        expect(entries.length).toBeGreaterThan(0)
+        for (const v of entries) {
           const buf = new ByteBuffer()
-          buf.putVI(value)
-          const readBuf = new ByteBuffer()
-          readBuf.putBytes(buf.toUint8Array())
-          const decoded = readBuf.getVI()
-          expect(decoded).toBe(BigInt(value))
-          expect(buf.length).toBe(1)
+          buf.putVI(parseValue(v.value))
+          expect(buf.toUint8Array(), `encode ${v.value}`).toEqual(parseBytes(v.encoding))
         }
       })
 
-      test('encodes and decodes medium numbers (64-16383)', () => {
-        const values = [64, 127, 128, 255, 300, 1000, 16383]
-        for (const value of values) {
-          const buf = new ByteBuffer()
-          buf.putVI(value)
-          const readBuf = new ByteBuffer()
-          readBuf.putBytes(buf.toUint8Array())
-          const decoded = readBuf.getVI()
-          expect(decoded).toBe(BigInt(value))
-          expect(buf.length).toBe(2)
+      test('Table 2 vectors decode to exact values', async () => {
+        const { varint, parseValue, parseBytes } = await fixture()
+        const entries = varint().vectors.entries
+        expect(entries.length).toBeGreaterThan(0)
+        for (const v of entries) {
+          const buf = new FrozenByteBuffer(parseBytes(v.encoding))
+          expect(buf.getVI(), `decode ${v.encoding}`).toBe(parseValue(v.value))
+          expect(buf.remaining).toBe(0)
         }
       })
 
-      test('encodes and decodes large numbers (16384-1073741823)', () => {
-        const values = [16384, 65535, 65536, 1000000, 1073741823]
-        for (const value of values) {
+      test('encodes boundaries at minimal length and exact bytes', async () => {
+        const { varint, parseValue, parseBytes } = await fixture()
+        const entries = varint().boundaries.entries
+        expect(entries.length).toBeGreaterThan(0)
+        for (const b of entries) {
           const buf = new ByteBuffer()
-          buf.putVI(value)
-          const readBuf = new ByteBuffer()
-          readBuf.putBytes(buf.toUint8Array())
-          const decoded = readBuf.getVI()
-          expect(decoded).toBe(BigInt(value))
-          expect(buf.length).toBe(4)
+          buf.putVI(parseValue(b.value))
+          expect(buf.length, `length for ${b.value}`).toBe(b.length)
+          expect(buf.toUint8Array(), `encoding for ${b.value}`).toEqual(parseBytes(b.encoding))
         }
       })
 
-      test('encodes and decodes very large numbers (bigint)', () => {
-        const values = [
-          1073741824n,
-          4294967295n, // max 32-bit unsigned
-          4294967296n,
-          4611686018427387903n, // max varint (62 bits)
-        ]
-        for (const value of values) {
+      test('round-trips across all lengths', async () => {
+        const { varint, parseValue } = await fixture()
+        const entries = varint().roundtrip_values.entries
+        expect(entries.length).toBeGreaterThan(0)
+        for (const raw of entries) {
+          const value = parseValue(raw)
           const buf = new ByteBuffer()
           buf.putVI(value)
-          const readBuf = new ByteBuffer()
-          readBuf.putBytes(buf.toUint8Array())
-
-          const decoded = readBuf.getVI()
-          expect(decoded).toBe(value)
-          expect(buf.length).toBe(8)
+          expect(buf.freeze().getVI()).toBe(value)
+        }
+        // number inputs must behave identically to their bigint equivalents.
+        for (const value of [0, 63, 64, 127, 128, 16384]) {
+          const buf = new ByteBuffer()
+          buf.putVI(value)
+          expect(buf.freeze().getVI()).toBe(BigInt(value))
         }
       })
 
-      test('throws on numbers too large to encode', () => {
+      test('decodes non-minimal encodings', async () => {
+        const { varint, parseValue, parseBytes } = await fixture()
+        const entries = varint().non_minimal.entries
+        expect(entries.length).toBeGreaterThan(0)
+        for (const n of entries) {
+          const buf = new FrozenByteBuffer(parseBytes(n.encoding))
+          expect(buf.getVI(), `decode ${n.encoding}`).toBe(parseValue(n.value))
+          expect(buf.remaining).toBe(0)
+        }
+      })
+
+      test('minimal encodings have the expected prefix shape', async () => {
+        const { varint, parseValue, parseHex } = await fixture()
+        const entries = varint().prefix_shapes.entries
+        expect(entries.length).toBeGreaterThan(0)
+        for (const p of entries) {
+          const buf = new ByteBuffer()
+          buf.putVI(parseValue(p.value))
+          const first = BigInt(buf.toUint8Array()[0]!)
+          expect(first & parseHex(p.mask), `prefix for ${p.value}`).toBe(parseHex(p.prefix))
+        }
+      })
+
+      test('throws on truncated encodings', async () => {
+        const { varint, parseBytes } = await fixture()
+        const entries = varint().truncated.entries
+        expect(entries.length).toBeGreaterThan(0)
+        for (const t of entries) {
+          expect(() => new FrozenByteBuffer(parseBytes(t.encoding)).getVI(), t.reason).toThrow()
+        }
+      })
+
+      test('throws on negative values', () => {
         const buf = new ByteBuffer()
-        const tooLarge = 4611686018427387904n // 1 more than max
+        expect(() => buf.putVI(-1)).toThrow()
+      })
+
+      test('throws on values too large to encode', () => {
+        const buf = new ByteBuffer()
+        const tooLarge = 18446744073709551616n // 2^64, one more than max
         expect(() => buf.putVI(tooLarge)).toThrow()
       })
-      test('empty varint', () => {
-        const buf = new ByteBuffer()
-        expect(() => buf.getVI()).toThrow()
+
+      test('leaves trailing bytes untouched', () => {
+        const buf = new FrozenByteBuffer(new Uint8Array([0x25, 0xaa, 0xbb]))
+        expect(buf.getVI()).toBe(37n)
+        expect(buf.getU8()).toBe(0xaa)
       })
     })
 

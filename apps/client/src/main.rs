@@ -15,15 +15,19 @@
 mod cli;
 mod connection;
 mod fetcher;
+mod filter_spec;
+mod prefix_subscriber;
 mod publisher;
+mod routing;
 mod stats;
 mod subscriber;
 mod switcher;
 mod utils;
 
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, CliFilter, Command, PrefixKind};
 use connection::MoqConnection;
+use moqtail::model::parameter::message_parameter::MessageParameter;
 use publisher::TrackSpec;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -40,7 +44,22 @@ async fn main() -> Result<(), anyhow::Error> {
     cli.server, cli.namespace, cli.track_name
   );
 
-  let moq_conn = MoqConnection::establish(&cli.server, cli.no_cert_validation).await?;
+  let moq_conn =
+    MoqConnection::establish(&cli.server, cli.no_cert_validation, cli.transport).await?;
+
+  let content = publisher::Content {
+    subgroups_per_group: cli.subgroups_per_group,
+    priorities: cli.priorities.clone(),
+    object_properties: cli.object_property.clone(),
+    track_properties: cli.track_property.clone(),
+    fetch_markers: cli.fetch_end_of_range.clone(),
+    fetch_reset_after: cli.fetch_reset_after,
+    end_of_group_objects: cli.end_of_group_objects,
+    end_of_track_object: cli.end_of_track_object,
+    reset_streams_at: cli.reset_stream_at.clone(),
+    dropped_datagrams: cli.drop_datagram.clone(),
+    gap_properties: !cli.no_gap_properties,
+  };
 
   match cli.command {
     Command::Publish => {
@@ -49,14 +68,17 @@ async fn main() -> Result<(), anyhow::Error> {
         track_name: cli.track_name,
         delivery_mode: cli.delivery_mode,
         group_count: cli.group_count,
+        pre_published_groups: cli.pre_published_groups,
         interval: cli.interval,
         objects_per_group: cli.objects_per_group,
+        object_id_step: cli.object_id_step,
+        group_id_step: cli.group_id_step,
         payload_size: cli.payload_size,
         track_alias: cli
           .track_alias
           .unwrap_or_else(|| rand::random::<u64>() & ((1u64 << 62) - 1)),
         publisher_priority: cli.publisher_priority,
-        group_order: cli.group_order.into(),
+        content: content.clone(),
       };
       publisher::run(moq_conn, config).await
     }
@@ -64,12 +86,17 @@ async fn main() -> Result<(), anyhow::Error> {
     Command::PublishNamespace => {
       let config = publisher::PublishNamespaceConfig {
         namespace: cli.namespace,
+        withdraw_after: cli.withdraw_after,
         delivery_mode: cli.delivery_mode,
         group_count: cli.group_count,
+        pre_published_groups: cli.pre_published_groups,
         interval: cli.interval,
         objects_per_group: cli.objects_per_group,
+        object_id_step: cli.object_id_step,
+        group_id_step: cli.group_id_step,
         payload_size: cli.payload_size,
         publisher_priority: cli.publisher_priority,
+        content: content.clone(),
       };
       publisher::run_namespace(moq_conn, config).await
     }
@@ -101,10 +128,73 @@ async fn main() -> Result<(), anyhow::Error> {
           let priority: u8 = prio.parse().ok()?;
           Some((name.to_string(), priority))
         }),
+        forward: cli.forward,
+        include_properties: cli.include_properties,
+        rendezvous_timeout: cli.rendezvous_timeout,
+        update_forward_after: cli.update_forward_after,
+        filter: cli.filter.unwrap_or(CliFilter::NextObject),
+        filter_start_group: cli.filter_start_group,
+        filter_start_object: cli.filter_start_object,
+        end_group_delta: cli.end_group_delta,
+        filter_end_object: cli.filter_end_object,
+        fill: cli.fill || cli.fill_start_group.is_some() || !cli.fill_range_filter.is_empty(),
+        fill_start_group: cli.fill_start_group,
+        switch_after: cli.switch_after,
+        switch_track: cli.switch_track,
+        switch_mode: cli.switch_mode.into(),
+        switch_publish_done: cli.switch_publish_done,
+        switch_start_group: cli.switch_start_group,
+        range_filters: cli.range_filter,
+        fill_range_filters: cli.fill_range_filter,
+        update_filters_after: cli.update_filters_after,
+        update_range_filters: cli.update_range_filter,
+        ignore_filter_limit: cli.ignore_filter_limit,
       };
       subscriber::run(moq_conn, config).await
     }
 
+    Command::SubscribeNamespace | Command::SubscribeTracks => {
+      let config = prefix_subscriber::PrefixSubscribeConfig {
+        namespace: cli.namespace,
+        duration: cli.duration,
+        kind: match cli.command {
+          Command::SubscribeNamespace => PrefixKind::Namespace,
+          _ => PrefixKind::Tracks,
+        },
+        overlap: cli.overlap,
+        include_properties: cli.include_properties,
+        pushed_track_parameters: {
+          // Each pushed track's Forward State, where it starts, and a fill of what it
+          // already has.
+          let mut params = Vec::new();
+          if !cli.forward {
+            params.push(MessageParameter::new_forward(false));
+          }
+          if let Some(filter) = cli.filter {
+            params.push(MessageParameter::new_location_filter(
+              subscriber::cli_location_filter(
+                filter,
+                cli.filter_start_group,
+                cli.filter_start_object,
+                cli.end_group_delta,
+                cli.filter_end_object,
+              ),
+            ));
+          }
+          if cli.fill || cli.fill_start_group.is_some() || !cli.fill_range_filter.is_empty() {
+            params.push(subscriber::fill_parameter(
+              cli.fill_start_group,
+              &cli.fill_range_filter,
+            ));
+          }
+          params
+        },
+        refuse_publish: cli.refuse_publish,
+        range_filters: cli.range_filter,
+        ignore_filter_limit: cli.ignore_filter_limit,
+      };
+      prefix_subscriber::run(moq_conn, config).await
+    }
     Command::Fetch => {
       let config = fetcher::FetchConfig {
         namespace: cli.namespace,
@@ -113,7 +203,11 @@ async fn main() -> Result<(), anyhow::Error> {
         start_object: cli.start_object,
         end_group: cli.end_group,
         end_object: cli.end_object,
+        group_order: cli.group_order.into(),
         cancel_after: cli.cancel_after,
+        include_properties: cli.include_properties,
+        range_filters: cli.range_filter,
+        ignore_filter_limit: cli.ignore_filter_limit,
       };
       fetcher::run(moq_conn, config).await
     }
@@ -145,7 +239,8 @@ async fn main() -> Result<(), anyhow::Error> {
         track_a: cli.track_a,
         track_b: cli.track_b,
         method: cli.method.into(),
-        switch_after_ms: cli.switch_after,
+        switch_mode: cli.switch_mode.into(),
+        switch_after_ms: cli.switch_after_ms,
         bandwidth_cap_bps: cli.bandwidth_cap_bps,
         output_json: cli.output_json,
         playout,

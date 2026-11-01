@@ -1,5 +1,6 @@
 <p align="center">
-	<img src="https://moqtail.dev/moqtail.png" alt="MOQtail" width="320" /><br>
+	<img src="https://moqtail.dev/moqtail_medal.svg" alt="MOQtail" width="240" />
+	<br>
 	<br>
 	<a href="https://github.com/moqtail/moqtail/actions/workflows/rust.yml">
 		<img src="https://github.com/moqtail/moqtail/actions/workflows/rust.yml/badge.svg" alt="Rust Checks" />
@@ -13,19 +14,27 @@
 	<a href="https://github.com/orgs/moqtail/packages/container/package/relay">
 		<img src="https://img.shields.io/badge/ghcr-ghcr.io%2Fmoqtail%2Frelay-2496ed?logo=docker&logoColor=white" alt="GHCR Relay Image" />
 	</a>
+	<a href="https://deepwiki.com/moqtail/moqtail"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
 	<br>
 	<br>
-	Draft 16 MOQ Transport (MOQT) libraries and relay components.<br>
+	Draft 22 MOQ Transport (MOQT) libraries and relay components.<br>
 	Rust and TypeScript tooling for publishers, subscribers, demos and relay deployments.
 </p>
 
 # MOQtail
 
-MOQtail is a draft 16-compliant MOQT toolkit for building publisher, subscriber, and relay applications. The repository includes Rust and TypeScript libraries, reference clients, and a relay that can be run locally or pulled as a container image from GHCR.
+MOQtail is a draft 22-compliant MOQT toolkit for building publisher, subscriber, and relay applications. The repository includes Rust and TypeScript libraries, reference clients, and a relay that can be run locally or pulled as a container image from GHCR. The relay and Rust client support both WebTransport (`https://`) and raw QUIC (`moqt://`) on the same port.
+
+> [!WARNING]
+> **Branch status:** `main` is tracking draft-22, we continue to work on it until next draft is released. For previous drafts, you can use the following branches:
+>
+> - [`draft-14`](https://github.com/moqtail/moqtail/tree/draft-14) branch.
+> - [`draft-16`](https://github.com/moqtail/moqtail/tree/draft-16) branch.
+> - [`draft-18`](https://github.com/moqtail/moqtail/tree/draft-18) branch.
 
 > [!IMPORTANT]
 > **To cite MOQtail in your academic research and elsewhere, please use:**
-> 
+>
 > **Zafer Gurel, Deniz Ugur and Ali C. Begen, "MOQtail: open-source, IETF-compliant MOQT protocol libraries," in _Proc. ACM Multimedia Systems Conf. (MMSys)_, Hong Kong, Hong Kong, Apr. 2026 ([DOI: 10.1145/3793853.3799817](https://doi.org/10.1145/3793853.3799817))**
 
 ## Components
@@ -50,7 +59,7 @@ Library documentation: [libs/moqtail-rs/README.md](libs/moqtail-rs/README.md)
 
 ### Relay
 
-The relay is the deployable Rust service that forwards MoQ messages between publishers and subscribers.
+The relay is the deployable Rust service that forwards MoQ messages between publishers and subscribers. It accepts both WebTransport and raw QUIC connections on the same UDP socket/port, demultiplexing them via ALPN.
 
 Local run:
 
@@ -78,12 +87,27 @@ docker build -f apps/relay/Dockerfile -t moqtail-relay .
 
 For local certificate generation and browser trust setup, see [apps/relay/cert/README.md](apps/relay/cert/README.md).
 
+#### Transports: WebTransport and raw QUIC
+
+The relay and the Rust test client (`apps/client`) support two transports on the same port:
+
+- **WebTransport** — connect with an `https://` server URL (e.g. `https://127.0.0.1:4433`). Used by browser clients and `moqtail-ts`.
+- **Raw QUIC** — connect with a `moqt://` server URL (e.g. `moqt://127.0.0.1:4433/path`). Since raw QUIC has no HTTP CONNECT to carry the authority/path, the client sends them as CLIENT_SETUP parameters instead.
+
+```bash
+# WebTransport
+cargo run --bin client -- -c publish --server https://127.0.0.1:4433
+
+# Raw QUIC
+cargo run --bin client -- -c publish --server moqt://127.0.0.1:4433
+```
+
 ## Getting Started
 
 ### Prerequisites
 
 - [Rust](https://www.rust-lang.org/tools/install)
-- [Node.js](https://nodejs.org/) 18 or newer
+- [Node.js](https://nodejs.org/) 22 or newer
 - [npm](https://www.npmjs.com/)
 - [Docker](https://www.docker.com/) for containerized relay builds and runs
 

@@ -15,31 +15,32 @@
  */
 
 import { BaseByteBuffer, ByteBuffer, FrozenByteBuffer } from '../common/byte_buffer'
-import { Location } from '../common/location'
-import { ControlMessageType, FetchType, fetchTypeFromBigInt } from './constant'
+import { ControlMessageType, LocationFilterType } from './constant'
 import { LengthExceedsMaxError } from '../error/error'
 import { FullTrackName } from '../data'
-import { MessageParameter, MessageParameters } from '../parameter/message_parameter'
+import {
+  MessageParameter,
+  MessageParameters,
+  deserializeMessageParameterKvps,
+  serializeMessageParameterKvps,
+} from '../parameter/message_parameter'
 import { SubscriberPriority } from '../parameter/message/subscriber_priority'
+import { LocationFilter } from '../parameter/message/location_filter'
 
 export class Fetch {
   constructor(
     public readonly requestId: bigint,
-    public readonly typeAndProps:
-      | {
-          readonly type: FetchType.Standalone
-          readonly props: { fullTrackName: FullTrackName; startLocation: Location; endLocation: Location }
-        }
-      | {
-          readonly type: FetchType.Relative
-          readonly props: { joiningRequestId: bigint; joiningStart: bigint }
-        }
-      | {
-          readonly type: FetchType.Absolute
-          readonly props: { joiningRequestId: bigint; joiningStart: bigint }
-        },
+    public readonly fullTrackName: FullTrackName,
     public readonly parameters: MessageParameter[],
   ) {}
+
+  /**
+   * The requested range. A FETCH without a LOCATION_FILTER parameter asks for the
+   * whole track up to the Largest Object, the same as a {@link (LocationFilterType:enum).None} filter.
+   */
+  get locationFilter(): LocationFilter {
+    return this.parameters.find(MessageParameter.isLocationFilter) ?? new LocationFilter(LocationFilterType.None)
+  }
 
   getType(): ControlMessageType {
     return ControlMessageType.Fetch
@@ -50,25 +51,9 @@ export class Fetch {
     buf.putVI(ControlMessageType.Fetch)
     const payload = new ByteBuffer()
     payload.putVI(this.requestId)
-    payload.putVI(this.typeAndProps.type)
-    switch (this.typeAndProps.type) {
-      case FetchType.Absolute:
-      case FetchType.Relative: {
-        payload.putVI(this.typeAndProps.props.joiningRequestId)
-        payload.putVI(this.typeAndProps.props.joiningStart)
-        break
-      }
-      case FetchType.Standalone: {
-        payload.putFullTrackName(this.typeAndProps.props.fullTrackName)
-        payload.putLocation(this.typeAndProps.props.startLocation)
-        payload.putLocation(this.typeAndProps.props.endLocation)
-        break
-      }
-    }
+    payload.putFullTrackName(this.fullTrackName)
     payload.putVI(this.parameters.length)
-    for (const param of this.parameters) {
-      payload.putKeyValuePair(param.toKeyValuePair())
-    }
+    payload.putBytes(serializeMessageParameterKvps(this.parameters.map((p) => p.toKeyValuePair())).toUint8Array())
     const payloadBytes = payload.toUint8Array()
     if (payloadBytes.length > 0xffff) {
       throw new LengthExceedsMaxError('Fetch::serialize(payload_length)', 0xffff, payloadBytes.length)
@@ -80,61 +65,30 @@ export class Fetch {
 
   static parsePayload(buf: BaseByteBuffer): Fetch {
     const requestId = buf.getVI()
-    const fetchTypeRaw = buf.getVI()
-    const fetchType = fetchTypeFromBigInt(fetchTypeRaw)
-
-    let props: Fetch['typeAndProps']
-
-    switch (fetchType) {
-      case FetchType.Absolute:
-      case FetchType.Relative: {
-        const joiningRequestId = buf.getVI()
-        const joiningStart = buf.getVI()
-        props = {
-          type: fetchType,
-          props: { joiningRequestId, joiningStart },
-        }
-        break
-      }
-      case FetchType.Standalone: {
-        const fullTrackName = buf.getFullTrackName()
-        const startLocation = buf.getLocation()
-        const endLocation = buf.getLocation()
-        props = {
-          type: FetchType.Standalone,
-          props: { fullTrackName, startLocation, endLocation },
-        }
-        break
-      }
-      default:
-        throw new Error(`Unknown fetch type: ${fetchType}`)
-    }
+    const fullTrackName = buf.getFullTrackName()
 
     const paramCount = buf.getNumberVI()
-    const rawParams = new Array(paramCount)
-    for (let i = 0; i < paramCount; i++) {
-      rawParams[i] = buf.getKeyValuePair()
-    }
+    const rawParams = deserializeMessageParameterKvps(buf, paramCount)
     const parameters = MessageParameters.fromKeyValuePairs(rawParams)
 
-    return new Fetch(requestId, props, parameters)
+    return new Fetch(requestId, fullTrackName, parameters)
   }
 }
 
 if (import.meta.vitest) {
   const { describe, test, expect } = import.meta.vitest
+
+  // Parameters are serialized sorted by type and parse back in that order, so they
+  // are listed sorted here for the roundtrip comparison to hold.
+  const sampleFetch = () =>
+    new Fetch(161803n, FullTrackName.tryNew('un/deux/trois', 'quatre'), [
+      new SubscriberPriority(42),
+      new LocationFilter(LocationFilterType.AbsoluteRange, 12n, 5n, 20n, 3n),
+    ])
+
   describe('Fetch', () => {
     test('roundtrip', () => {
-      const requestId = 161803n
-      const parameters = [new SubscriberPriority(42)]
-      const fetch = new Fetch(
-        requestId,
-        {
-          type: FetchType.Absolute,
-          props: { joiningRequestId: 119n, joiningStart: 73n },
-        },
-        parameters,
-      )
+      const fetch = sampleFetch()
       const serialized = fetch.serialize()
       const buf = new ByteBuffer()
       buf.putBytes(serialized.toUint8Array())
@@ -149,16 +103,7 @@ if (import.meta.vitest) {
     })
 
     test('excess roundtrip', () => {
-      const requestId = 161803n
-      const parameters = [new SubscriberPriority(42)]
-      const fetch = new Fetch(
-        requestId,
-        {
-          type: FetchType.Absolute,
-          props: { joiningRequestId: 119n, joiningStart: 73n },
-        },
-        parameters,
-      )
+      const fetch = sampleFetch()
       const serialized = fetch.serialize().toUint8Array()
       const excess = new Uint8Array([9, 1, 1])
       const buf = new ByteBuffer()
@@ -174,17 +119,25 @@ if (import.meta.vitest) {
       expect(Array.from(frozen.getBytes(3))).toEqual([9, 1, 1])
     })
 
+    test('the range is carried in the location filter, not in message fields', () => {
+      const fetch = sampleFetch()
+      expect(fetch.locationFilter).toEqual(new LocationFilter(LocationFilterType.AbsoluteRange, 12n, 5n, 20n, 3n))
+
+      const frozen = fetch.serialize()
+      frozen.getVI()
+      frozen.getU16()
+      frozen.getVI()
+      frozen.getFullTrackName()
+      expect(frozen.getNumberVI()).toBe(fetch.parameters.length)
+    })
+
+    test('no location filter is the whole track', () => {
+      const fetch = new Fetch(1n, FullTrackName.tryNew('ns', 'track'), [])
+      expect(fetch.locationFilter.filterType).toBe(LocationFilterType.None)
+    })
+
     test('partial message', () => {
-      const requestId = 161803n
-      const parameters = [new SubscriberPriority(42)]
-      const fetch = new Fetch(
-        requestId,
-        {
-          type: FetchType.Absolute,
-          props: { joiningRequestId: 119n, joiningStart: 73n },
-        },
-        parameters,
-      )
+      const fetch = sampleFetch()
       const serialized = fetch.serialize().toUint8Array()
       const upper = Math.floor(serialized.length / 2)
       const partial = serialized.slice(0, upper)

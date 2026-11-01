@@ -15,11 +15,11 @@
  */
 
 import {
-  FetchType,
-  FilterType,
   FullTrackName,
   GroupOrder,
   Location,
+  LocationFilter,
+  LocationFilterType,
   MoqtObject,
   Tuple,
 } from 'moqtail';
@@ -43,21 +43,21 @@ interface SubscribeOptions {
 }
 
 export interface PlayerOptions {
-  /** The URL of the relay to connect to. */
+  /** The URL of the relay to connect to. `moqt://` or `https://`. */
   relayUrl: string;
   /** The namespace to use for this session. */
   namespace: Tuple;
   /** Whether to receive the catalog via SUBSCRIBE message. */
   receiveCatalogViaSubscribe?: boolean;
-  /** Catalog location (default: group 0, object 1) */
+  /** First and last catalog Objects to fetch, inclusive (default: group 0, object 0) */
   catalogLocation?: [Location, Location];
 }
 
 const DefaultOptions: Required<PlayerOptions> = {
-  relayUrl: 'https://relay.moqtail.dev',
+  relayUrl: 'moqt://relay.moqtail.dev',
   namespace: Tuple.fromUtf8Path('/moqtail'),
   receiveCatalogViaSubscribe: false,
-  catalogLocation: [new Location(0n, 0n), new Location(0n, 1n)],
+  catalogLocation: [new Location(0n, 0n), new Location(0n, 0n)],
 };
 
 export class Player {
@@ -180,6 +180,14 @@ export class Player {
         sourceBuffer.addEventListener('updateend', () => resolve(), { once: true }),
       );
 
+    const isInOrder = (a: MoqtObject, b: MoqtObject) => {
+      // First objects are most likely to be RAPs
+      if (b.location.object === 0n) return true;
+      if (a.location.group < b.location.group) return true;
+      if (a.location.group > b.location.group) return false;
+      return a.location.object < b.location.object;
+    };
+
     // Seek to buffer end
     let gotNotification = 0;
     let target = 0;
@@ -254,6 +262,7 @@ export class Player {
       let lastMSEErrorLogged = 0;
       let kickStarted = false;
       let objectCount = 0;
+      let previousObject: MoqtObject | null = null;
 
       // Create the WritableStream to handle incoming objects
       const writable = new WritableStream<MoqtObject>({
@@ -297,6 +306,17 @@ export class Player {
               controller.error(new DOMException('Stream aborted', 'InternalError'));
               return;
             }
+
+            // This is a very crude attempt to ensure video playback continues when objects from multiple streams arrive out of order.
+            // Normally we order the objects but this is simpler.
+            if (previousObject && !isInOrder(previousObject, object)) {
+              logger.warn(
+                'player',
+                `[${struct.trackName}] out-of-order object detected (group=${object.groupId}, obj=${object.objectId}), discarding...`,
+              );
+              return;
+            }
+            previousObject = object;
 
             // Append the data
             let maxRetries = 5;
@@ -435,14 +455,14 @@ export class Player {
       const result = await this.client.fetch({
         groupOrder: GroupOrder.Original,
         priority: 0,
-        typeAndProps: {
-          type: FetchType.Standalone,
-          props: {
-            fullTrackName: getFullTrackName(this.#options.namespace, 'catalog'),
-            startLocation: startLoc,
-            endLocation: endLoc,
-          },
-        },
+        fullTrackName: getFullTrackName(this.#options.namespace, 'catalog'),
+        locationFilter: new LocationFilter(
+          LocationFilterType.AbsoluteRange,
+          startLoc.group,
+          startLoc.object,
+          endLoc.group,
+          endLoc.object,
+        ),
       });
       if (result instanceof RequestError) {
         logger.error(
@@ -514,7 +534,8 @@ export class Player {
     const result = await this.client.subscribe({
       fullTrackName: ftn,
       groupOrder: GroupOrder.Original,
-      filterType: FilterType.LatestObject,
+      // StartGroup 0 is the next group.
+      locationFilter: new LocationFilter(LocationFilterType.RelativeStart, 0n),
       forward: true,
       priority: params.priority ?? 0,
     });

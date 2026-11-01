@@ -14,16 +14,18 @@
 
 use std::{
   collections::BTreeMap,
+  hash::{BuildHasher, Hasher, RandomState},
   sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64},
+    Arc, LazyLock,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
   },
 };
 use tokio::sync::{RwLock, mpsc};
 
-use moqtail::model::data::fetch_object::FetchObjectPayload;
-use wtransport::Connection;
+use moqtail::model::common::location::Location;
+use moqtail::model::data::fetch_object::{EndOfRangeKind, FetchObjectPayload};
 
+use moqtail::transport::connection::{TransportConnection, TransportKind};
 use moqtail::transport::data_stream_handler::{FetchRequest, SubscribeRequest};
 
 use super::{
@@ -31,13 +33,12 @@ use super::{
 };
 
 #[allow(dead_code)]
-// TODO: Remove the dead_code attribute after merging all the draft-16 changes.
+// TODO: Remove the dead_code attribute after merging all the migration changes.
 // These changes are required for message unification and will be useful in other branches.
 #[derive(Debug, Clone)]
 pub enum PendingRequest {
   Fetch(FetchRequest),
   Subscribe(SubscribeRequest),
-  TrackStatus(SubscribeRequest),
   PublishNamespace {
     client_connection_id: usize,
     original_request_id: u64,
@@ -47,6 +48,11 @@ pub enum PendingRequest {
     client_connection_id: usize,
     original_request_id: u64,
     message: moqtail::model::control::subscribe_namespace::SubscribeNamespace,
+  },
+  SubscribeTracks {
+    client_connection_id: usize,
+    original_request_id: u64,
+    message: moqtail::model::control::subscribe_tracks::SubscribeTracks,
   },
   Publish {
     publisher_connection_id: usize,
@@ -66,7 +72,19 @@ pub enum PendingRequest {
 /// The receiver awaits entries in a loop and sends them downstream.
 #[allow(dead_code)]
 pub(crate) enum UpstreamFetchEvent {
+  /// The publisher's FETCH_OK, carrying the range it will actually deliver. A relay
+  /// cannot answer its own subscriber until it has this.
+  Accepted {
+    end_location: Location,
+  },
   Object(FetchObjectPayload),
+  /// Every Location after the previous Object, if any, up to and including
+  /// `location`, is of `kind`.
+  EndOfRange {
+    kind: EndOfRangeKind,
+    location: Location,
+  },
+  MalformedTrack,
   StreamClosed,
   Error(String),
 }
@@ -81,40 +99,57 @@ pub struct RequestMaps {
 }
 
 pub struct SessionContext {
-  pub(crate) client_manager: Arc<RwLock<ClientManager>>,
+  pub(crate) client_manager: ClientManager,
   pub(crate) track_manager: TrackManager,
   pub(crate) relay_pending_requests: Arc<RwLock<BTreeMap<u64, PendingRequest>>>,
   pub(crate) connection_id: usize,
+  pub(crate) transport_kind: TransportKind,
   pub(crate) client: Arc<RwLock<Option<Arc<MOQTClient>>>>, // the client that is connected to this session
-  pub(crate) connection: Connection,
+  pub(crate) connection: TransportConnection,
   pub(crate) server_config: &'static AppConfig,
   pub(crate) is_connection_closed: Arc<AtomicBool>,
   pub(crate) relay_next_request_id: Arc<AtomicU64>,
-  pub(crate) max_request_id: Arc<AtomicU64>,
   pub(crate) upstream_fetch_senders: Arc<RwLock<BTreeMap<u64, mpsc::Sender<UpstreamFetchEvent>>>>,
+  pub(crate) active_request_streams: Arc<AtomicU64>,
+  /// Set once the relay is draining (GOAWAY sent); new requests are rejected.
+  pub(crate) draining: Arc<AtomicBool>,
+}
+
+static NEXT_CONNECTION_ID: LazyLock<AtomicUsize> = LazyLock::new(|| {
+  let seed = RandomState::new().build_hasher().finish() as u32;
+  AtomicUsize::new(seed as usize)
+});
+
+fn next_connection_id() -> usize {
+  NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 impl SessionContext {
+  #[allow(clippy::too_many_arguments)]
   pub fn new(
     server_config: &'static AppConfig,
-    client_manager: Arc<RwLock<ClientManager>>,
+    client_manager: ClientManager,
     track_manager: TrackManager,
     request_maps: RequestMaps,
-    connection: Connection,
+    connection: TransportConnection,
     relay_next_request_id: Arc<AtomicU64>,
+    active_request_streams: Arc<AtomicU64>,
+    draining: Arc<AtomicBool>,
   ) -> Self {
     Self {
       client_manager,
       track_manager,
       relay_pending_requests: request_maps.relay_pending_requests,
-      connection_id: connection.stable_id(),
+      connection_id: next_connection_id(),
+      transport_kind: connection.kind(),
       client: Arc::new(RwLock::new(None)), // initially no client is set
       connection,
       server_config,
       is_connection_closed: Arc::new(AtomicBool::new(false)),
       relay_next_request_id,
-      max_request_id: Arc::new(AtomicU64::new(server_config.initial_max_request_id)),
       upstream_fetch_senders: request_maps.upstream_fetch_senders,
+      active_request_streams,
+      draining,
     }
   }
 
@@ -125,5 +160,21 @@ impl SessionContext {
 
   pub async fn get_client(&self) -> Option<Arc<MOQTClient>> {
     self.client.read().await.clone()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::next_connection_id;
+
+  // The only test that draws ids: another one running in parallel would take ids
+  // in between and throw off the difference.
+  #[test]
+  fn connection_ids_incrementing() {
+    let first = next_connection_id();
+    next_connection_id();
+    next_connection_id();
+    let last = next_connection_id();
+    assert_eq!(last.wrapping_sub(first), 3);
   }
 }

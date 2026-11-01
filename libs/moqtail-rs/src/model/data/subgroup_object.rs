@@ -17,8 +17,8 @@ use tracing::trace;
 
 use crate::model::common::varint::{BufMutVarIntExt, BufVarIntExt};
 use crate::model::error::ParseError;
-use crate::model::extension_header::object_extension::{
-  ObjectExtension, deserialize_object_extensions,
+use crate::model::property::object_property::{
+  ObjectProperty, deserialize_object_properties, serialize_object_properties,
 };
 
 use super::constant::ObjectStatus;
@@ -26,7 +26,7 @@ use super::constant::ObjectStatus;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubgroupObject {
   pub object_id: u64,
-  pub extension_headers: Option<Vec<ObjectExtension>>,
+  pub properties: Option<Vec<ObjectProperty>>,
   pub object_status: Option<ObjectStatus>,
   pub payload: Option<Bytes>,
 }
@@ -35,7 +35,7 @@ impl SubgroupObject {
   pub fn serialize(
     &self,
     previous_object_id: Option<u64>,
-    _has_extensions: bool,
+    has_properties: bool,
   ) -> Result<Bytes, ParseError> {
     let mut buf = BytesMut::new();
 
@@ -47,22 +47,24 @@ impl SubgroupObject {
 
     trace!(
       "SubgroupObject::serialize || object_id_delta: {} prev: {:?} object_id: {} ext_headers: {:?}",
-      object_id_delta, previous_object_id, self.object_id, &self.extension_headers
+      object_id_delta, previous_object_id, self.object_id, &self.properties
     );
 
     buf.put_vi(object_id_delta)?;
 
-    if let Some(ext_headers) = &self.extension_headers {
-      if ext_headers.is_empty() {
-        buf.put_vi(0)?;
-      } else {
-        let mut ext_buf = BytesMut::new();
-        for header in ext_headers {
-          ext_buf.extend_from_slice(&header.serialize()?);
-        }
-        buf.put_vi(ext_buf.len())?;
-        buf.extend_from_slice(&ext_buf);
-      }
+    let properties = self.properties.as_deref().unwrap_or(&[]);
+
+    if !has_properties && !properties.is_empty() {
+      return Err(ParseError::ProtocolViolation {
+        context: "SubgroupObject::serialize(properties)",
+        details: "properties are present but header type has no properties".to_string(),
+      });
+    }
+
+    if has_properties {
+      let ext_buf = serialize_object_properties(properties)?;
+      buf.put_vi(ext_buf.len())?;
+      buf.extend_from_slice(&ext_buf);
     }
 
     if let Some(payload) = &self.payload
@@ -81,7 +83,7 @@ impl SubgroupObject {
   pub fn deserialize(
     bytes: &mut Bytes,
     previous_object_id: &Option<u64>,
-    has_extensions: bool,
+    has_properties: bool,
   ) -> Result<Self, ParseError> {
     let object_id_delta = bytes.get_vi()?;
 
@@ -96,7 +98,7 @@ impl SubgroupObject {
       object_id_delta, previous_object_id, object_id
     );
 
-    let extension_headers = if has_extensions {
+    let properties = if has_properties {
       let ext_len = bytes.get_vi()?;
 
       if ext_len > 0 {
@@ -119,16 +121,16 @@ impl SubgroupObject {
         }
 
         let mut header_bytes = bytes.copy_to_bytes(ext_len);
-        let headers = deserialize_object_extensions(&mut header_bytes).map_err(|_| {
+        let headers = deserialize_object_properties(&mut header_bytes).map_err(|_| {
           ParseError::ProtocolViolation {
             context: "SubgroupObject::deserialize",
-            details: "Failed to parse extension header".to_string(),
+            details: "Failed to parse property".to_string(),
           }
         })?;
         Some(headers)
       } else {
         // TODO: this is a hack to deal with the fact that we can understand
-        // whether we need to serialize this object with extensions
+        // whether we need to serialize this object with properties
         Some(vec![])
       }
     } else {
@@ -164,7 +166,7 @@ impl SubgroupObject {
 
     Ok(SubgroupObject {
       object_id,
-      extension_headers,
+      properties,
       object_status,
       payload,
     })
@@ -182,11 +184,11 @@ mod tests {
   fn test_roundtrip() {
     let object_id: u64 = 10;
     let prev_object_id = 9;
-    let extension_headers = Some(vec![
-      ObjectExtension::Unknown {
+    let properties = Some(vec![
+      ObjectProperty::Unknown {
         kvp: KeyValuePair::try_new_varint(0, 10).unwrap(),
       },
-      ObjectExtension::Unknown {
+      ObjectProperty::Unknown {
         kvp: KeyValuePair::try_new_bytes(1, Bytes::from_static(b"wololoo")).unwrap(),
       },
     ]);
@@ -195,7 +197,7 @@ mod tests {
 
     let subgroup_object = SubgroupObject {
       object_id,
-      extension_headers,
+      properties,
       payload,
       object_status,
     };
@@ -209,14 +211,40 @@ mod tests {
   }
 
   #[test]
+  fn test_serializes_empty_properties_as_absent() {
+    let object_id: u64 = 10;
+    let payload = Some(Bytes::from_static(&[0xab]));
+
+    let with_no_headers = SubgroupObject {
+      object_id,
+      properties: None,
+      object_status: None,
+      payload: payload.clone(),
+    }
+    .serialize(None, false)
+    .unwrap();
+
+    let with_empty_headers = SubgroupObject {
+      object_id,
+      properties: Some(vec![]),
+      object_status: None,
+      payload,
+    }
+    .serialize(None, false)
+    .unwrap();
+
+    assert_eq!(with_empty_headers, with_no_headers);
+  }
+
+  #[test]
   fn test_excess_roundtrip() {
     let object_id: u64 = 10;
     let prev_object_id = 9;
-    let extension_headers = Some(vec![
-      ObjectExtension::Unknown {
+    let properties = Some(vec![
+      ObjectProperty::Unknown {
         kvp: KeyValuePair::try_new_varint(0, 10).unwrap(),
       },
-      ObjectExtension::Unknown {
+      ObjectProperty::Unknown {
         kvp: KeyValuePair::try_new_bytes(1, Bytes::from_static(b"wololoo")).unwrap(),
       },
     ]);
@@ -225,7 +253,7 @@ mod tests {
 
     let subgroup_object = SubgroupObject {
       object_id,
-      extension_headers,
+      properties,
       payload,
       object_status,
     };
@@ -247,11 +275,11 @@ mod tests {
   fn test_partial_message() {
     let object_id: u64 = 10;
     let prev_object_id = 9;
-    let extension_headers = Some(vec![
-      ObjectExtension::Unknown {
+    let properties = Some(vec![
+      ObjectProperty::Unknown {
         kvp: KeyValuePair::try_new_varint(0, 10).unwrap(),
       },
-      ObjectExtension::Unknown {
+      ObjectProperty::Unknown {
         kvp: KeyValuePair::try_new_bytes(1, Bytes::from_static(b"wololoo")).unwrap(),
       },
     ]);
@@ -260,7 +288,7 @@ mod tests {
 
     let subgroup_object = SubgroupObject {
       object_id,
-      extension_headers,
+      properties,
       payload,
       object_status,
     };

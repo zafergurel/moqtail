@@ -16,10 +16,16 @@ mod client;
 mod client_manager;
 mod config;
 mod errors;
+mod fill;
+mod filter_constructor;
 mod message_handlers;
 mod object_logger;
+mod prefix_subscription;
+mod request_stream;
+mod seen_objects;
 mod session;
 mod session_context;
+mod ssts;
 mod stream_id;
 mod subscription;
 mod subscription_manager;
@@ -29,29 +35,43 @@ mod track_cache;
 mod track_manager;
 mod utils;
 
+use crate::server::client::MOQTClient;
 use crate::server::session_context::{PendingRequest, UpstreamFetchEvent};
 use crate::server::{config::AppConfig, session::Session};
 use anyhow::Result;
 use client_manager::ClientManager;
+use moqtail::model::control::control_message::ControlMessage;
+use moqtail::model::control::goaway::GoAway;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::signal;
-use tokio::sync::{Notify, RwLock, mpsc};
-use tracing::{debug, error, info};
+use tokio::sync::{RwLock, mpsc, watch};
+use tracing::{error, info, trace, warn};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 use track_manager::TrackManager;
-use wtransport::Endpoint;
+use wtransport::endpoint::IncomingSessionFuture;
+use wtransport::quinn;
+
+const CACHE_ONLY_TRACK_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(crate) struct Server {
-  pub client_manager: Arc<RwLock<ClientManager>>,
+  pub client_manager: ClientManager,
   pub track_manager: TrackManager,
   pub relay_pending_requests: Arc<RwLock<BTreeMap<u64, PendingRequest>>>,
   pub app_config: &'static AppConfig,
   pub relay_next_request_id: Arc<AtomicU64>,
   pub upstream_fetch_senders: Arc<RwLock<BTreeMap<u64, mpsc::Sender<UpstreamFetchEvent>>>>,
+  /// Request streams currently being served across the relay (for load shedding).
+  pub active_request_streams: Arc<AtomicU64>,
+  /// Set once the relay is draining (GOAWAY broadcast); new requests are rejected.
+  pub draining: Arc<AtomicBool>,
+  /// GOAWAY redirect URI clients should migrate to. Seeded from config; a future
+  /// admin API mutates this at runtime.
+  pub redirect_uri: Arc<RwLock<Option<String>>>,
 }
 
 impl Server {
@@ -60,77 +80,185 @@ impl Server {
 
     init_logging(&config.log_folder);
 
-    debug!("Server | App. Config.: {:?}", config);
+    trace!("Server | App. Config.: {:?}", config);
 
     Server {
-      client_manager: Arc::new(RwLock::new(ClientManager::new())),
+      client_manager: ClientManager::new(),
       track_manager: TrackManager::new(),
       relay_pending_requests: Arc::new(RwLock::new(BTreeMap::new())),
       app_config: config,
       relay_next_request_id: Arc::new(AtomicU64::new(1u64)), // relay's request id starts at 1 and are odd
       upstream_fetch_senders: Arc::new(RwLock::new(BTreeMap::new())),
+      active_request_streams: Arc::new(AtomicU64::new(0)),
+      draining: Arc::new(AtomicBool::new(false)),
+      redirect_uri: Arc::new(RwLock::new(config.redirect_uri.clone())),
     }
   }
 
+  /// The redirect URI advertised in GOAWAY. Reads the runtime value; the config
+  /// default seeds it at startup.
+  async fn redirect_uri(&self) -> Option<String> {
+    self.redirect_uri.read().await.clone()
+  }
+
   pub async fn start(&mut self) -> Result<()> {
-    let server_config = self.app_config.build_server_config().await?;
-    let server = match Endpoint::server(server_config) {
-      Ok(server) => server,
-      Err(e) => {
-        error!("Failed to create server endpoint. Error: {:?}", e);
-        return Err(anyhow::Error::from(e));
-      }
-    };
+    let endpoints = self.app_config.build_quic_endpoints().await?;
 
     info!(
-      "{} is running at https://{}:{}",
+      "{} is running on {} UDP socket(s) -- WebTransport clients: https://{}:{}  Raw QUIC clients: moqt://{}:{}",
       env!("MOQTAIL_VERSION"),
+      endpoints.len(),
+      self.app_config.host,
+      self.app_config.port,
       self.app_config.host,
       self.app_config.port
     );
 
-    let shutdown_notify = Arc::new(Notify::new());
-    let notify_clone = shutdown_notify.clone();
-    // catch ctrl-c signal to shutdown the server gracefully
-    let _ctrl_c_handler = tokio::spawn(async move {
-      signal::ctrl_c()
-        .await
-        .expect("Failed to listen for ctrl-c signal");
-      notify_clone.notify_waiters();
-    });
+    // Level-triggered, so an accept loop between two iterations when shutdown is
+    // signalled still sees it, which a Notify would not guarantee.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Only used to correlate log lines, so any unique value will do.
+    let session_id_counter = Arc::new(AtomicU64::new(0));
 
-    let notify_clone = shutdown_notify.clone();
-
-    let mut session_id_counter: u64 = 0;
-
-    loop {
-      let id = session_id_counter;
-      tokio::select! {
-        _ = notify_clone.notified() => {
-          info!("Ctrl-C received, exiting...");
-          break;
-        },
-        incoming_session = server.accept() => {
-          let server = self.clone();
-          tokio::spawn(async move {
-            match Session::new(incoming_session, server).await {
-              Ok(_) => {
-                info!("New session: {}", id);
-              }
-              Err(e) => {
-                error!("Error occurred in session {}: {:?}", id, e);
-              }
+    // A cache-only track stays as long as it caches something, so the ones left holding
+    // nothing are swept up now and then.
+    let track_manager = self.track_manager.clone();
+    let mut shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+      let mut sweep = tokio::time::interval(CACHE_ONLY_TRACK_SWEEP_INTERVAL);
+      loop {
+        tokio::select! {
+          _ = shutdown.changed() => break,
+          _ = sweep.tick() => {
+            let removed = track_manager.sweep_empty_cache_only_tracks().await;
+            if removed > 0 {
+              info!("Removed {removed} cache-only tracks holding nothing");
             }
-          });
-          if session_id_counter == u64::MAX {
-            session_id_counter = 0;
-          } else {
-            session_id_counter += 1;
           }
         }
       }
+    });
+
+    let mut accept_loops = Vec::with_capacity(endpoints.len());
+    for (socket_index, endpoint) in endpoints.into_iter().enumerate() {
+      let server = self.clone();
+      let counter = session_id_counter.clone();
+      let mut shutdown = shutdown_rx.clone();
+      accept_loops.push(tokio::spawn(async move {
+        loop {
+          tokio::select! {
+            _ = shutdown.changed() => break,
+            incoming = endpoint.accept() => {
+              let Some(incoming) = incoming else {
+                info!("QUIC endpoint on socket {} closed, exiting accept loop", socket_index);
+                break;
+              };
+              let id = counter.fetch_add(1, Ordering::Relaxed);
+              let server = server.clone();
+              tokio::spawn(async move {
+                match Self::accept_incoming(incoming, server).await {
+                  Ok(_) => {
+                    info!("New session: {}", id);
+                  }
+                  Err(e) => {
+                    error!("Error occurred in session {}: {:?}", id, e);
+                  }
+                }
+              });
+            }
+          }
+        }
+      }));
+    }
+
+    // SIGTERM drains the relay: broadcast GOAWAY, reject new requests, then exit
+    // after the drain timeout.
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+      .expect("Failed to install SIGTERM handler");
+    const DRAIN_TIMEOUT_MS: u64 = 10_000;
+
+    tokio::select! {
+      _ = signal::ctrl_c() => {
+        info!("Ctrl-C received, exiting...");
+      },
+      _ = sigterm.recv() => {
+        info!("SIGTERM received, draining (GOAWAY, timeout {}ms)...", DRAIN_TIMEOUT_MS);
+        self.draining.store(true, Ordering::Relaxed);
+        self.broadcast_goaway(DRAIN_TIMEOUT_MS).await;
+        // Keep accepting while draining; a second Ctrl-C cuts it short.
+        tokio::select! {
+          _ = tokio::time::sleep(Duration::from_millis(DRAIN_TIMEOUT_MS)) => {},
+          _ = signal::ctrl_c() => info!("Ctrl-C received during drain, exiting..."),
+        }
+      },
+    }
+
+    let _ = shutdown_tx.send(true);
+    for accept_loop in accept_loops {
+      let _ = accept_loop.await;
     }
     Ok(())
+  }
+
+  /// Sends GOAWAY to every connected client so they can migrate before the relay exits.
+  async fn broadcast_goaway(&self, timeout_ms: u64) {
+    let redirect_uri = self.redirect_uri().await;
+    let clients: Vec<Arc<MOQTClient>> = {
+      let clients = self.client_manager.clients.read().await;
+      clients.values().cloned().collect()
+    };
+    info!(
+      "Broadcasting GOAWAY (uri: {:?}) to {} client(s)",
+      redirect_uri,
+      clients.len()
+    );
+    for client in clients {
+      let goaway = GoAway::new(redirect_uri.clone(), timeout_ms);
+      client
+        .queue_message(ControlMessage::Goaway(Box::new(goaway)))
+        .await;
+    }
+  }
+
+  /// Demultiplexes one incoming QUIC connection by its negotiated ALPN protocol —
+  /// `h3` is routed to the existing WebTransport path, any MOQT version string
+  /// (e.g. `moqt-18`) is routed to the raw-QUIC path. Both share the same port; see
+  /// `AppConfig::build_quic_endpoints` for the listener setup.
+  async fn accept_incoming(incoming: quinn::Incoming, server: Server) -> Result<()> {
+    let remote_addr = incoming.remote_address();
+    let mut connecting = incoming.accept()?;
+
+    let handshake_data = connecting.handshake_data().await?;
+    let protocol = handshake_data
+      .downcast::<quinn::crypto::rustls::HandshakeData>()
+      .ok()
+      .and_then(|data| data.protocol);
+
+    match protocol.as_deref() {
+      Some(b"h3") => {
+        trace!(remote = %remote_addr, "demuxed incoming QUIC connection as WebTransport (h3)");
+        let session_request = IncomingSessionFuture::with_quic_connecting(connecting).await?;
+        Session::accept_webtransport(session_request, server)
+          .await
+          .map(|_| ())
+      }
+      Some(other) => {
+        trace!(
+          remote = %remote_addr,
+          alpn = %String::from_utf8_lossy(other),
+          "demuxed incoming QUIC connection as raw QUIC"
+        );
+        let connection = connecting.await?;
+        Session::accept_quic(connection, server).await.map(|_| ())
+      }
+      None => {
+        warn!(
+          remote = %remote_addr,
+          "QUIC connection completed handshake with no negotiated ALPN protocol; rejecting"
+        );
+        Err(anyhow::anyhow!("no ALPN protocol negotiated"))
+      }
+    }
   }
 }
 

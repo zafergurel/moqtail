@@ -17,37 +17,36 @@ use super::control_message::ControlMessageTrait;
 use crate::model::common::location::Location;
 use crate::model::common::varint::{BufMutVarIntExt, BufVarIntExt};
 use crate::model::error::ParseError;
-use crate::model::extension_header::track_extension::{
-  TrackExtension, deserialize_track_extensions, serialize_track_extensions,
-};
 use crate::model::parameter::message_parameter::{
-  MessageParameter, deserialize_message_parameters,
+  MessageParameter, deserialize_message_parameters, serialize_message_parameters,
+};
+use crate::model::property::track_property::{
+  TrackProperty, deserialize_track_properties, serialize_track_properties,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct FetchOk {
-  pub request_id: u64,
   pub end_of_track: bool,
+  /// The last Location the response covers, inclusive. Object `u64::MAX` is all of
+  /// that group.
   pub end_location: Location,
   pub subscribe_parameters: Vec<MessageParameter>,
-  pub track_extensions: Vec<TrackExtension>,
+  pub track_properties: Vec<TrackProperty>,
 }
 
 impl FetchOk {
   pub fn new(
-    request_id: u64,
     end_of_track: bool,
     end_location: Location,
     subscribe_parameters: Vec<MessageParameter>,
-    track_extensions: Vec<TrackExtension>,
+    track_properties: Vec<TrackProperty>,
   ) -> Self {
     Self {
-      request_id,
       end_of_track,
       end_location,
       subscribe_parameters,
-      track_extensions,
+      track_properties,
     }
   }
 }
@@ -58,16 +57,13 @@ impl ControlMessageTrait for FetchOk {
     buf.put_vi(ControlMessageType::FetchOk)?;
 
     let mut payload = BytesMut::new();
-    payload.put_vi(self.request_id)?;
     payload.put_u8(if self.end_of_track { 1u8 } else { 0u8 });
     payload.extend_from_slice(&self.end_location.serialize()?);
     payload.put_vi(self.subscribe_parameters.len())?;
-    for param in &self.subscribe_parameters {
-      payload.extend_from_slice(&param.serialize()?);
-    }
+    payload.extend_from_slice(&serialize_message_parameters(&self.subscribe_parameters)?);
 
-    // Track Extensions (no length prefix; bounded by outer message Length field)
-    payload.extend_from_slice(&serialize_track_extensions(&self.track_extensions)?);
+    // Track Properties (no length prefix; bounded by outer message Length field)
+    payload.extend_from_slice(&serialize_track_properties(&self.track_properties)?);
 
     let payload_len: u16 = payload
       .len()
@@ -84,8 +80,6 @@ impl ControlMessageTrait for FetchOk {
   }
 
   fn parse_payload(payload: &mut Bytes) -> Result<Box<Self>, ParseError> {
-    let request_id = payload.get_vi()?;
-
     if payload.remaining() < 1 {
       return Err(ParseError::NotEnoughBytes {
         context: "FetchOk::parse_payload(end_of_track)",
@@ -111,15 +105,14 @@ impl ControlMessageTrait for FetchOk {
     let subscribe_parameters =
       deserialize_message_parameters(payload, param_count, ControlMessageType::FetchOk)?;
 
-    // Track Extensions: consume whatever remains in the payload
-    let track_extensions = deserialize_track_extensions(payload)?;
+    // Track Properties: consume whatever remains in the payload
+    let track_properties = deserialize_track_properties(payload)?;
 
     Ok(Box::new(FetchOk {
-      request_id,
       end_of_track,
       end_location,
       subscribe_parameters,
-      track_extensions,
+      track_properties,
     }))
   }
 
@@ -138,14 +131,13 @@ mod tests {
   #[test]
   fn test_roundtrip() {
     let fetch_ok = FetchOk {
-      request_id: 271828,
       end_of_track: true,
       end_location: Location {
         group: 17,
         object: 57,
       },
       subscribe_parameters: vec![],
-      track_extensions: vec![],
+      track_properties: vec![],
     };
     let mut buf = fetch_ok.serialize().unwrap();
     let msg_type = buf.get_vi().unwrap();
@@ -158,40 +150,35 @@ mod tests {
   }
 
   #[test]
-  fn test_roundtrip_with_group_order_param() {
+  fn test_group_order_param_is_rejected() {
+    // The order a FETCH is served in is the one the FETCH asked for.
     let fetch_ok = FetchOk {
-      request_id: 271828,
       end_of_track: true,
       end_location: Location {
         group: 17,
         object: 57,
       },
       subscribe_parameters: vec![MessageParameter::new_group_order(GroupOrder::Ascending)],
-      track_extensions: vec![],
+      track_properties: vec![],
     };
     let mut buf = fetch_ok.serialize().unwrap();
-    let msg_type = buf.get_vi().unwrap();
-    assert_eq!(msg_type, ControlMessageType::FetchOk as u64);
-    let msg_length = buf.get_u16();
-    assert_eq!(msg_length as usize, buf.remaining());
-    let deserialized = FetchOk::parse_payload(&mut buf).unwrap();
-    assert_eq!(*deserialized, fetch_ok);
-    assert!(!buf.has_remaining());
+    buf.get_vi().unwrap();
+    buf.get_u16();
+    assert!(FetchOk::parse_payload(&mut buf).is_err());
   }
 
   #[test]
-  fn test_roundtrip_with_track_extensions() {
+  fn test_roundtrip_with_track_properties() {
     let fetch_ok = FetchOk {
-      request_id: 12345,
       end_of_track: false,
       end_location: Location {
         group: 5,
         object: 0,
       },
       subscribe_parameters: vec![],
-      track_extensions: vec![
-        TrackExtension::MaxCacheDuration { duration_ms: 60000 },
-        TrackExtension::DefaultPublisherGroupOrder {
+      track_properties: vec![
+        TrackProperty::MaxCacheDuration { duration_ms: 60000 },
+        TrackProperty::DefaultPublisherGroupOrder {
           order: GroupOrder::Ascending,
         },
       ],
@@ -209,14 +196,13 @@ mod tests {
   #[test]
   fn test_excess_roundtrip() {
     let fetch_ok = FetchOk {
-      request_id: 271828,
       end_of_track: true,
       end_location: Location {
         group: 17,
         object: 57,
       },
       subscribe_parameters: vec![],
-      track_extensions: vec![],
+      track_properties: vec![],
     };
 
     let serialized = fetch_ok.serialize().unwrap();
@@ -240,14 +226,13 @@ mod tests {
   #[test]
   fn test_partial_message() {
     let fetch_ok = FetchOk {
-      request_id: 271828,
       end_of_track: true,
       end_location: Location {
         group: 17,
         object: 57,
       },
       subscribe_parameters: vec![],
-      track_extensions: vec![],
+      track_properties: vec![],
     };
     let mut buf = fetch_ok.serialize().unwrap();
     let msg_type = buf.get_vi().unwrap();

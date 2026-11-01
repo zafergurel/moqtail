@@ -49,14 +49,14 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 
-ALL_METHODS=("switch" "sub-update-forward" "joining-fetch")
+ALL_METHODS=("switch" "sub-update-forward")
 # Default track sequence: single upswitch 720p→1080p (lower number = lower bitrate)
 TRACK_SEQUENCE="3,4"
 SWITCH_AFTER=5000
 JITTER_BUFFER_MS=200
 REPS=3
 RELAY_PORT=4433
-RELAY_URL="https://127.0.0.1:${RELAY_PORT}"
+RELAY_URL="moqt://127.0.0.1:${RELAY_PORT}"
 NAMESPACE="moqtail-experiment"
 
 # Relative-position delays (ms). For each non-zero value D two scenarios are run:
@@ -113,7 +113,7 @@ while [[ $# -gt 0 ]]; do
     --objects-per-group)   PUB_OBJECTS_PER_GROUP="$2";          shift 2 ;;
     --interval)            PUB_INTERVAL_MS="$2";                shift 2 ;;
     --group-count)         PUB_GROUP_COUNT="$2";                shift 2 ;;
-    --relay-port)          RELAY_PORT="$2"; RELAY_URL="https://127.0.0.1:${RELAY_PORT}"; shift 2 ;;
+    --relay-port)          RELAY_PORT="$2"; RELAY_URL="moqt://127.0.0.1:${RELAY_PORT}"; shift 2 ;;
     --output)              OUTPUT_DIR="$2";                     shift 2 ;;
     --help|-h)             usage ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -199,7 +199,7 @@ start_relay() {
   fi
 
   log "Stopping any lingering local relay..."
-  pkill -f "target/release/relay" 2>/dev/null || true
+  pkill -INT -f "target/release/relay" 2>/dev/null || true
   sleep 1
 
   log "Starting local relay (port $RELAY_PORT) → $RELAY_LOG"
@@ -212,7 +212,7 @@ start_relay() {
 stop_relay() {
   if [ -f "$RELAY_PID_FILE" ]; then
     log "Stopping relay (PID $(cat "$RELAY_PID_FILE"))..."
-    kill "$(cat "$RELAY_PID_FILE")" 2>/dev/null || true
+    kill -INT "$(cat "$RELAY_PID_FILE")" 2>/dev/null || true
     rm -f "$RELAY_PID_FILE"
   fi
 }
@@ -298,7 +298,7 @@ run_one() {
     --no-cert-validation \
     --track-sequence "$TRACK_SEQUENCE" \
     --method "$method" \
-    --switch-after "$SWITCH_AFTER" \
+    --switch-after-ms "$SWITCH_AFTER" \
     --jitter-buffer-ms "$JITTER_BUFFER_MS" \
     --bandwidth-cap-bps 0 \
     --output-json "$outfile" \

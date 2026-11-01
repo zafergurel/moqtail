@@ -14,124 +14,32 @@
  * limitations under the License.
  */
 import { BaseByteBuffer, ByteBuffer, FrozenByteBuffer } from '../common/byte_buffer'
-import { Location } from '../common/location'
 import { Tuple } from '../common/tuple'
-import { ControlMessageType, FilterType, GroupOrder } from '../control/constant'
+import { ControlMessageType, GroupOrder, LocationFilterType } from '../control/constant'
 import { FullTrackName } from '../data'
-import { MessageParameter, MessageParameters } from '../parameter/message_parameter'
+import {
+  MessageParameter,
+  MessageParameters,
+  deserializeMessageParameterKvps,
+  serializeMessageParameterKvps,
+} from '../parameter/message_parameter'
 import { AuthorizationToken } from '../parameter/common/authorization_token'
+import { LocationFilter } from '../parameter/message/location_filter'
 
-// TODO: Couple filter type and bounded parameters for idiomatic design
 export class TrackStatus {
-  private constructor(
+  constructor(
     public requestId: bigint,
     public trackAlias: bigint,
     public fullTrackName: FullTrackName,
     public subscriberPriority: number,
     public groupOrder: GroupOrder,
     public forward: boolean,
-    public filterType: FilterType,
-    public startLocation: Location | undefined,
-    public endGroup: bigint | undefined,
+    public locationFilter: LocationFilter,
     public subscribeParameters: MessageParameter[],
   ) {}
 
-  static newNextGroupStart(
-    requestId: bigint,
-    trackAlias: bigint,
-    fullTrackName: FullTrackName,
-    subscriberPriority: number,
-    groupOrder: GroupOrder,
-    forward: boolean,
-    subscribeParameters: MessageParameter[],
-  ): TrackStatus {
-    return new TrackStatus(
-      requestId,
-      trackAlias,
-      fullTrackName,
-      subscriberPriority,
-      groupOrder,
-      forward,
-      FilterType.NextGroupStart,
-      undefined,
-      undefined,
-      subscribeParameters,
-    )
-  }
-
-  static newLatestObject(
-    requestId: bigint,
-    trackAlias: bigint,
-    fullTrackName: FullTrackName,
-    subscriberPriority: number,
-    groupOrder: GroupOrder,
-    forward: boolean,
-    subscribeParameters: MessageParameter[],
-  ): TrackStatus {
-    return new TrackStatus(
-      requestId,
-      trackAlias,
-      fullTrackName,
-      subscriberPriority,
-      groupOrder,
-      forward,
-      FilterType.LatestObject,
-      undefined,
-      undefined,
-      subscribeParameters,
-    )
-  }
-
-  static newAbsoluteStart(
-    requestId: bigint,
-    trackAlias: bigint,
-    fullTrackName: FullTrackName,
-    subscriberPriority: number,
-    groupOrder: GroupOrder,
-    forward: boolean,
-    startLocation: Location,
-    subscribeParameters: MessageParameter[],
-  ): TrackStatus {
-    return new TrackStatus(
-      requestId,
-      trackAlias,
-      fullTrackName,
-      subscriberPriority,
-      groupOrder,
-      forward,
-      FilterType.AbsoluteStart,
-      startLocation,
-      undefined,
-      subscribeParameters,
-    )
-  }
-
-  static newAbsoluteRange(
-    requestId: bigint,
-    trackAlias: bigint,
-    fullTrackName: FullTrackName,
-    subscriberPriority: number,
-    groupOrder: GroupOrder,
-    forward: boolean,
-    startLocation: Location,
-    endGroup: bigint,
-    subscribeParameters: MessageParameter[],
-  ): TrackStatus {
-    if (endGroup < startLocation.group) {
-      throw new Error('End Group must be >= Start Group')
-    }
-    return new TrackStatus(
-      requestId,
-      trackAlias,
-      fullTrackName,
-      subscriberPriority,
-      groupOrder,
-      forward,
-      FilterType.AbsoluteRange,
-      startLocation,
-      endGroup,
-      subscribeParameters,
-    )
+  getType(): ControlMessageType {
+    return ControlMessageType.TrackStatus
   }
 
   serialize(): FrozenByteBuffer {
@@ -145,26 +53,12 @@ export class TrackStatus {
     payload.putU8(this.subscriberPriority)
     payload.putU8(this.groupOrder)
     payload.putU8(this.forward ? 1 : 0)
-    payload.putVI(this.filterType)
-
-    if (this.filterType === FilterType.AbsoluteStart || this.filterType === FilterType.AbsoluteRange) {
-      if (!this.startLocation) {
-        throw new Error('StartLocation required for selected filterType')
-      }
-      payload.putLocation(this.startLocation)
-    }
-
-    if (this.filterType === FilterType.AbsoluteRange) {
-      if (this.endGroup == null) {
-        throw new Error('EndGroup required for AbsoluteRange')
-      }
-      payload.putVI(this.endGroup)
-    }
+    payload.putBytes(this.locationFilter.serializeValue())
 
     payload.putVI(this.subscribeParameters.length)
-    for (const param of this.subscribeParameters) {
-      payload.putKeyValuePair(param.toKeyValuePair())
-    }
+    payload.putBytes(
+      serializeMessageParameterKvps(this.subscribeParameters.map((p) => p.toKeyValuePair())).toUint8Array(),
+    )
 
     const payloadBytes = payload.toUint8Array()
     buf.putU16(payloadBytes.length)
@@ -180,23 +74,10 @@ export class TrackStatus {
     const subscriberPriority = buf.getU8()
     const groupOrder = buf.getU8()
     const forward = buf.getU8() === 1
-    const filterType = Number(buf.getVI()) as FilterType
-
-    let startLocation: Location | undefined = undefined
-    let endGroup: bigint | undefined = undefined
-
-    if (filterType === FilterType.AbsoluteStart || filterType === FilterType.AbsoluteRange) {
-      startLocation = buf.getLocation()
-    }
-    if (filterType === FilterType.AbsoluteRange) {
-      endGroup = buf.getVI()
-    }
+    const locationFilter = LocationFilter.deserializeValue(buf)
 
     const paramCount = Number(buf.getVI())
-    const rawParams = new Array(paramCount)
-    for (let i = 0; i < paramCount; i++) {
-      rawParams[i] = buf.getKeyValuePair()
-    }
+    const rawParams = deserializeMessageParameterKvps(buf, paramCount)
     const subscribeParameters = MessageParameters.fromKeyValuePairs(rawParams)
 
     return new TrackStatus(
@@ -206,9 +87,7 @@ export class TrackStatus {
       subscriberPriority,
       groupOrder,
       forward,
-      filterType,
-      startLocation,
-      endGroup,
+      locationFilter,
       subscribeParameters,
     )
   }
@@ -218,15 +97,14 @@ if (import.meta.vitest) {
   const { describe, it, expect } = import.meta.vitest
 
   function buildTestTrackStatus(): TrackStatus {
-    return TrackStatus.newAbsoluteRange(
+    return new TrackStatus(
       128242n,
       999n,
       FullTrackName.tryNew('track/namespace', 'trackName'),
       31,
       GroupOrder.Original,
       true,
-      new Location(81n, 81n),
-      100n,
+      new LocationFilter(LocationFilterType.AbsoluteStartGroupEnd, 81n, 81n, 100n),
       [AuthorizationToken.newUseValue(0n, new TextEncoder().encode('test-token'))],
     )
   }
@@ -270,42 +148,6 @@ if (import.meta.vitest) {
       expect(Array.from(trailing)).toEqual([9, 1, 1])
     })
 
-    describe('TrackStatus Constructors', () => {
-      it('should create a TrackStatus with AbsoluteRange filter', () => {
-        const subscribe = TrackStatus.newAbsoluteRange(
-          128242n,
-          999n,
-          FullTrackName.tryNew('track/namespace', 'trackName'),
-          31,
-          GroupOrder.Original,
-          true,
-          new Location(81n, 81n),
-          100n,
-          [],
-        )
-
-        expect(subscribe.filterType).toBe(FilterType.AbsoluteRange)
-        expect(subscribe.startLocation).toEqual(new Location(81n, 81n))
-        expect(subscribe.endGroup).toBe(100n)
-      })
-
-      it('should throw an error if EndGroup < StartGroup', () => {
-        expect(() =>
-          TrackStatus.newAbsoluteRange(
-            128242n,
-            999n,
-            FullTrackName.tryNew('track/namespace', 'trackName'),
-            31,
-            GroupOrder.Original,
-            true,
-            new Location(81n, 81n),
-            80n,
-            [],
-          ),
-        ).toThrow('End Group must be >= Start Group')
-      })
-    })
-
     it('should throw on invalid filterType', () => {
       const buf = new ByteBuffer()
       buf.putVI(ControlMessageType.TrackStatus)
@@ -322,13 +164,14 @@ if (import.meta.vitest) {
       expect(() => TrackStatus.parsePayload(buf)).toThrow()
     })
     it('should handle empty subscribeParameters', () => {
-      const subscribe = TrackStatus.newLatestObject(
+      const subscribe = new TrackStatus(
         128242n,
         999n,
         FullTrackName.tryNew('track/namespace', 'trackName'),
         31,
         GroupOrder.Original,
         true,
+        new LocationFilter(LocationFilterType.NextObject),
         [],
       )
 

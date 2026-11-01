@@ -14,13 +14,15 @@
  * limitations under the License.
  */
 
-import { Publish } from '@/model/control'
+import { Publish, RequestUpdate } from '@/model/control'
 import { MOQtailClient } from '../client'
 import { Track } from '../track/track'
-import { InternalError, Location, SubgroupHeaderType } from '@/model'
+import { InternalError, Location, MessageParameter, applyMessageParameterUpdate } from '@/model'
+import { CombinedFilter } from '@/model/parameter/message/combined_filter'
 import { SendStream } from '../data_stream'
-import { SubgroupHeader } from '@/model/data/subgroup_header'
 import { MoqtObject } from '@/model/data/object'
+import { SubgroupIds, subgroupHeaderFor } from './subgroup'
+import { assertWithinFilterRangeLimit } from '../util/validators'
 import { SimpleLock } from '../../util/simple_lock'
 import { getTransportPriority } from '../util/priority'
 import { logger } from '../../util/logger'
@@ -77,6 +79,36 @@ export class PublishPublication {
   #id = Math.floor(Math.random() * 1000000)
 
   /**
+   * Whether the peer is taking Objects right now. A PUBLISH may declare FORWARD=0, and
+   * then nothing is sent until the peer raises it -- in its PUBLISH_OK, or later with a
+   * REQUEST_UPDATE on this publication's own request stream.
+   */
+  #forward: boolean
+
+  /**
+   * The parameters this publication currently holds. An update amends them rather than
+   * replacing them, so a parameter the update leaves out keeps the value it had.
+   */
+  #parameters: MessageParameter[]
+
+  /**
+   * What the subscriber's Range Filters let through. A PUBLISH carries none, so this
+   * passes everything until a REQUEST_UPDATE says otherwise.
+   */
+  #filter: CombinedFilter = new CombinedFilter([])
+
+  /**
+   * The Subgroup ID of each Object, which the filter and the stream header need.
+   */
+  #subgroupIds = new SubgroupIds()
+
+  /**
+   * Highest group this publication has already opened a stream for or skipped objects of.
+   * A stream for a group at or below it reopens a subgroup, so it cannot claim FIRST_OBJECT.
+   */
+  #highestGroupSeen: bigint | undefined
+
+  /**
    * Creates a new PublishPublication instance.
    * @param client - The MOQT client managing the connection.
    * @param track - The track being proactively published.
@@ -89,9 +121,60 @@ export class PublishPublication {
   ) {
     this.#trackAlias = track.trackAlias!
     this.#publisherPriority = track.publisherPriority
+    this.#parameters = [...publishMsg.parameters]
+    // An omitted FORWARD means the publisher sends immediately; FORWARD=0 means it
+    // holds off until told otherwise.
+    this.#forward = publishMsg.parameters.find(MessageParameter.isForward)?.forward ?? true
 
-    // Start pushing data immediately
+    // Attaches to the track source. Whether anything is written from here is the
+    // Forward State's call, which may move for as long as the publication lives.
     this.publishToRelay()
+  }
+
+  /**
+   * How many data streams this publication has opened, which is what a PUBLISH_DONE
+   * reports to the subscriber.
+   */
+  get streamsOpened(): bigint {
+    return this.#streamsOpened
+  }
+
+  /**
+   * Whether Objects are being sent right now. False while the peer holds this
+   * publication at FORWARD=0.
+   */
+  get forwarding(): boolean {
+    return this.#forward
+  }
+
+  /**
+   * Moves the Forward State: false parks the publication, true resumes it. The
+   * application hears about the move through {@link MOQtailClient.onForwardStateChange},
+   * which is where a publisher starts or stops the work behind the track -- a camera
+   * and an encoder cost the same whether or not anything is listening.
+   */
+  setForwardState(forward: boolean): void {
+    if (this.#forward === forward) return
+    this.#forward = forward
+    this.client.onForwardStateChange?.(this.publishMsg.requestId, forward)
+  }
+
+  /**
+   * Applies a REQUEST_UPDATE the peer sent on this publication's request stream. It
+   * can move the Forward State and the Range Filters; what a publisher sends, and
+   * when, is otherwise its own to decide.
+   * @throws :{@link InvalidFilterError} If the Range Filters the publication would be
+   * left with cannot be applied; nothing is updated.
+   */
+  update(msg: RequestUpdate): void {
+    const parameters = [...this.#parameters]
+    applyMessageParameterUpdate(parameters, msg.parameters)
+    assertWithinFilterRangeLimit(parameters, this.client.maxFilterRanges, 'REQUEST_UPDATE')
+    this.#filter = new CombinedFilter(parameters)
+    this.#parameters = parameters
+
+    const forward = msg.parameters.find(MessageParameter.isForward)
+    if (forward) this.setForwardState(forward.forward)
   }
 
   /**
@@ -125,6 +208,12 @@ export class PublishPublication {
     })
   }
 
+  #markGroupSeen(group: bigint): void {
+    if (this.#highestGroupSeen === undefined || group > this.#highestGroupSeen) {
+      this.#highestGroupSeen = group
+    }
+  }
+
   /**
    * Publishes MOQT objects to the relay as they become available.
    * Handles stream creation, object writing, and stream closure.
@@ -138,8 +227,30 @@ export class PublishPublication {
       this.cancel()
     })
 
+    // Objects produced before publishing started are never sent, so the group they belong to
+    // cannot claim to start at its first object.
+    this.#highestGroupSeen = this.track.trackSource.live.largestLocation?.group
+
     this.#cancelPublishing = this.track.trackSource.live.onNewObject(async (obj: MoqtObject) => {
       if (this.#isCompleted) return
+      this.#subgroupIds.note(obj)
+
+      // Parked at FORWARD=0: Objects are dropped rather than queued, because a live
+      // track that resumes wants what is happening then, not a backlog. The group is
+      // still marked seen, so a stream opened for it later cannot claim to start at
+      // its first Object.
+      if (!this.#forward) {
+        this.#markGroupSeen(obj.location.group)
+        return
+      }
+
+      // Filtered out: marked seen, so a stream opened for this group later does not
+      // claim its first Object.
+      const subgroupId = this.#subgroupIds.of(obj)
+      if (!this.#filter.matches(obj, subgroupId)) {
+        this.#markGroupSeen(obj.location.group)
+        return
+      }
 
       try {
         if (!this.#streams.has(obj.location.group)) {
@@ -151,20 +262,25 @@ export class PublishPublication {
               sendOrder: this.#streamPriority,
             })
 
-            let subgroupId: bigint | undefined
-            if (SubgroupHeaderType.hasExplicitSubgroupId(obj.getSubgroupHeaderType(true))) subgroupId = obj.subgroupId!
-
-            const header = new SubgroupHeader(
-              obj.getSubgroupHeaderType(true),
+            const firstObject = this.#highestGroupSeen === undefined || obj.location.group > this.#highestGroupSeen
+            const header = subgroupHeaderFor(
+              obj,
+              subgroupId ?? obj.location.object,
               this.#trackAlias,
-              obj.location.group,
-              subgroupId,
               this.#publisherPriority,
+              firstObject,
             )
 
-            const sendStream = await SendStream.new(writeStream, header)
+            const sendStream = await SendStream.new(
+              writeStream,
+              header,
+              this.client.onDataSent,
+              undefined,
+              this.client.dataStreamObserver(() => this.track.fullTrackName),
+            )
             this.#streams.set(obj.location.group, sendStream)
             this.#streamsOpened++
+            this.#markGroupSeen(obj.location.group)
           }
           await this.#lock.release()
         }
@@ -209,4 +325,232 @@ export class PublishPublication {
       }
     })
   }
+}
+
+if (import.meta.vitest) {
+  const { describe, test, expect, vi } = import.meta.vitest
+  const { FullTrackName, Forward, ObjectForwardingPreference, SubgroupHeaderType } = await import('@/model')
+  const { RequestUpdate } = await import('@/model/control')
+  const { LiveTrackSource } = await import('../track/content_source')
+  const { SubgroupHeader: Header } = await import('@/model/data/subgroup_header')
+  const { FrozenByteBuffer } = await import('@/model/common/byte_buffer')
+
+  describe('PublishPublication FIRST_OBJECT', () => {
+    const ftn = FullTrackName.tryNew('room/alice', 'video')
+
+    /** Header types of the subgroup streams the publication opened, in order. */
+    function publishing(): { headerTypes: number[]; push: (group: number, object: number) => void; done: () => void } {
+      const headerTypes: number[] = []
+      const webTransport = {
+        createUnidirectionalStream: async () => {
+          let first = true
+          return new WritableStream<Uint8Array>({
+            write: (chunk) => {
+              if (!first) return
+              first = false
+              headerTypes.push(Number(Header.deserialize(new FrozenByteBuffer(chunk)).type))
+            },
+          })
+        },
+      }
+
+      let source!: ReadableStreamDefaultController<MoqtObject>
+      const live = new LiveTrackSource(new ReadableStream<MoqtObject>({ start: (controller) => (source = controller) }))
+      const track: Track = {
+        fullTrackName: ftn,
+        trackSource: { live },
+        publisherPriority: 0,
+        trackAlias: 1n,
+      }
+      const client = {
+        webTransport,
+        publications: new Map(),
+        dataStreamObserver: () => undefined,
+      } as unknown as MOQtailClient
+      new PublishPublication(client, track, { requestId: 0n, parameters: [] } as unknown as Publish)
+
+      const push = (group: number, object: number) =>
+        source.enqueue(
+          MoqtObject.newWithPayload(
+            ftn,
+            new Location(BigInt(group), BigInt(object)),
+            0,
+            ObjectForwardingPreference.Subgroup,
+            0n,
+            null,
+            new Uint8Array([1]),
+          ),
+        )
+      return { headerTypes, push, done: () => source.close() }
+    }
+
+    test('sets the bit on each new subgroup', async () => {
+      const { headerTypes, push } = publishing()
+      push(0, 0)
+      push(1, 0)
+      await vi.waitFor(() => expect(headerTypes).toHaveLength(2))
+      expect(headerTypes.map(SubgroupHeaderType.isFirstObject)).toEqual([true, true])
+    })
+
+    test('leaves the bit clear when a closed subgroup is reopened', async () => {
+      const { headerTypes, push } = publishing()
+      push(0, 0)
+      push(1, 0)
+      await vi.waitFor(() => expect(headerTypes).toHaveLength(2))
+      // Group 0's stream was closed when group 1 arrived; a later group 0 object reopens it.
+      push(0, 1)
+      await vi.waitFor(() => expect(headerTypes).toHaveLength(3))
+      expect(headerTypes.map(SubgroupHeaderType.isFirstObject)).toEqual([true, true, false])
+    })
+
+    test('leaves the bit clear for a group already in progress when publishing starts', async () => {
+      const headerTypes: number[] = []
+      const webTransport = {
+        createUnidirectionalStream: async () => {
+          let first = true
+          return new WritableStream<Uint8Array>({
+            write: (chunk) => {
+              if (!first) return
+              first = false
+              headerTypes.push(Number(Header.deserialize(new FrozenByteBuffer(chunk)).type))
+            },
+          })
+        },
+      }
+      let source!: ReadableStreamDefaultController<MoqtObject>
+      const live = new LiveTrackSource(new ReadableStream<MoqtObject>({ start: (controller) => (source = controller) }))
+      const object = (group: number, objectId: number) =>
+        MoqtObject.newWithPayload(
+          ftn,
+          new Location(BigInt(group), BigInt(objectId)),
+          0,
+          ObjectForwardingPreference.Subgroup,
+          0n,
+          null,
+          new Uint8Array([1]),
+        )
+
+      // Group 3 is already flowing before anyone publishes it, so its first object is gone.
+      source.enqueue(object(3, 0))
+      await vi.waitFor(() => expect(live.largestLocation?.group).toBe(3n))
+
+      const client = {
+        webTransport,
+        publications: new Map(),
+        dataStreamObserver: () => undefined,
+      } as unknown as MOQtailClient
+      new PublishPublication(
+        client,
+        { fullTrackName: ftn, trackSource: { live }, publisherPriority: 0, trackAlias: 1n },
+        {
+          requestId: 0n,
+          parameters: [],
+        } as unknown as Publish,
+      )
+
+      source.enqueue(object(3, 1))
+      source.enqueue(object(4, 0))
+      await vi.waitFor(() => expect(headerTypes).toHaveLength(2))
+      expect(headerTypes.map(SubgroupHeaderType.isFirstObject)).toEqual([false, true])
+    })
+  })
+
+  describe('PublishPublication Forward State', () => {
+    const ftn = FullTrackName.tryNew('room/alice', 'video')
+
+    /** A publication that declared `forward`, the wire under it, and its source. */
+    function publishing(forward: boolean) {
+      const chunks: Uint8Array[] = []
+      const webTransport = {
+        createUnidirectionalStream: async () =>
+          new WritableStream<Uint8Array>({
+            write: (chunk) => {
+              chunks.push(chunk)
+            },
+          }),
+      }
+
+      let source!: ReadableStreamDefaultController<MoqtObject>
+      const live = new LiveTrackSource(new ReadableStream<MoqtObject>({ start: (controller) => (source = controller) }))
+      const track: Track = {
+        fullTrackName: ftn,
+        trackSource: { live },
+        publisherPriority: 0,
+        trackAlias: 1n,
+      }
+      const moves: { requestId: bigint; forward: boolean }[] = []
+      const client = {
+        webTransport,
+        publications: new Map(),
+        dataStreamObserver: () => undefined,
+        onForwardStateChange: (requestId: bigint, forward: boolean) => moves.push({ requestId, forward }),
+      } as unknown as MOQtailClient
+      const publication = new PublishPublication(client, track, {
+        requestId: 7n,
+        parameters: [new Forward(forward)],
+      } as unknown as Publish)
+
+      const push = (group: number, object: number) =>
+        source.enqueue(
+          MoqtObject.newWithPayload(
+            ftn,
+            new Location(BigInt(group), BigInt(object)),
+            0,
+            ObjectForwardingPreference.Subgroup,
+            0n,
+            null,
+            new Uint8Array([1]),
+          ),
+        )
+      return { publication, live, chunks, push, moves }
+    }
+
+    test('sends nothing while the publisher declared FORWARD=0', async () => {
+      const { publication, live, chunks, push } = publishing(false)
+      expect(publication.forwarding).toBe(false)
+
+      push(0, 0)
+      await vi.waitFor(() => expect(live.largestLocation?.group).toBe(0n))
+      expect(chunks).toHaveLength(0)
+    })
+
+    test('starts sending when the peer raises the Forward State', async () => {
+      const { publication, live, chunks, push, moves } = publishing(false)
+      push(0, 0)
+      await vi.waitFor(() => expect(live.largestLocation?.group).toBe(0n))
+
+      publication.update(new RequestUpdate(0n, [new Forward(true)]))
+      expect(publication.forwarding).toBe(true)
+      expect(moves).toEqual([{ requestId: 7n, forward: true }])
+
+      push(1, 0)
+      await vi.waitFor(() => expect(chunks.length).toBeGreaterThan(0))
+      // Group 1 opened the only stream: what arrived while the publication was parked
+      // was dropped rather than held back for this moment.
+      expect(Header.deserialize(new FrozenByteBuffer(chunks[0]!)).groupId).toBe(1n)
+    })
+
+    test('parks the publication when the peer drops the Forward State', async () => {
+      const { publication, live, chunks, push, moves } = publishing(true)
+      push(0, 0)
+      await vi.waitFor(() => expect(chunks.length).toBeGreaterThan(0))
+      const sent = chunks.length
+
+      publication.update(new RequestUpdate(0n, [new Forward(false)]))
+      expect(publication.forwarding).toBe(false)
+      expect(moves).toEqual([{ requestId: 7n, forward: false }])
+
+      push(1, 0)
+      await vi.waitFor(() => expect(live.largestLocation?.group).toBe(1n))
+      expect(chunks).toHaveLength(sent)
+    })
+
+    test('leaves the Forward State alone when an update does not name it', async () => {
+      const { publication, moves } = publishing(true)
+
+      publication.update(new RequestUpdate(0n, []))
+      expect(publication.forwarding).toBe(true)
+      expect(moves).toHaveLength(0)
+    })
+  })
 }

@@ -14,59 +14,65 @@
  * limitations under the License.
  */
 
-import { FullTrackName, InternalError, Location, ReasonPhrase } from '@/model'
-import { Fetch, FetchOk, FetchType, RequestError, RequestErrorCode } from '../../model/control'
-import { ControlMessageHandler } from './handler'
+import { InternalError, MessageParameter, ReasonPhrase } from '@/model'
+import { Fetch, FetchOk, RequestError, RequestErrorCode } from '../../model/control'
+import { RequestStreamMessageHandler } from './handler'
 import { SubscribePublication } from '../publication/subscribe'
 import { FetchPublication } from '../publication/fetch'
 import { PublishPublication } from '../publication'
 import { logger } from '../../util/logger'
+import { rangeFilterRejection } from '../util/validators'
 
-export const handlerFetch: ControlMessageHandler<Fetch> = async (client, msg) => {
-  logger.log('handler/fetch', 'requestId, type', msg.requestId, msg.typeAndProps.type)
-  // TODO: Use fetch parameters and handle authorization
-  let fullTrackName: FullTrackName | undefined
-  let joiningRequest: SubscribePublication | FetchPublication | PublishPublication | undefined
-  switch (msg.typeAndProps.type) {
-    case FetchType.Standalone:
-      fullTrackName = msg.typeAndProps.props.fullTrackName
-      break
-
-    case FetchType.Relative:
-    case FetchType.Absolute:
-      joiningRequest = client.publications.get(msg.typeAndProps.props.joiningRequestId)
-      if (!(joiningRequest instanceof SubscribePublication))
-        throw new InternalError('handlerFetch', 'No subscription for the joining request id')
-      fullTrackName = joiningRequest.track.fullTrackName
-      break
+export const handlerFetch: RequestStreamMessageHandler<Fetch> = async (client, msg, stream) => {
+  logger.log('handler/fetch', 'requestId', msg.requestId)
+  const filterRejection = rangeFilterRejection(msg.parameters, client.maxFilterRanges)
+  if (filterRejection) {
+    logger.warn(
+      'handler/fetch',
+      `requestId=${msg.requestId} has filters this client cannot take: ${filterRejection.reasonPhrase.phrase}`,
+    )
+    await stream.send(filterRejection)
+    return
   }
+
+  // TODO: Use fetch parameters and handle authorization
+  const fullTrackName = msg.fullTrackName
   const track = client.trackSources.get(fullTrackName.toString())
   if (!track) {
-    const response = new RequestError(
-      msg.requestId,
-      RequestErrorCode.DoesNotExist,
-      0n,
-      new ReasonPhrase('Track does not exists'),
-    )
-    await client.controlStream.send(response)
+    const response = new RequestError(RequestErrorCode.DoesNotExist, 0n, new ReasonPhrase('Track does not exists'))
+    await stream.send(response)
     return
   }
 
   if (!track.trackSource.past) {
     const response = new RequestError(
-      msg.requestId,
       RequestErrorCode.NotSupported,
       0n,
       new ReasonPhrase('Requested track does not support fetch'),
     )
-    await client.controlStream.send(response)
+    await stream.send(response)
     return
   }
+  const largest = track.trackSource.live?.largestLocation ?? (await track.trackSource.past.getRange()).at(-1)?.location
+  const range = msg.locationFilter.fetchRange(largest)
+  if (!range) {
+    logger.warn('handler/fetch', `requestId=${msg.requestId} selects nothing published (largest=${largest})`)
+    const response = new RequestError(
+      RequestErrorCode.InvalidRange,
+      0n,
+      new ReasonPhrase('Nothing published in the requested range'),
+    )
+    await stream.send(response)
+    return
+  }
+
   // TODO: Add support for descending group order
   // TODO: Handle parameter checking and parameter selection.
-  // TODO: Figure out what to do with endOfTrack and end location
-  const publication = new FetchPublication(client, track, msg)
+  // TODO: Figure out what to do with endOfTrack
+  const publication = new FetchPublication(client, track, msg, range.start, range.end)
   client.publications.set(msg.requestId, publication)
-  const response = new FetchOk(msg.requestId, false, new Location(0n, 0n), msg.parameters, track.trackExtensions ?? [])
-  await client.controlStream.send(response)
+  // No parameters are defined for FETCH_OK, so the request's are not echoed.
+  const trackProperties = MessageParameter.includesProperties(msg.parameters) ? (track.trackProperties ?? []) : []
+  const response = new FetchOk(false, range.end, [], trackProperties)
+  await stream.send(response)
 }

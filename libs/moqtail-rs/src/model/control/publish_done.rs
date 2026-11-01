@@ -21,21 +21,22 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct PublishDone {
-  pub request_id: u64,
   pub status_code: PublishDoneStatusCode,
   pub stream_count: u64,
   pub reason_phrase: ReasonPhrase,
 }
 
 impl PublishDone {
+  /// The Stream Count a publisher sends when it cannot name the exact number of
+  /// streams it opened. Receivers fall back on a timeout to end the subscription.
+  pub const UNKNOWN_STREAM_COUNT: u64 = u64::MAX;
+
   pub fn new(
-    request_id: u64,
     status_code: PublishDoneStatusCode,
     stream_count: u64,
     reason_phrase: ReasonPhrase,
   ) -> Self {
     Self {
-      request_id,
       status_code,
       stream_count,
       reason_phrase,
@@ -49,7 +50,6 @@ impl ControlMessageTrait for PublishDone {
     buf.put_vi(ControlMessageType::PublishDone)?;
 
     let mut payload = BytesMut::new();
-    payload.put_vi(self.request_id)?;
     payload.put_vi(self.status_code)?;
     payload.put_vi(self.stream_count)?;
     payload.extend_from_slice(&self.reason_phrase.serialize()?);
@@ -70,14 +70,13 @@ impl ControlMessageTrait for PublishDone {
   }
 
   fn parse_payload(payload: &mut Bytes) -> Result<Box<Self>, ParseError> {
-    let request_id = payload.get_vi()?;
+    // An unknown or GREASE status code is not fatal; treat it as InternalError.
     let status_code_raw = payload.get_vi()?;
-    let status_code = PublishDoneStatusCode::try_from(status_code_raw)?;
+    let status_code = PublishDoneStatusCode::from_wire(status_code_raw);
     let stream_count = payload.get_vi()?;
     let reason_phrase = ReasonPhrase::deserialize(payload)?;
 
     Ok(Box::new(PublishDone {
-      request_id,
       status_code,
       stream_count,
       reason_phrase,
@@ -97,12 +96,10 @@ mod tests {
 
   #[test]
   fn test_roundtrip() {
-    let request_id = 209455;
-    let status_code = PublishDoneStatusCode::SubscriptionEnded;
+    let status_code = PublishDoneStatusCode::TrackEnded;
     let stream_count = 9;
     let reason_phrase = ReasonPhrase::try_new("It's not you, it's me.".to_string()).unwrap();
     let subscribe_done = PublishDone {
-      request_id,
       status_code,
       stream_count,
       reason_phrase,
@@ -119,12 +116,10 @@ mod tests {
 
   #[test]
   fn test_excess_roundtrip() {
-    let request_id = 209455;
-    let status_code = PublishDoneStatusCode::SubscriptionEnded;
+    let status_code = PublishDoneStatusCode::TrackEnded;
     let stream_count = 9;
     let reason_phrase = ReasonPhrase::try_new("It's not you, it's me.".to_string()).unwrap();
     let subscribe_done = PublishDone {
-      request_id,
       status_code,
       stream_count,
       reason_phrase,
@@ -146,13 +141,37 @@ mod tests {
   }
 
   #[test]
+  fn test_unknown_stream_count_roundtrip() {
+    let subscribe_done = PublishDone::new(
+      PublishDoneStatusCode::TrackEnded,
+      PublishDone::UNKNOWN_STREAM_COUNT,
+      ReasonPhrase::try_new("unknown".to_string()).unwrap(),
+    );
+    let mut buf = subscribe_done.serialize().unwrap();
+    buf.get_vi().unwrap();
+    buf.get_u16();
+    let deserialized = PublishDone::parse_payload(&mut buf).unwrap();
+    assert_eq!(deserialized.stream_count, u64::MAX);
+    assert!(!buf.has_remaining());
+  }
+
+  #[test]
+  fn the_removed_subscription_ended_code_reads_as_internal_error() {
+    // 0x3 was SUBSCRIPTION_ENDED. A peer that still sends it gets the same treatment
+    // as any other code this side does not know.
+    assert!(PublishDoneStatusCode::try_from(0x3).is_err());
+    assert_eq!(
+      PublishDoneStatusCode::from_wire(0x3),
+      PublishDoneStatusCode::InternalError
+    );
+  }
+
+  #[test]
   fn test_partial_message() {
-    let request_id = 209455;
-    let status_code = PublishDoneStatusCode::SubscriptionEnded;
+    let status_code = PublishDoneStatusCode::TrackEnded;
     let stream_count = 9;
     let reason_phrase = ReasonPhrase::try_new("It's not you, it's me.".to_string()).unwrap();
     let subscribe_done = PublishDone {
-      request_id,
       status_code,
       stream_count,
       reason_phrase,

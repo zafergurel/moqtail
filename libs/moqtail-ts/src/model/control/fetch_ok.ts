@@ -18,31 +18,42 @@ import { ByteBuffer, FrozenByteBuffer, BaseByteBuffer } from '../common/byte_buf
 import { ControlMessageType } from './constant'
 import { Location } from '../common/location'
 import { LengthExceedsMaxError, NotEnoughBytesError, ProtocolViolationError } from '../error/error'
-import { MessageParameter, MessageParameters } from '../parameter/message_parameter'
-import { TrackExtension, DeliveryTimeoutExtension } from '../extension_header/track_extension'
-import { DeliveryTimeout } from '../parameter/message/delivery_timeout'
+import {
+  MessageParameter,
+  MessageParameters,
+  deserializeMessageParameterKvps,
+  serializeMessageParameterKvps,
+} from '../parameter/message_parameter'
+import { TrackProperty, ObjectDeliveryTimeoutProperty } from '../property/track_property'
+import { ObjectDeliveryTimeout } from '../parameter/message/object_delivery_timeout'
 
+/**
+ * FETCH_OK (0x18) keeps a body of its own rather than folding into REQUEST_OK, but like
+ * every other response it carries no Request ID: the request stream it arrives on
+ * identifies the request (§10.1).
+ */
 export class FetchOk {
   constructor(
-    public readonly requestId: bigint,
     public readonly endOfTrack: boolean,
+    /** The last Location the response covers, inclusive. Object 2^64-1 is all of that group. */
     public readonly endLocation: Location,
     public readonly parameters: MessageParameter[],
-    public readonly trackExtensions: TrackExtension[] = [],
+    public readonly trackProperties: TrackProperty[] = [],
   ) {}
+
+  getType(): ControlMessageType {
+    return ControlMessageType.FetchOk
+  }
 
   serialize(): FrozenByteBuffer {
     const buf = new ByteBuffer()
     buf.putVI(BigInt(ControlMessageType.FetchOk))
     const payload = new ByteBuffer()
-    payload.putVI(this.requestId)
     payload.putU8(this.endOfTrack ? 1 : 0)
     payload.putLocation(this.endLocation)
     payload.putVI(this.parameters.length)
-    for (const param of this.parameters) {
-      payload.putKeyValuePair(param.toKeyValuePair())
-    }
-    TrackExtension.serializeInto(this.trackExtensions, payload)
+    payload.putBytes(serializeMessageParameterKvps(this.parameters.map((p) => p.toKeyValuePair())).toUint8Array())
+    TrackProperty.serializeInto(this.trackProperties, payload)
     const payloadBytes = payload.toUint8Array()
     if (payloadBytes.length > 0xffff) {
       throw new LengthExceedsMaxError('FetchOk::serialize(payloadBytes.length)', 0xffff, payloadBytes.length)
@@ -53,7 +64,6 @@ export class FetchOk {
   }
 
   static parsePayload(buf: BaseByteBuffer): FetchOk {
-    const requestId = buf.getVI()
     if (buf.remaining < 1) {
       throw new NotEnoughBytesError('FetchOk::parsePayload(endOfTrack)', 1, 0)
     }
@@ -71,13 +81,10 @@ export class FetchOk {
     }
     const endLocation = buf.getLocation()
     const paramCount = buf.getNumberVI()
-    const rawParams = new Array(paramCount)
-    for (let i = 0; i < paramCount; i++) {
-      rawParams[i] = buf.getKeyValuePair()
-    }
+    const rawParams = deserializeMessageParameterKvps(buf, paramCount)
     const parameters = MessageParameters.fromKeyValuePairs(rawParams)
-    const trackExtensions = TrackExtension.deserializeAll(buf)
-    return new FetchOk(requestId, endOfTrack, endLocation, parameters, trackExtensions)
+    const trackProperties = TrackProperty.deserializeAll(buf)
+    return new FetchOk(endOfTrack, endLocation, parameters, trackProperties)
   }
 }
 
@@ -86,49 +93,45 @@ if (import.meta.vitest) {
 
   describe('FetchOk', () => {
     test('roundtrip', () => {
-      const requestId = 271828n
       const endOfTrack = true
       const endLocation = new Location(17n, 57n)
-      const parameters = [new DeliveryTimeout(200n)]
-      const msg = new FetchOk(requestId, endOfTrack, endLocation, parameters)
+      const parameters = [new ObjectDeliveryTimeout(200n)]
+      const msg = new FetchOk(endOfTrack, endLocation, parameters)
       const frozen = msg.serialize()
       const msgType = frozen.getVI()
       expect(msgType).toBe(BigInt(ControlMessageType.FetchOk))
       const msgLength = frozen.getU16()
       expect(msgLength).toBe(frozen.remaining)
       const parsed = FetchOk.parsePayload(frozen)
-      expect(parsed.requestId).toBe(requestId)
       expect(parsed.endOfTrack).toBe(endOfTrack)
       expect(parsed.endLocation.equals(endLocation)).toBe(true)
       expect(parsed.parameters.length).toBe(1)
-      expect(parsed.trackExtensions.length).toBe(0)
+      expect(parsed.trackProperties.length).toBe(0)
       expect(frozen.remaining).toBe(0)
     })
 
-    test('roundtrip with track extensions', () => {
+    test('roundtrip with track properties', () => {
       const msg = new FetchOk(
-        271828n,
         true,
         new Location(17n, 57n),
-        [new DeliveryTimeout(200n)],
-        [new DeliveryTimeoutExtension(8000n)],
+        [new ObjectDeliveryTimeout(200n)],
+        [new ObjectDeliveryTimeoutProperty(8000n)],
       )
       const frozen = msg.serialize()
       frozen.getVI() // message type
       const msgLength = frozen.getU16()
       const payload = new FrozenByteBuffer(frozen.getBytes(msgLength))
       const parsed = FetchOk.parsePayload(payload)
-      expect(parsed.trackExtensions.length).toBe(1)
-      expect(parsed.trackExtensions[0]).toBeInstanceOf(DeliveryTimeoutExtension)
+      expect(parsed.trackProperties.length).toBe(1)
+      expect(parsed.trackProperties[0]).toBeInstanceOf(ObjectDeliveryTimeoutProperty)
       expect(payload.remaining).toBe(0)
     })
 
     test('excess roundtrip', () => {
-      const requestId = 271828n
       const endOfTrack = true
       const endLocation = new Location(17n, 57n)
-      const parameters = [new DeliveryTimeout(200n)]
-      const msg = new FetchOk(requestId, endOfTrack, endLocation, parameters)
+      const parameters = [new ObjectDeliveryTimeout(200n)]
+      const msg = new FetchOk(endOfTrack, endLocation, parameters)
       const serialized = msg.serialize().toUint8Array()
       const excess = new Uint8Array([9, 1, 1])
       const buf = new ByteBuffer()
@@ -141,7 +144,6 @@ if (import.meta.vitest) {
       expect(msgLength).toBe(frozen.remaining - 3)
       const payload = new FrozenByteBuffer(frozen.getBytes(msgLength))
       const parsed = FetchOk.parsePayload(payload)
-      expect(parsed.requestId).toBe(requestId)
       expect(parsed.endOfTrack).toBe(endOfTrack)
       expect(parsed.endLocation.equals(endLocation)).toBe(true)
       expect(parsed.parameters.length).toBe(1)
@@ -150,11 +152,10 @@ if (import.meta.vitest) {
     })
 
     test('partial message', () => {
-      const requestId = 271828n
       const endOfTrack = true
       const endLocation = new Location(17n, 57n)
-      const parameters = [new DeliveryTimeout(200n)]
-      const msg = new FetchOk(requestId, endOfTrack, endLocation, parameters)
+      const parameters = [new ObjectDeliveryTimeout(200n)]
+      const msg = new FetchOk(endOfTrack, endLocation, parameters)
       const serialized = msg.serialize().toUint8Array()
       const upper = Math.floor(serialized.length / 2)
       const partial = serialized.slice(0, upper)

@@ -16,36 +16,41 @@ use crate::model::error::ParseError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
-pub enum SetupParameterType {
+pub enum SetupOptionType {
   Path = 0x01,
-  MaxRequestId = 0x02,
   AuthorizationToken = 0x03,
   MaxAuthTokenCacheSize = 0x04,
   Authority = 0x05, // MQOtail does not use this (WebTransport)
+  MaxFilterRanges = 0x06,
   MoqtImplementation = 0x07,
+  MaxRequestUpdates = 0x08,
+  // Provisional: sender-side track switching is not in the adopted registry.
+  SstsAlgorithms = 0x09,
 }
 
-impl TryFrom<u64> for SetupParameterType {
+impl TryFrom<u64> for SetupOptionType {
   type Error = ParseError;
 
   fn try_from(value: u64) -> Result<Self, Self::Error> {
     match value {
-      0x01 => Ok(SetupParameterType::Path),
-      0x02 => Ok(SetupParameterType::MaxRequestId),
-      0x03 => Ok(SetupParameterType::AuthorizationToken),
-      0x04 => Ok(SetupParameterType::MaxAuthTokenCacheSize),
-      0x05 => Ok(SetupParameterType::Authority),
-      0x07 => Ok(SetupParameterType::MoqtImplementation),
+      0x01 => Ok(SetupOptionType::Path),
+      0x03 => Ok(SetupOptionType::AuthorizationToken),
+      0x04 => Ok(SetupOptionType::MaxAuthTokenCacheSize),
+      0x05 => Ok(SetupOptionType::Authority),
+      0x06 => Ok(SetupOptionType::MaxFilterRanges),
+      0x07 => Ok(SetupOptionType::MoqtImplementation),
+      0x08 => Ok(SetupOptionType::MaxRequestUpdates),
+      0x09 => Ok(SetupOptionType::SstsAlgorithms),
       _ => Err(ParseError::InvalidType {
-        context: "SetupParameterType::try_from(u64)",
+        context: "SetupOptionType::try_from(u64)",
         details: format!("Invalid type, got {value}"),
       }),
     }
   }
 }
 
-impl From<SetupParameterType> for u64 {
-  fn from(value: SetupParameterType) -> Self {
+impl From<SetupOptionType> for u64 {
+  fn from(value: SetupOptionType) -> Self {
     value as u64
   }
 }
@@ -53,15 +58,28 @@ impl From<SetupParameterType> for u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum MessageParameterType {
-  DeliveryTimeout = 0x02,
+  ObjectDeliveryTimeout = 0x02,
   AuthorizationToken = 0x03,
+  RendezvousTimeout = 0x04,
+  SubgroupDeliveryTimeout = 0x06,
   Expires = 0x08,
   LargestObject = 0x09,
+  FillTimeout = 0x0A,
   Forward = 0x10,
   SubscriberPriority = 0x20,
-  SubscriptionFilter = 0x21,
+  LocationFilter = 0x21,
   GroupOrder = 0x22,
+  FillParameters = 0x23,
+  SwitchFrom = 0x24,
+  SubgroupFilter = 0x25,
+  ObjectIdFilter = 0x26,
+  PriorityFilter = 0x27,
+  ObjectPropertyFilter = 0x28,
+  TrackPropertyFilter = 0x29,
   NewGroupRequest = 0x32,
+  TrackNamespacePrefix = 0x34,
+  IncludeProperties = 0x35,
+  SwitchingSetAssignment = 0x41,
 }
 
 impl TryFrom<u64> for MessageParameterType {
@@ -69,15 +87,28 @@ impl TryFrom<u64> for MessageParameterType {
 
   fn try_from(value: u64) -> Result<Self, Self::Error> {
     match value {
-      0x02 => Ok(MessageParameterType::DeliveryTimeout),
+      0x02 => Ok(MessageParameterType::ObjectDeliveryTimeout),
       0x03 => Ok(MessageParameterType::AuthorizationToken),
+      0x04 => Ok(MessageParameterType::RendezvousTimeout),
+      0x06 => Ok(MessageParameterType::SubgroupDeliveryTimeout),
       0x08 => Ok(MessageParameterType::Expires),
       0x09 => Ok(MessageParameterType::LargestObject),
+      0x0A => Ok(MessageParameterType::FillTimeout),
       0x10 => Ok(MessageParameterType::Forward),
       0x20 => Ok(MessageParameterType::SubscriberPriority),
-      0x21 => Ok(MessageParameterType::SubscriptionFilter),
+      0x21 => Ok(MessageParameterType::LocationFilter),
       0x22 => Ok(MessageParameterType::GroupOrder),
+      0x23 => Ok(MessageParameterType::FillParameters),
+      0x24 => Ok(MessageParameterType::SwitchFrom),
+      0x25 => Ok(MessageParameterType::SubgroupFilter),
+      0x26 => Ok(MessageParameterType::ObjectIdFilter),
+      0x27 => Ok(MessageParameterType::PriorityFilter),
+      0x28 => Ok(MessageParameterType::ObjectPropertyFilter),
+      0x29 => Ok(MessageParameterType::TrackPropertyFilter),
       0x32 => Ok(MessageParameterType::NewGroupRequest),
+      0x34 => Ok(MessageParameterType::TrackNamespacePrefix),
+      0x35 => Ok(MessageParameterType::IncludeProperties),
+      0x41 => Ok(MessageParameterType::SwitchingSetAssignment),
       _ => Err(ParseError::InvalidType {
         context: "MessageParameterType::try_from(u64)",
         details: format!("Unknown parameter type, got {value}"),

@@ -13,20 +13,21 @@
 // limitations under the License.
 
 use crate::model::common::varint::{BufMutVarIntExt, BufVarIntExt};
+use crate::model::control::constant::GroupOrder;
 use crate::model::error::ParseError;
-use crate::model::extension_header::object_extension::{
-  ObjectExtension, deserialize_object_extensions,
+use crate::model::property::object_property::{
+  ObjectProperty, deserialize_object_properties, serialize_object_properties,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use super::constant::ObjectForwardingPreference;
 
-/// Draft-16 §10.4.4 Serialization Flags bit layout.
+/// Serialization Flags bit layout.
 const FLAG_SUBGROUP_MODE_MASK: u8 = 0x03;
 const FLAG_OBJECT_ID_PRESENT: u8 = 0x04;
 const FLAG_GROUP_ID_PRESENT: u8 = 0x08;
 const FLAG_PRIORITY_PRESENT: u8 = 0x10;
-const FLAG_EXTENSIONS_PRESENT: u8 = 0x20;
+const FLAG_PROPERTIES_PRESENT: u8 = 0x20;
 const FLAG_DATAGRAM: u8 = 0x40;
 
 const SUBGROUP_MODE_ZERO: u8 = 0b00;
@@ -37,24 +38,33 @@ const SUBGROUP_MODE_PRESENT: u8 = 0b11;
 /// Special Serialization Flag varint values for End-of-Range markers.
 const END_OF_NON_EXISTENT_RANGE: u64 = 0x8C;
 const END_OF_UNKNOWN_RANGE: u64 = 0x10C;
+const END_OF_TIMED_OUT_RANGE: u64 = 0x20C;
 
-/// Prior-object state threaded across successive Fetch Objects on the same stream.
-/// Used by both `serialize` and `deserialize` to compute / resolve inherited fields.
+/// The prior Object a Fetch Object is encoded against: each one is written as
+/// differences from it. Used by both `serialize` and `deserialize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FetchObjectContext {
   pub group_id: u64,
-  pub subgroup_id: u64,
+  /// None while the stream has carried only End of Range markers and no Object yet:
+  /// a marker sets the prior Group and Object IDs, but has no Subgroup ID.
+  pub subgroup_id: Option<u64>,
   pub object_id: u64,
-  pub publisher_priority: u8,
+  /// None while the stream has carried only End of Range markers and no Object yet:
+  /// a marker has no priority.
+  pub publisher_priority: Option<u8>,
 }
 
-/// Kind discriminator for End-of-Range markers (§10.4.4.2).
+/// Kind discriminator for End-of-Range markers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EndOfRangeKind {
   /// Serialization Flags = 0x8C: all objects in the range are known not to exist.
   NonExistent,
   /// Serialization Flags = 0x10C: the range is cache-unknown.
   Unknown,
+  /// Serialization Flags = 0x20C: the range timed out, e.g. a relay ran out of its
+  /// fill budget before it could retrieve it.
+  TimedOut,
 }
 
 impl EndOfRangeKind {
@@ -62,11 +72,12 @@ impl EndOfRangeKind {
     match self {
       EndOfRangeKind::NonExistent => END_OF_NON_EXISTENT_RANGE,
       EndOfRangeKind::Unknown => END_OF_UNKNOWN_RANGE,
+      EndOfRangeKind::TimedOut => END_OF_TIMED_OUT_RANGE,
     }
   }
 }
 
-/// Payload-bearing fetch object (§10.4.4, non-End-of-Range form).
+/// Payload-bearing fetch object (non-End-of-Range form).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchObjectPayload {
   pub group_id: u64,
@@ -74,8 +85,8 @@ pub struct FetchObjectPayload {
   pub object_id: u64,
   pub publisher_priority: u8,
   pub forwarding_preference: ObjectForwardingPreference,
-  pub extension_headers: Option<Vec<ObjectExtension>>,
-  /// Draft-16 §10.4.4 FETCH objects carry no Object Status field; zero-length
+  pub properties: Option<Vec<ObjectProperty>>,
+  /// FETCH objects carry no Object Status field; zero-length
   /// payload signals a zero-length Normal object.
   pub payload: Bytes,
 }
@@ -92,21 +103,38 @@ pub enum FetchObject {
 }
 
 impl FetchObject {
-  /// Context to thread into the next call on this stream.
-  /// Returns None for EndOfRange markers — they MUST NOT update prior state.
-  pub fn context(&self) -> Option<FetchObjectContext> {
+  /// What the entry after this one is encoded against, given what this one was
+  /// encoded against (`prev`).
+  ///
+  /// After an Object, that is the Object itself. After an End of Range marker, it is
+  /// the marker's Group and Object IDs, with the Subgroup ID and priority still those
+  /// of the last Object before the marker, or none if no Object came before it.
+  pub fn next_context(&self, prev: Option<&FetchObjectContext>) -> FetchObjectContext {
     match self {
-      FetchObject::Object(p) => Some(FetchObjectContext {
+      FetchObject::Object(p) => FetchObjectContext {
         group_id: p.group_id,
-        subgroup_id: p.subgroup_id,
+        subgroup_id: Some(p.subgroup_id),
         object_id: p.object_id,
-        publisher_priority: p.publisher_priority,
-      }),
-      FetchObject::EndOfRange { .. } => None,
+        publisher_priority: Some(p.publisher_priority),
+      },
+      FetchObject::EndOfRange {
+        group_id,
+        object_id,
+        ..
+      } => FetchObjectContext {
+        group_id: *group_id,
+        subgroup_id: prev.and_then(|pc| pc.subgroup_id),
+        object_id: *object_id,
+        publisher_priority: prev.and_then(|pc| pc.publisher_priority),
+      },
     }
   }
 
-  pub fn serialize(&self, prev: Option<&FetchObjectContext>) -> Result<Bytes, ParseError> {
+  pub fn serialize(
+    &self,
+    prev: Option<&FetchObjectContext>,
+    group_order: GroupOrder,
+  ) -> Result<Bytes, ParseError> {
     match self {
       FetchObject::EndOfRange {
         kind,
@@ -119,13 +147,14 @@ impl FetchObject {
         buf.put_vi(*object_id)?;
         Ok(buf.freeze())
       }
-      FetchObject::Object(p) => serialize_payload(p, prev),
+      FetchObject::Object(p) => serialize_payload(p, prev, group_order),
     }
   }
 
   pub fn deserialize(
     bytes: &mut Bytes,
     prev: Option<&FetchObjectContext>,
+    group_order: GroupOrder,
   ) -> Result<Self, ParseError> {
     let flags_raw = bytes.get_vi()?;
 
@@ -133,6 +162,7 @@ impl FetchObject {
       let kind = match flags_raw {
         END_OF_NON_EXISTENT_RANGE => EndOfRangeKind::NonExistent,
         END_OF_UNKNOWN_RANGE => EndOfRangeKind::Unknown,
+        END_OF_TIMED_OUT_RANGE => EndOfRangeKind::TimedOut,
         other => {
           return Err(ParseError::ProtocolViolation {
             context: "FetchObject::deserialize",
@@ -154,7 +184,7 @@ impl FetchObject {
     let has_object_id = flags & FLAG_OBJECT_ID_PRESENT != 0;
     let has_group_id = flags & FLAG_GROUP_ID_PRESENT != 0;
     let has_priority = flags & FLAG_PRIORITY_PRESENT != 0;
-    let has_extensions = flags & FLAG_EXTENSIONS_PRESENT != 0;
+    let has_properties = flags & FLAG_PROPERTIES_PRESENT != 0;
     let is_datagram = flags & FLAG_DATAGRAM != 0;
 
     // First object on the stream must not reference prior state.
@@ -175,8 +205,33 @@ impl FetchObject {
       }
     }
 
+    // Group ID Delta present. For the first Object (no prior) the delta is the
+    // absolute Group ID; otherwise it is applied to the prior Group ID per the
+    // Group Order. A computed value outside [0, 2^64-1] is a
+    // PROTOCOL_VIOLATION.
     let group_id = if has_group_id {
-      bytes.get_vi()?
+      let delta = bytes.get_vi()?;
+      match prev {
+        None => delta,
+        Some(pc) => {
+          let computed = match group_order {
+            GroupOrder::Descending => delta
+              .checked_add(1)
+              .and_then(|step| pc.group_id.checked_sub(step)),
+            GroupOrder::Ascending | GroupOrder::Original => pc
+              .group_id
+              .checked_add(delta)
+              .and_then(|v| v.checked_add(1)),
+          };
+          computed.ok_or(ParseError::ProtocolViolation {
+            context: "FetchObject::deserialize",
+            details: format!(
+              "group id delta wraps: prior={} delta={} order={group_order:?}",
+              pc.group_id, delta
+            ),
+          })?
+        }
+      }
     } else {
       prev
         .ok_or(ParseError::ProtocolViolation {
@@ -195,19 +250,19 @@ impl FetchObject {
         SUBGROUP_MODE_ZERO => 0,
         SUBGROUP_MODE_PRIOR => {
           prev
+            .and_then(|pc| pc.subgroup_id)
             .ok_or(ParseError::ProtocolViolation {
               context: "FetchObject::deserialize",
               details: "subgroup_id inherited but no prior object".to_string(),
             })?
-            .subgroup_id
         }
         SUBGROUP_MODE_PRIOR_PLUS_ONE => {
           prev
+            .and_then(|pc| pc.subgroup_id)
             .ok_or(ParseError::ProtocolViolation {
               context: "FetchObject::deserialize",
               details: "subgroup_id inherited but no prior object".to_string(),
             })?
-            .subgroup_id
             + 1
         }
         SUBGROUP_MODE_PRESENT => bytes.get_vi()?,
@@ -215,16 +270,38 @@ impl FetchObject {
       }
     };
 
+    // Object ID resolution:
+    // - Object ID Delta present + Group ID Delta present (or first Object): the
+    //   Object ID is the delta itself (absolute).
+    // - Object ID Delta present + Group ID Delta absent: prior Object ID + delta.
+    // - Object ID Delta absent: prior Object ID + 1.
+    // A computed value greater than 2^64-1 is a PROTOCOL_VIOLATION.
     let object_id = if has_object_id {
-      bytes.get_vi()?
+      let delta = bytes.get_vi()?;
+      match prev {
+        None => delta,
+        Some(_) if has_group_id => delta,
+        Some(pc) => pc.object_id.checked_add(delta).ok_or({
+          ParseError::ProtocolViolation {
+            context: "FetchObject::deserialize",
+            details: format!(
+              "object id delta wraps: prior={} delta={delta}",
+              pc.object_id
+            ),
+          }
+        })?,
+      }
     } else {
-      prev
+      let pc = prev.ok_or(ParseError::ProtocolViolation {
+        context: "FetchObject::deserialize",
+        details: "object_id inherited but no prior object".to_string(),
+      })?;
+      pc.object_id
+        .checked_add(1)
         .ok_or(ParseError::ProtocolViolation {
           context: "FetchObject::deserialize",
-          details: "object_id inherited but no prior object".to_string(),
+          details: format!("object id wraps: prior={} +1", pc.object_id),
         })?
-        .object_id
-        + 1
     };
 
     let publisher_priority = if has_priority {
@@ -238,14 +315,14 @@ impl FetchObject {
       bytes.get_u8()
     } else {
       prev
+        .and_then(|pc| pc.publisher_priority)
         .ok_or(ParseError::ProtocolViolation {
           context: "FetchObject::deserialize",
           details: "priority inherited but no prior object".to_string(),
         })?
-        .publisher_priority
     };
 
-    let extension_headers = if has_extensions {
+    let properties = if has_properties {
       let ext_len = bytes.get_vi()?;
       let ext_len: usize =
         ext_len
@@ -258,16 +335,16 @@ impl FetchObject {
           })?;
       if bytes.remaining() < ext_len {
         return Err(ParseError::NotEnoughBytes {
-          context: "FetchObject::deserialize(extensions)",
+          context: "FetchObject::deserialize(properties)",
           needed: ext_len,
           available: bytes.remaining(),
         });
       }
       let mut header_bytes = bytes.copy_to_bytes(ext_len);
-      let headers = deserialize_object_extensions(&mut header_bytes).map_err(|_| {
+      let headers = deserialize_object_properties(&mut header_bytes).map_err(|_| {
         ParseError::ProtocolViolation {
-          context: "FetchObject::deserialize(extensions)",
-          details: "cannot parse object extensions".to_string(),
+          context: "FetchObject::deserialize(properties)",
+          details: "cannot parse object properties".to_string(),
         }
       })?;
       Some(headers)
@@ -309,7 +386,7 @@ impl FetchObject {
       object_id,
       publisher_priority,
       forwarding_preference,
-      extension_headers,
+      properties,
       payload,
     }))
   }
@@ -318,71 +395,90 @@ impl FetchObject {
 fn serialize_payload(
   p: &FetchObjectPayload,
   prev: Option<&FetchObjectContext>,
+  group_order: GroupOrder,
 ) -> Result<Bytes, ParseError> {
   let is_datagram = matches!(
     p.forwarding_preference,
     ObjectForwardingPreference::Datagram
   );
 
-  let (has_group_id, group_id_inherited) = match prev {
-    Some(pc) if pc.group_id == p.group_id => (false, true),
-    _ => (true, false),
+  // Group ID Delta field. Present for the first Object (delta = absolute Group ID)
+  // and whenever the Group ID changes; absent when the Group ID is inherited.
+  let group_delta: Option<u64> = match prev {
+    None => Some(p.group_id),
+    Some(pc) if pc.group_id == p.group_id => None,
+    Some(pc) => {
+      let delta = match group_order {
+        GroupOrder::Descending => pc
+          .group_id
+          .checked_sub(p.group_id)
+          .and_then(|d| d.checked_sub(1)),
+        GroupOrder::Ascending | GroupOrder::Original => p
+          .group_id
+          .checked_sub(pc.group_id)
+          .and_then(|d| d.checked_sub(1)),
+      };
+      Some(delta.ok_or(ParseError::ProtocolViolation {
+        context: "FetchObject::serialize",
+        details: format!(
+          "group id not monotonic for {group_order:?}: prior={} current={}",
+          pc.group_id, p.group_id
+        ),
+      })?)
+    }
   };
 
-  let (has_object_id, object_id_inherited) = match prev {
-    Some(pc) if pc.object_id + 1 == p.object_id => (false, true),
-    _ => (true, false),
-  };
-
-  let (has_priority, priority_inherited) = match prev {
-    Some(pc) if pc.publisher_priority == p.publisher_priority => (false, true),
-    _ => (true, false),
-  };
-
-  let has_extensions = matches!(&p.extension_headers, Some(v) if !v.is_empty());
-
-  // First object on the stream cannot inherit.
-  let (has_group_id, has_object_id, has_priority, subgroup_mode) = if prev.is_none() {
-    let sm = if is_datagram || p.subgroup_id == 0 {
-      SUBGROUP_MODE_ZERO
-    } else {
-      SUBGROUP_MODE_PRESENT
-    };
-    (true, true, true, sm)
-  } else {
-    let subgroup_mode = if is_datagram || p.subgroup_id == 0 {
-      SUBGROUP_MODE_ZERO
-    } else if let Some(pc) = prev {
-      if pc.subgroup_id == p.subgroup_id {
-        SUBGROUP_MODE_PRIOR
-      } else if pc.subgroup_id + 1 == p.subgroup_id {
-        SUBGROUP_MODE_PRIOR_PLUS_ONE
-      } else {
-        SUBGROUP_MODE_PRESENT
+  // Object ID Delta field:
+  // - first Object, or a new group: absolute Object ID.
+  // - same group, prior + 1: field omitted.
+  // - same group otherwise: prior + delta.
+  let object_delta: Option<u64> = match prev {
+    None => Some(p.object_id),
+    Some(_) if group_delta.is_some() => Some(p.object_id),
+    Some(pc) if pc.object_id + 1 == p.object_id => None,
+    Some(pc) => Some(p.object_id.checked_sub(pc.object_id).ok_or({
+      ParseError::ProtocolViolation {
+        context: "FetchObject::serialize",
+        details: format!(
+          "object id not monotonic: prior={} current={}",
+          pc.object_id, p.object_id
+        ),
       }
-    } else {
-      SUBGROUP_MODE_PRESENT
-    };
-    (
-      has_group_id || !group_id_inherited,
-      has_object_id || !object_id_inherited,
-      has_priority || !priority_inherited,
-      subgroup_mode,
-    )
+    })?),
+  };
+
+  let has_priority = match prev {
+    Some(pc) => pc.publisher_priority != Some(p.publisher_priority),
+    None => true,
+  };
+
+  let has_properties = matches!(&p.properties, Some(v) if !v.is_empty());
+
+  // Subgroup mode. The first Object (no prior) cannot reference a prior subgroup.
+  let subgroup_mode = if is_datagram || p.subgroup_id == 0 {
+    SUBGROUP_MODE_ZERO
+  } else {
+    match prev {
+      Some(pc) if pc.subgroup_id == Some(p.subgroup_id) => SUBGROUP_MODE_PRIOR,
+      Some(pc) if pc.subgroup_id.map(|s| s + 1) == Some(p.subgroup_id) => {
+        SUBGROUP_MODE_PRIOR_PLUS_ONE
+      }
+      _ => SUBGROUP_MODE_PRESENT,
+    }
   };
 
   let mut flags: u8 = subgroup_mode & FLAG_SUBGROUP_MODE_MASK;
-  if has_object_id {
+  if object_delta.is_some() {
     flags |= FLAG_OBJECT_ID_PRESENT;
   }
-  if has_group_id {
+  if group_delta.is_some() {
     flags |= FLAG_GROUP_ID_PRESENT;
   }
   if has_priority {
     flags |= FLAG_PRIORITY_PRESENT;
   }
-  if has_extensions {
-    flags |= FLAG_EXTENSIONS_PRESENT;
+  if has_properties {
+    flags |= FLAG_PROPERTIES_PRESENT;
   }
   if is_datagram {
     flags |= FLAG_DATAGRAM;
@@ -391,23 +487,20 @@ fn serialize_payload(
   let mut buf = BytesMut::new();
   buf.put_vi(flags as u64)?;
 
-  if has_group_id {
-    buf.put_vi(p.group_id)?;
+  if let Some(delta) = group_delta {
+    buf.put_vi(delta)?;
   }
   if !is_datagram && subgroup_mode == SUBGROUP_MODE_PRESENT {
     buf.put_vi(p.subgroup_id)?;
   }
-  if has_object_id {
-    buf.put_vi(p.object_id)?;
+  if let Some(delta) = object_delta {
+    buf.put_vi(delta)?;
   }
   if has_priority {
     buf.put_u8(p.publisher_priority);
   }
-  if has_extensions {
-    let mut ext_buf = BytesMut::new();
-    for h in p.extension_headers.as_ref().unwrap() {
-      ext_buf.extend_from_slice(&h.serialize()?);
-    }
+  if has_properties {
+    let ext_buf = serialize_object_properties(p.properties.as_ref().unwrap())?;
     buf.put_vi(ext_buf.len() as u64)?;
     buf.extend_from_slice(&ext_buf);
   }
@@ -423,6 +516,54 @@ mod tests {
   use super::*;
   use crate::model::common::pair::KeyValuePair;
 
+  /// The FETCH object layout, byte for byte. Round-trip tests cannot catch a field in
+  /// the wrong place or a field that should not be there, because both ends share this
+  /// encoder.
+  #[test]
+  fn wire_layout_is_byte_exact() {
+    let first = FetchObject::Object(FetchObjectPayload {
+      group_id: 2,
+      subgroup_id: 0,
+      object_id: 0,
+      publisher_priority: 0,
+      forwarding_preference: ObjectForwardingPreference::Subgroup,
+      properties: None,
+      payload: Bytes::from_static(b"abc"),
+    });
+    let bytes = first.serialize(None, GroupOrder::Ascending).unwrap();
+    assert_eq!(
+      bytes.as_ref(),
+      &[
+        0x1c, // flags: subgroup zero, object id + group id + priority present
+        0x02, // Group ID Delta — absolute on the first object
+        // no Subgroup ID: the flags say it is zero
+        0x00, // Object ID Delta — absolute on the first object
+        0x00, // Publisher Priority
+        // no Properties: the flags say absent
+        0x03, // Object Payload Length
+        b'a', b'b', b'c',
+      ]
+    );
+
+    // The next object in the same group inherits everything, so only the payload is sent.
+    // A zero-length payload here is a zero-length Normal object; FETCH has no status
+    // field, and a missing range is spelled with an End of Range indicator instead.
+    let prev = Some(first.next_context(None));
+    let second = FetchObject::Object(FetchObjectPayload {
+      group_id: 2,
+      subgroup_id: 0,
+      object_id: 1,
+      publisher_priority: 0,
+      forwarding_preference: ObjectForwardingPreference::Subgroup,
+      properties: None,
+      payload: Bytes::from_static(b"de"),
+    });
+    let bytes = second
+      .serialize(prev.as_ref(), GroupOrder::Ascending)
+      .unwrap();
+    assert_eq!(bytes.as_ref(), &[0x00, 0x02, b'd', b'e']);
+  }
+
   fn sample_payload() -> FetchObjectPayload {
     FetchObjectPayload {
       group_id: 9,
@@ -430,11 +571,11 @@ mod tests {
       object_id: 10,
       publisher_priority: 255,
       forwarding_preference: ObjectForwardingPreference::Subgroup,
-      extension_headers: Some(vec![
-        ObjectExtension::Unknown {
+      properties: Some(vec![
+        ObjectProperty::Unknown {
           kvp: KeyValuePair::try_new_varint(0, 10).unwrap(),
         },
-        ObjectExtension::Unknown {
+        ObjectProperty::Unknown {
           kvp: KeyValuePair::try_new_bytes(1, Bytes::from_static(b"wololoo")).unwrap(),
         },
       ]),
@@ -442,11 +583,13 @@ mod tests {
     }
   }
 
+  const ASC: GroupOrder = GroupOrder::Ascending;
+
   #[test]
   fn roundtrip_first_object() {
     let obj = FetchObject::Object(sample_payload());
-    let mut buf = obj.serialize(None).unwrap();
-    let parsed = FetchObject::deserialize(&mut buf, None).unwrap();
+    let mut buf = obj.serialize(None, ASC).unwrap();
+    let parsed = FetchObject::deserialize(&mut buf, None, ASC).unwrap();
     assert_eq!(parsed, obj);
     assert!(!buf.has_remaining());
   }
@@ -456,24 +599,152 @@ mod tests {
     let first = sample_payload();
     let obj1 = FetchObject::Object(first.clone());
     let mut second = first.clone();
-    // Inheritable: same group, object_id = prior + 1, same subgroup, same priority, no extensions.
+    // Inheritable: same group, object_id = prior + 1, same subgroup, same priority, no properties.
     second.object_id = first.object_id + 1;
-    second.extension_headers = None;
+    second.properties = None;
     second.payload = Bytes::from_static(b"second");
     let obj2 = FetchObject::Object(second);
 
     let mut wire = BytesMut::new();
-    wire.extend_from_slice(&obj1.serialize(None).unwrap());
-    let ctx = obj1.context();
-    wire.extend_from_slice(&obj2.serialize(ctx.as_ref()).unwrap());
+    wire.extend_from_slice(&obj1.serialize(None, ASC).unwrap());
+    let ctx = Some(obj1.next_context(None));
+    wire.extend_from_slice(&obj2.serialize(ctx.as_ref(), ASC).unwrap());
     let mut wire = wire.freeze();
 
-    let parsed1 = FetchObject::deserialize(&mut wire, None).unwrap();
+    let parsed1 = FetchObject::deserialize(&mut wire, None, ASC).unwrap();
     assert_eq!(parsed1, obj1);
-    let ctx1 = parsed1.context();
-    let parsed2 = FetchObject::deserialize(&mut wire, ctx1.as_ref()).unwrap();
+    let ctx1 = Some(parsed1.next_context(None));
+    let parsed2 = FetchObject::deserialize(&mut wire, ctx1.as_ref(), ASC).unwrap();
     assert_eq!(parsed2, obj2);
     assert!(!wire.has_remaining());
+  }
+
+  /// A run of objects that cross a group boundary must round-trip, with the
+  /// Object ID resetting inside the new group and the Group ID recovered from
+  /// its delta.
+  #[test]
+  fn roundtrip_across_group_boundary() {
+    let mut a = sample_payload();
+    a.group_id = 4;
+    a.object_id = 7;
+    let mut b = a.clone();
+    b.object_id = 8; // same group, prior + 1
+    b.properties = None;
+    let mut c = a.clone();
+    c.group_id = 6; // new group two ahead (ascending delta = 1)
+    c.object_id = 0; // object id resets
+    c.properties = None;
+
+    let objs = [
+      FetchObject::Object(a),
+      FetchObject::Object(b),
+      FetchObject::Object(c),
+    ];
+
+    for order in [
+      GroupOrder::Ascending,
+      GroupOrder::Descending,
+      GroupOrder::Original,
+    ] {
+      // Descending needs decreasing group ids; flip the run for that order.
+      let run: Vec<FetchObject> = if order == GroupOrder::Descending {
+        let mut a = sample_payload();
+        a.group_id = 6;
+        a.object_id = 7;
+        let mut b = a.clone();
+        b.object_id = 8;
+        b.properties = None;
+        let mut c = a.clone();
+        c.group_id = 4;
+        c.object_id = 0;
+        c.properties = None;
+        vec![
+          FetchObject::Object(a),
+          FetchObject::Object(b),
+          FetchObject::Object(c),
+        ]
+      } else {
+        objs.to_vec()
+      };
+
+      let mut wire = BytesMut::new();
+      let mut ctx: Option<FetchObjectContext> = None;
+      for o in &run {
+        wire.extend_from_slice(&o.serialize(ctx.as_ref(), order).unwrap());
+        ctx = Some(o.next_context(ctx.as_ref()));
+      }
+      let mut wire = wire.freeze();
+
+      let mut ctx: Option<FetchObjectContext> = None;
+      for o in &run {
+        let parsed = FetchObject::deserialize(&mut wire, ctx.as_ref(), order).unwrap();
+        assert_eq!(&parsed, o, "order={order:?}");
+        ctx = Some(parsed.next_context(ctx.as_ref()));
+      }
+      assert!(!wire.has_remaining(), "order={order:?}");
+    }
+  }
+
+  /// An Object ID delta that pushes the value past 2^64-1 is a PROTOCOL_VIOLATION.
+  #[test]
+  fn object_id_delta_wrap_closes_session() {
+    let prev = FetchObjectContext {
+      group_id: 3,
+      subgroup_id: Some(0),
+      object_id: u64::MAX - 1,
+      publisher_priority: Some(5),
+    };
+    // Same group (group delta absent), object delta present = 5 → prior + 5 wraps.
+    let flags = SUBGROUP_MODE_ZERO | FLAG_OBJECT_ID_PRESENT;
+    let mut buf = BytesMut::new();
+    buf.put_vi(flags as u64).unwrap();
+    buf.put_vi(5u64).unwrap();
+    buf.put_vi(0u64).unwrap(); // payload length
+    let mut frozen = buf.freeze();
+    let err = FetchObject::deserialize(&mut frozen, Some(&prev), ASC).unwrap_err();
+    assert!(matches!(err, ParseError::ProtocolViolation { .. }));
+  }
+
+  /// An ascending Group ID delta that overflows 2^64-1 is a PROTOCOL_VIOLATION.
+  #[test]
+  fn group_id_delta_wrap_closes_session() {
+    let prev = FetchObjectContext {
+      group_id: u64::MAX - 1,
+      subgroup_id: Some(0),
+      object_id: 0,
+      publisher_priority: Some(5),
+    };
+    // Group delta present = 5 → prior + 5 + 1 wraps; object delta present (absolute).
+    let flags = SUBGROUP_MODE_ZERO | FLAG_GROUP_ID_PRESENT | FLAG_OBJECT_ID_PRESENT;
+    let mut buf = BytesMut::new();
+    buf.put_vi(flags as u64).unwrap();
+    buf.put_vi(5u64).unwrap(); // group delta
+    buf.put_vi(0u64).unwrap(); // object id (absolute)
+    buf.put_vi(0u64).unwrap(); // payload length
+    let mut frozen = buf.freeze();
+    let err = FetchObject::deserialize(&mut frozen, Some(&prev), ASC).unwrap_err();
+    assert!(matches!(err, ParseError::ProtocolViolation { .. }));
+  }
+
+  /// A descending Group ID delta that underflows below 0 is a PROTOCOL_VIOLATION.
+  #[test]
+  fn group_id_delta_underflow_closes_session() {
+    let prev = FetchObjectContext {
+      group_id: 0,
+      subgroup_id: Some(0),
+      object_id: 0,
+      publisher_priority: Some(5),
+    };
+    let flags = SUBGROUP_MODE_ZERO | FLAG_GROUP_ID_PRESENT | FLAG_OBJECT_ID_PRESENT;
+    let mut buf = BytesMut::new();
+    buf.put_vi(flags as u64).unwrap();
+    buf.put_vi(0u64).unwrap(); // group delta → prior - (0 + 1) underflows
+    buf.put_vi(0u64).unwrap();
+    buf.put_vi(0u64).unwrap();
+    let mut frozen = buf.freeze();
+    let err =
+      FetchObject::deserialize(&mut frozen, Some(&prev), GroupOrder::Descending).unwrap_err();
+    assert!(matches!(err, ParseError::ProtocolViolation { .. }));
   }
 
   #[test]
@@ -483,8 +754,8 @@ mod tests {
     // For datagrams, subgroup_id is synthesized to match object_id on decode.
     p.subgroup_id = p.object_id;
     let obj = FetchObject::Object(p);
-    let mut buf = obj.serialize(None).unwrap();
-    let parsed = FetchObject::deserialize(&mut buf, None).unwrap();
+    let mut buf = obj.serialize(None, ASC).unwrap();
+    let parsed = FetchObject::deserialize(&mut buf, None, ASC).unwrap();
     assert_eq!(parsed, obj);
   }
 
@@ -495,8 +766,8 @@ mod tests {
       group_id: 7,
       object_id: 42,
     };
-    let mut buf = obj.serialize(None).unwrap();
-    let parsed = FetchObject::deserialize(&mut buf, None).unwrap();
+    let mut buf = obj.serialize(None, ASC).unwrap();
+    let parsed = FetchObject::deserialize(&mut buf, None, ASC).unwrap();
     assert_eq!(parsed, obj);
   }
 
@@ -507,20 +778,119 @@ mod tests {
       group_id: 100,
       object_id: 0,
     };
-    let mut buf = obj.serialize(None).unwrap();
-    let parsed = FetchObject::deserialize(&mut buf, None).unwrap();
+    let mut buf = obj.serialize(None, ASC).unwrap();
+    let parsed = FetchObject::deserialize(&mut buf, None, ASC).unwrap();
     assert_eq!(parsed, obj);
   }
 
   #[test]
+  fn roundtrip_end_of_timed_out_range() {
+    let obj = FetchObject::EndOfRange {
+      kind: EndOfRangeKind::TimedOut,
+      group_id: 3,
+      object_id: 9,
+    };
+    let mut buf = obj.serialize(None, ASC).unwrap();
+    let mut flags = BytesMut::new();
+    flags.put_vi(0x20Cu64).unwrap();
+    assert!(buf.starts_with(&flags), "Serialization Flags 0x20C");
+    let parsed = FetchObject::deserialize(&mut buf, None, ASC).unwrap();
+    assert_eq!(parsed, obj);
+  }
+
+  /// After a marker the prior Group and Object IDs are the marker's, while the prior
+  /// Subgroup ID and priority are those of the Object before it.
+  #[test]
+  fn an_object_after_a_marker_is_encoded_against_the_marker() {
+    let first = FetchObject::Object(FetchObjectPayload {
+      group_id: 9,
+      subgroup_id: 144,
+      object_id: 10,
+      publisher_priority: 255,
+      forwarding_preference: ObjectForwardingPreference::Subgroup,
+      properties: None,
+      payload: Bytes::from_static(b"a"),
+    });
+    let marker = FetchObject::EndOfRange {
+      kind: EndOfRangeKind::Unknown,
+      group_id: 10,
+      object_id: 5,
+    };
+    // The Object right after {10,5}, in the subgroup and priority of the first.
+    let after = FetchObject::Object(FetchObjectPayload {
+      group_id: 10,
+      subgroup_id: 144,
+      object_id: 6,
+      publisher_priority: 255,
+      forwarding_preference: ObjectForwardingPreference::Subgroup,
+      properties: None,
+      payload: Bytes::from_static(b"b"),
+    });
+
+    let mut wire = BytesMut::new();
+    let mut ctx: Option<FetchObjectContext> = None;
+    for entry in [&first, &marker, &after] {
+      wire.extend_from_slice(&entry.serialize(ctx.as_ref(), ASC).unwrap());
+      ctx = Some(entry.next_context(ctx.as_ref()));
+    }
+    let mut wire = wire.freeze();
+
+    let mut ctx: Option<FetchObjectContext> = None;
+    for entry in [&first, &marker] {
+      let parsed = FetchObject::deserialize(&mut wire, ctx.as_ref(), ASC).unwrap();
+      assert_eq!(&parsed, entry);
+      ctx = Some(parsed.next_context(ctx.as_ref()));
+    }
+    // Everything but the payload is inherited: the Group and next Object ID from
+    // the marker, the subgroup and priority from the first Object.
+    let after_bytes = wire.clone();
+    assert_eq!(after_bytes[0] & FLAG_GROUP_ID_PRESENT, 0, "group inherited");
+    assert_eq!(
+      after_bytes[0] & FLAG_OBJECT_ID_PRESENT,
+      0,
+      "object id inherited"
+    );
+    assert_eq!(
+      after_bytes[0] & FLAG_PRIORITY_PRESENT,
+      0,
+      "priority inherited"
+    );
+    let parsed = FetchObject::deserialize(&mut wire, ctx.as_ref(), ASC).unwrap();
+    assert_eq!(parsed, after);
+    assert!(!wire.has_remaining());
+  }
+
+  /// A marker that opens the stream gives the next Object a prior Location, but no
+  /// prior priority or subgroup to inherit.
+  #[test]
+  fn an_object_after_a_leading_marker_cannot_inherit_a_priority() {
+    let marker = FetchObject::EndOfRange {
+      kind: EndOfRangeKind::NonExistent,
+      group_id: 4,
+      object_id: 2,
+    };
+    let ctx = marker.next_context(None);
+    assert_eq!((ctx.subgroup_id, ctx.publisher_priority), (None, None));
+
+    // Group, Object ID and subgroup are inherited or zero, the priority inherited.
+    let flags = SUBGROUP_MODE_ZERO;
+    let mut buf = BytesMut::new();
+    buf.put_vi(flags as u64).unwrap();
+    buf.put_vi(0u64).unwrap(); // payload length
+    let mut frozen = buf.freeze();
+    let err = FetchObject::deserialize(&mut frozen, Some(&ctx), ASC).unwrap_err();
+    assert!(matches!(err, ParseError::ProtocolViolation { .. }));
+  }
+
+  #[test]
   fn reject_reserved_high_flag_value() {
-    // 0x80 is ≥ 128 but not 0x8C / 0x10C → protocol violation.
+    // 0x80 is ≥ 128 but not 0x8C / 0x10C / 0x20C → protocol violation.
     let mut buf = BytesMut::new();
     buf.put_vi(0x80u64).unwrap();
     buf.put_vi(1u64).unwrap();
     buf.put_vi(1u64).unwrap();
     let mut frozen = buf.freeze();
-    let err = FetchObject::deserialize(&mut frozen, None).unwrap_err();
+    let err = FetchObject::deserialize(&mut frozen, None, ASC).unwrap_err();
     assert!(matches!(err, ParseError::ProtocolViolation { .. }));
   }
 
@@ -535,19 +905,19 @@ mod tests {
     buf.put_vi(1u64).unwrap();
     buf.put_vi(0u64).unwrap();
     let mut frozen = buf.freeze();
-    let err = FetchObject::deserialize(&mut frozen, None).unwrap_err();
+    let err = FetchObject::deserialize(&mut frozen, None, ASC).unwrap_err();
     assert!(matches!(err, ParseError::ProtocolViolation { .. }));
   }
 
   #[test]
   fn excess_bytes_preserved() {
     let obj = FetchObject::Object(sample_payload());
-    let serialized = obj.serialize(None).unwrap();
+    let serialized = obj.serialize(None, ASC).unwrap();
     let mut excess = BytesMut::new();
     excess.extend_from_slice(&serialized);
     excess.extend_from_slice(&[9u8, 1u8, 1u8]);
     let mut buf = excess.freeze();
-    let parsed = FetchObject::deserialize(&mut buf, None).unwrap();
+    let parsed = FetchObject::deserialize(&mut buf, None, ASC).unwrap();
     assert_eq!(parsed, obj);
     assert_eq!(buf.chunk(), &[9u8, 1u8, 1u8]);
   }
@@ -555,10 +925,10 @@ mod tests {
   #[test]
   fn partial_message_fails() {
     let obj = FetchObject::Object(sample_payload());
-    let buf = obj.serialize(None).unwrap();
+    let buf = obj.serialize(None, ASC).unwrap();
     let upper = buf.remaining() / 2;
     let mut partial = buf.slice(..upper);
-    let result = FetchObject::deserialize(&mut partial, None);
+    let result = FetchObject::deserialize(&mut partial, None, ASC);
     assert!(result.is_err());
   }
 }

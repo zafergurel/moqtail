@@ -14,7 +14,6 @@
 
 use crate::model::error::ParseError;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use tracing::debug;
 
 pub trait BufVarIntExt {
   fn get_vi(&mut self) -> Result<u64, ParseError>;
@@ -35,28 +34,27 @@ impl BufVarIntExt for Bytes {
     }
 
     let first = self.get_u8();
-    let num_bytes = match first >> 6 {
-      0 => 1,
-      1 => 2,
-      2 => 4,
-      3 => 8,
-      _ => unreachable!(),
-    };
+    // n leading ones -> length n+1 bytes.
+    let length = first.leading_ones() as usize + 1;
+    let extra_bytes = length - 1;
 
-    if self.remaining() + 1 < num_bytes {
+    if self.remaining() < extra_bytes {
       return Err(ParseError::NotEnoughBytes {
         context: "varint continuation",
-        needed: num_bytes,
+        needed: length,
         available: self.remaining() + 1,
       });
     }
 
-    let mut val = (u64::from(first & 0b0011_1111)) << ((num_bytes - 1) * 8);
+    let mut val = if length <= 8 {
+      let data_bits = 8 - length;
+      u64::from(first) & ((1u64 << data_bits) - 1)
+    } else {
+      0
+    };
 
-    for i in 1..num_bytes {
-      let byte = self.get_u8() as u64;
-      let shift = (num_bytes - 1 - i) * 8;
-      val |= byte << shift;
+    for _ in 0..extra_bytes {
+      val = (val << 8) | u64::from(self.get_u8());
     }
     Ok(val)
   }
@@ -74,151 +72,157 @@ where
       details: String::new(),
     })?;
 
-    // now choose the encoding length
-    if v < 1 << 6 {
-      self.put_u8(v as u8);
-    } else if v < 1 << 14 {
-      self.put_slice(&[((v >> 8) | 0b01_000000) as u8, v as u8]);
-    } else if v < 1 << 30 {
-      self.put_slice(&[
-        ((v >> 24) | 0b10_000000) as u8,
-        (v >> 16) as u8,
-        (v >> 8) as u8,
-        v as u8,
-      ]);
-    } else if v < 1 << 62 {
-      self.put_slice(&[
-        ((v >> 56) | 0b11_000000) as u8,
-        (v >> 48) as u8,
-        (v >> 40) as u8,
-        (v >> 32) as u8,
-        (v >> 24) as u8,
-        (v >> 16) as u8,
-        (v >> 8) as u8,
-        v as u8,
-      ]);
-    } else {
-      debug!("varint overflow");
-      return Err(ParseError::VarIntOverflow {
-        context: "varint put_vi",
-        value: v,
-      });
+    let length = minimal_vi_length(v);
+
+    if length == 9 {
+      let mut out = [0u8; 9];
+      out[0] = 0xFF;
+      out[1..9].copy_from_slice(&v.to_be_bytes());
+      self.put_slice(&out);
+      return Ok(());
     }
+
+    // Big-endian value in the low `length` bytes, then OR the leading-ones
+    // prefix (length - 1 ones) into the top bits of the first byte.
+    let mut out = [0u8; 8];
+    for i in 0..length {
+      out[length - 1 - i] = (v >> (8 * i)) as u8;
+    }
+    let ones = length - 1;
+    if ones > 0 {
+      out[0] |= (((1u16 << ones) - 1) << (8 - ones)) as u8;
+    }
+    self.put_slice(&out[0..length]);
 
     Ok(())
   }
 }
 
+fn minimal_vi_length(v: u64) -> usize {
+  if v < (1u64 << 7) {
+    1
+  } else if v < (1u64 << 14) {
+    2
+  } else if v < (1u64 << 21) {
+    3
+  } else if v < (1u64 << 28) {
+    4
+  } else if v < (1u64 << 35) {
+    5
+  } else if v < (1u64 << 42) {
+    6
+  } else if v < (1u64 << 49) {
+    7
+  } else if v < (1u64 << 56) {
+    8
+  } else {
+    9
+  }
+}
+
 #[cfg(test)]
 mod tests {
-  /*
-  2MSB	Length	Usable Bits	Range
-  00	1	6	0-63
-  01	2	14	0-16383
-  10	4	30	0-1073741823
-  11	8	62	0-4611686018427387903
-  */
+  //! Every vector here comes from `dev/conformance/draft22/varint.json`, which is
+  //! shared with moqtail-ts. Table 1 (the length/range summary) and Table 2 (the
+  //! example encodings) live there, not in this file.
+
   use super::*;
+  use crate::conformance::{self, parse_bytes, parse_u64};
   use bytes::Bytes;
 
   #[test]
-  fn test_encode() {
-    let mut buf = BytesMut::new();
-    buf.put_vi(0).unwrap();
-    assert_eq!(buf.freeze(), Bytes::from(vec![0b00000000]));
-
-    let mut buf = BytesMut::new();
-    buf.put_vi(1).unwrap();
-    assert_eq!(buf.freeze(), Bytes::from(vec![0b00000001]));
-
-    let mut buf = BytesMut::new();
-    buf.put_vi(127).unwrap();
-    assert_eq!(buf.freeze(), Bytes::from(vec![0b01000000, 127]));
-
-    let mut buf = BytesMut::new();
-    buf.put_vi(128).unwrap();
-    assert_eq!(buf.freeze(), Bytes::from(vec![0b01000000, 128]));
-
-    let mut buf = BytesMut::new();
-    buf.put_vi(300).unwrap();
-    assert_eq!(buf.freeze(), Bytes::from(vec![0b01000001, 44]));
-
-    let mut buf = BytesMut::new();
-    buf.put_vi(63).unwrap();
-    assert_eq!(buf.freeze(), Bytes::from(vec![0b00111111]));
-
-    let mut buf = BytesMut::new();
-    buf.put_vi(16383).unwrap();
-    assert_eq!(buf.freeze(), Bytes::from(vec![0b01111111, 0xFF]));
-
-    let mut buf = BytesMut::new();
-    buf.put_vi(1073741823).unwrap();
-    assert_eq!(
-      buf.freeze(),
-      Bytes::from(vec![0b10111111, 0xFF, 0xFF, 0xFF])
-    );
-
-    let mut buf = BytesMut::new();
-    buf.put_vi(4611686018427387903u64).unwrap();
-    assert_eq!(
-      buf.freeze(),
-      Bytes::from(vec![0b11111111, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
-    );
+  fn table2_vectors_encode() {
+    for v in conformance::varint().vectors.entries {
+      if !v.minimal {
+        continue; // encoding always produces the minimal form
+      }
+      let value = parse_u64(&v.value);
+      let mut buf = BytesMut::new();
+      buf.put_vi(value).unwrap();
+      assert_eq!(
+        buf.freeze(),
+        Bytes::from(parse_bytes(&v.encoding)),
+        "encode {value}"
+      );
+    }
   }
 
   #[test]
-  fn test_ext_len() {
-    let mut buf = Bytes::from(vec![
-      64, 172, 45, 2, 192, 0, 0, 37, 138, 62, 225, 57, 4, 0, 13, 32, 1, 66, 192, 30, 255, 225, 0,
-      17, 103, 66, 192, 30, 140, 104, 10, 3, 218, 106, 2, 2, 12, 15, 8, 132, 106, 1, 0, 4, 104,
-      206, 60, 128, 77, 242,
-    ]);
-    assert_eq!(buf.get_vi().unwrap(), 172);
-    assert_eq!(buf.get_vi().unwrap(), 45);
-    assert_eq!(buf.get_vi().unwrap(), 2);
-    assert_eq!(buf.get_vi().unwrap(), 161233166649);
-    assert_eq!(buf.get_vi().unwrap(), 4);
-    assert_eq!(buf.get_vi().unwrap(), 0);
-    assert_eq!(buf.get_vi().unwrap(), 13);
+  fn table2_vectors_decode() {
+    for v in conformance::varint().vectors.entries {
+      let value = parse_u64(&v.value);
+      let mut buf = Bytes::from(parse_bytes(&v.encoding));
+      assert_eq!(buf.get_vi().unwrap(), value, "decode {}", v.encoding);
+      assert_eq!(buf.remaining(), 0, "consumed all bytes for {value}");
+    }
   }
 
   #[test]
-  fn test_decode() {
-    let mut buf = Bytes::from(vec![0b00000000]);
-    assert_eq!(buf.get_vi().unwrap(), 0);
-
-    let mut buf = Bytes::from(vec![0b00000001]);
-    assert_eq!(buf.get_vi().unwrap(), 1);
-
-    let mut buf = Bytes::from(vec![0b01000000, 127]);
-    assert_eq!(buf.get_vi().unwrap(), 127);
-
-    let mut buf = Bytes::from(vec![0b01000000, 128]);
-    assert_eq!(buf.get_vi().unwrap(), 128);
-
-    let mut buf = Bytes::from(vec![0b01000001, 44]);
-    assert_eq!(buf.get_vi().unwrap(), 300);
-
-    let mut buf = Bytes::from(vec![0b00111111]);
-    assert_eq!(buf.get_vi().unwrap(), 63);
-
-    let mut buf = Bytes::from(vec![0b01111111, 0xFF]);
-    assert_eq!(buf.get_vi().unwrap(), 16383);
-
-    let mut buf = Bytes::from(vec![0b10111111, 0xFF, 0xFF, 0xFF]);
-    assert_eq!(buf.get_vi().unwrap(), 1073741823);
-
-    let mut buf = Bytes::from(vec![0b11111111, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-    assert_eq!(buf.get_vi().unwrap(), 4611686018427387903);
+  fn encodes_boundaries_at_minimal_length_and_exact_bytes() {
+    for b in conformance::varint().boundaries.entries {
+      let value = parse_u64(&b.value);
+      let mut buf = BytesMut::new();
+      buf.put_vi(value).unwrap();
+      let bytes = buf.freeze();
+      assert_eq!(bytes.len(), b.length, "length for {value}");
+      assert_eq!(
+        &bytes[..],
+        &parse_bytes(&b.encoding)[..],
+        "encoding for {value}"
+      );
+    }
   }
 
   #[test]
-  fn test_decode_invalid() {
-    // test invalid encoding
-    assert!(Bytes::from(vec![0b01000000]).get_vi().is_err());
-    assert!(Bytes::from(vec![0b10000000]).get_vi().is_err());
-    assert!(Bytes::from(vec![0b11000000]).get_vi().is_err());
-    assert!(Bytes::from(vec![0b11100000]).get_vi().is_err());
-    assert!(Bytes::from(vec![0b11110000]).get_vi().is_err());
+  fn roundtrips_all_lengths() {
+    for raw in conformance::varint().roundtrip_values.entries {
+      let value = parse_u64(&raw);
+      let mut buf = BytesMut::new();
+      buf.put_vi(value).unwrap();
+      let mut frozen = buf.freeze();
+      assert_eq!(frozen.get_vi().unwrap(), value);
+    }
+  }
+
+  #[test]
+  fn decodes_non_minimal_encodings_across_lengths() {
+    for n in conformance::varint().non_minimal.entries {
+      let mut buf = Bytes::from(parse_bytes(&n.encoding));
+      assert_eq!(
+        buf.get_vi().unwrap(),
+        parse_u64(&n.value),
+        "decode {}",
+        n.encoding
+      );
+      assert_eq!(buf.remaining(), 0);
+    }
+  }
+
+  #[test]
+  fn minimal_encodings_have_expected_prefix_shape() {
+    for p in conformance::varint().prefix_shapes.entries {
+      let value = parse_u64(&p.value);
+      let mask = conformance::parse_hex(&p.mask) as u8;
+      let expected = conformance::parse_hex(&p.prefix) as u8;
+      let mut buf = BytesMut::new();
+      buf.put_vi(value).unwrap();
+      let bytes = buf.freeze();
+      assert_eq!(bytes[0] & mask, expected, "prefix for {value}");
+    }
+  }
+
+  #[test]
+  fn truncated_encodings_are_errors() {
+    for t in conformance::varint().truncated.entries {
+      let mut buf = Bytes::from(parse_bytes(&t.encoding));
+      assert!(buf.get_vi().is_err(), "expected error: {}", t.reason);
+    }
+  }
+
+  #[test]
+  fn decode_leaves_trailing_bytes_untouched() {
+    let mut buf = Bytes::from(vec![0x25, 0xaa, 0xbb]);
+    assert_eq!(buf.get_vi().unwrap(), 37);
+    assert_eq!(&buf[..], &[0xaa, 0xbb]);
   }
 }

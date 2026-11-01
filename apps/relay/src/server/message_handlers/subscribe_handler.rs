@@ -13,135 +13,656 @@
 // limitations under the License.
 
 use crate::server::client::MOQTClient;
-use crate::server::client::switch_context::SwitchStatus;
+use crate::server::client::switch_context::SwitchPlan;
+use crate::server::filter_constructor;
+use crate::server::message_handlers::parameters;
 use crate::server::session::Session;
 use crate::server::session_context::{PendingRequest, SessionContext};
-use crate::server::track::{Track, TrackStatus};
-use core::result::Result;
-use moqtail::model::common::location::Location;
-use moqtail::model::control::constant::RequestErrorCode;
+use crate::server::subscription::Subscription;
+use crate::server::subscription_manager::SubscriptionId;
+use crate::server::track::{Cleanup, Track, TrackOrigin, TrackStatus, await_publisher_streams};
+use anyhow::Result;
+use moqtail::model::control::constant::PublishDoneStatusCode;
+use moqtail::model::control::publish_done::PublishDone;
 use moqtail::model::control::request_error::RequestError;
+use moqtail::model::control::request_ok::RequestOk;
 use moqtail::model::control::subscribe::Subscribe;
+use moqtail::model::data::full_track_name::FullTrackName;
+use moqtail::model::error::RequestErrorCode;
+use moqtail::model::error::StreamResetCode;
 use moqtail::model::error::TerminationCode;
 use moqtail::model::parameter::message_parameter::{
-  MessageParameter, MessageParameterVecExt, apply_message_parameter_update,
+  MessageParameter, apply_message_parameter_update,
 };
+use moqtail::model::property::track_property::has_unsupported_mandatory;
 use moqtail::model::{
   common::reason_phrase::ReasonPhrase, control::control_message::ControlMessage,
 };
 use moqtail::transport::control_stream_handler::ControlStreamHandler;
 use moqtail::transport::data_stream_handler::SubscribeRequest;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio::sync::oneshot;
+use tracing::{error, info, trace, warn};
 
 async fn add_subscription(
   subscribe: Subscribe,
   track: &Track,
   subscriber: Arc<MOQTClient>,
-  is_switch: bool,
-) -> bool {
-  match track
-    .add_subscription(subscriber.clone(), subscribe, is_switch)
-    .await
-  {
+) -> Option<Arc<RwLock<Subscription>>> {
+  let request_id = subscribe.request_id;
+  match track.add_subscription(subscriber.clone(), subscribe).await {
     Ok(subscription) => {
       subscriber
         .subscriptions
-        .add_subscription(track.full_track_name.clone(), Arc::downgrade(&subscription))
+        .add(request_id, Arc::downgrade(&subscription))
         .await;
-      true
+      Some(subscription)
     }
-    Err(_) => false, // error already logged in add_subscription and it means that subscription already exists
+    // Only a Request ID already in use on this track is refused, and the subscription
+    // manager has logged it.
+    Err(_) => None,
   }
+}
+
+/// Drop a subscription that must be rejected after `add_subscription` already
+/// registered it, on the track and on the client.
+async fn reject_subscription(
+  track_arc: &Arc<RwLock<Track>>,
+  client: &MOQTClient,
+  subscription_id: &SubscriptionId,
+) {
+  {
+    let track = track_arc.read().await;
+    track.remove_subscription(subscription_id).await;
+  }
+  client.subscriptions.remove(subscription_id.1).await;
+}
+
+/// Forward a SUBSCRIBE to the upstream publisher on its own bidirectional request
+/// stream, then read the response (and follow-ups) on that stream and dispatch
+/// them so the result fans out to the downstream subscribers.
+async fn forward_subscribe_upstream(
+  publisher: Arc<MOQTClient>,
+  new_sub: Subscribe,
+  context: Arc<SessionContext>,
+) {
+  let relay_request_id = new_sub.request_id;
+  upstream_subscribe_exchange(publisher, new_sub, context.clone()).await;
+
+  // The entry exists to resolve this publisher's response against, and the exchange
+  // has ended one way or another: answered, declined, timed out, cancelled, or never
+  // sent. Dropping it here covers every exit inside, several of which return early.
+  context
+    .relay_pending_requests
+    .write()
+    .await
+    .remove(&relay_request_id);
+}
+
+async fn upstream_subscribe_exchange(
+  publisher: Arc<MOQTClient>,
+  new_sub: Subscribe,
+  context: Arc<SessionContext>,
+) {
+  let (send, recv) = match publisher.connection.open_bi().await {
+    Ok(streams) => streams,
+    Err(e) => {
+      error!("Failed to open upstream subscribe stream: {:?}", e);
+      return;
+    }
+  };
+  // The response returns on this stream, so correlate it by the relay request id
+  // we sent upstream rather than a field in the response.
+  let relay_request_id = new_sub.request_id;
+  let full_track_name = new_sub.get_full_track_name();
+  let mut upstream = ControlStreamHandler::new(send, recv).with_peer_id(publisher.connection_id);
+  if let Err(e) = upstream
+    .send(&ControlMessage::Subscribe(Box::new(new_sub)))
+    .await
+  {
+    error!("Failed to send upstream SUBSCRIBE: {:?}", e);
+    return;
+  }
+
+  // Register a cancel signal on the track so the last downstream unsubscribe
+  // resets this upstream stream and the publisher observes CANCELLED. Under the
+  // hand-over lock, so a last subscriber leaving meanwhile either finds it to cancel,
+  // or has already left and it is cancelled here.
+  let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+  if let Some(track) = context.track_manager.get_track(&full_track_name).await {
+    let track = track.read().await;
+    let _handover = track.lock_handover().await;
+    if track.subscriber_count().await == 0 {
+      let _ = cancel_tx.send(());
+    } else {
+      track
+        .upstream_subscribe_cancellers
+        .lock()
+        .await
+        .push(cancel_tx);
+    }
+  }
+
+  // A publisher owes exactly one SUBSCRIBE_OK or REQUEST_ERROR. One that stays
+  // connected and sends neither would otherwise hold the subscriber's request stream
+  // open forever, and — where several publishers were asked — keep the others' answers
+  // from ever being acted on. The deadline only covers that first response; once it
+  // arrives the stream lives as long as the subscription does.
+  let answer_deadline = tokio::time::sleep(context.server_config.upstream_subscribe_timeout);
+  tokio::pin!(answer_deadline);
+  let mut answered = false;
+
+  loop {
+    tokio::select! {
+      biased;
+      _ = &mut cancel_rx => {
+        info!("Downstream unsubscribed; resetting upstream subscribe stream (CANCELLED)");
+        // Break and tear the stream down after the loop: `reset_and_stop`
+        // consumes `upstream`, which can't be moved inside the select while the
+        // `next_message()` branch borrows it. Reset the send half and stop the
+        // recv half with the same CANCELLED code, so the publisher sees a
+        // coherent cancellation on both halves rather than a STOP_SENDING(0)
+        // (InternalError) emitted when the handler is dropped.
+        break;
+      }
+      _ = &mut answer_deadline, if !answered => {
+        warn!(
+          "Publisher {} did not answer the SUBSCRIBE for {:?} in time; treating it as declined",
+          publisher.connection_id, full_track_name
+        );
+        let err = RequestError::new(
+          RequestErrorCode::Timeout,
+          0,
+          ReasonPhrase::try_new("Publisher did not answer the subscribe".to_string()).unwrap(),
+        );
+        end_upstream_subscription(
+          relay_request_id,
+          publisher.connection_id,
+          &full_track_name,
+          err,
+          PublishDoneStatusCode::InternalError,
+          context.clone(),
+        )
+        .await;
+        break;
+      }
+      msg = upstream.next_message() => {
+        answered = true;
+        match msg {
+          Ok(ControlMessage::SubscribeOk(m)) => {
+            if let Err(code) =
+              handle_subscribe_ok_message(publisher.clone(), relay_request_id, *m, context.clone())
+                .await
+            {
+              warn!(
+                "Unacceptable SubscribeOk from publisher {} for {:?}; closing its session: {:?}",
+                publisher.connection_id, full_track_name, code
+              );
+              // The publisher has answered, so the subscriber is owed a response
+              // as surely as if it had declined.
+              let err = RequestError::new(
+                RequestErrorCode::InternalError,
+                0,
+                ReasonPhrase::try_new("Upstream subscription failed".to_string()).unwrap(),
+              );
+              end_upstream_subscription(
+                relay_request_id,
+                publisher.connection_id,
+                &full_track_name,
+                err,
+                PublishDoneStatusCode::InternalError,
+                context.clone(),
+              )
+              .await;
+              publisher
+                .connection
+                .close(code.to_u32(), b"Unacceptable SUBSCRIBE_OK");
+              return;
+            }
+          }
+          Ok(ControlMessage::RequestError(m)) => {
+            let status = publish_done_status_for(m.error_code);
+            end_upstream_subscription(
+              relay_request_id,
+              publisher.connection_id,
+              &full_track_name,
+              *m,
+              status,
+              context.clone(),
+            )
+            .await;
+            return;
+          }
+          Ok(ControlMessage::PublishDone(m)) => {
+            // Upstream is done for this track; relay its PUBLISH_DONE (status and
+            // reason verbatim) to the downstream subscribers. It usually arrives
+            // coalesced with the upstream stream FIN.
+            info!(
+              "Upstream PUBLISH_DONE for {:?}: status={:?} reason={}",
+              full_track_name,
+              m.status_code,
+              m.reason_phrase.as_str()
+            );
+            if let Some(track) = context.track_manager.get_track(&full_track_name).await {
+              // This publisher is done with the track, which is not the same as
+              // the track being over: a PUBLISH_DONE can carry any reason this
+              // one publisher stopped. While another still serves the track the
+              // subscribers keep receiving it, so they are told nothing and the
+              // switching sets are left alone.
+              let still_served = track
+                .read()
+                .await
+                .remove_publisher_quietly(publisher.connection_id)
+                .await;
+              if still_served {
+                info!(
+                  "Upstream PUBLISH_DONE for {:?} from publisher {}; other publishers still serve it",
+                  full_track_name, publisher.connection_id
+                );
+                return;
+              }
+
+              // The message overtakes the data streams it accounts for, so hold it
+              // until its Stream Count of them has finished arriving. Passing it on
+              // first closes the downstream streams mid-object and understates the
+              // Stream Count the relay reports in turn.
+              await_publisher_streams(
+                &track,
+                publisher.connection_id,
+                m.stream_count,
+                context.server_config.publish_done_stream_timeout,
+                context.server_config.publish_done_datagram_quiet,
+              )
+              .await;
+
+              // SSTS: the track is no longer available upstream; remove it
+              // from the switching sets of its subscribers.
+              track.read().await.remove_from_subscriber_switching_sets().await;
+              if let Err(e) = track
+                .read()
+                .await
+                .notify_publish_done(m.status_code, m.reason_phrase.as_str().to_string())
+                .await
+              {
+                error!("Failed to relay upstream PUBLISH_DONE downstream: {:?}", e);
+              }
+            }
+            return;
+          }
+          Ok(ControlMessage::RequestUpdate(_)) => {
+            super::close_on_unexpected_request_update(&publisher, "SUBSCRIBE");
+            let err = RequestError::new(
+              RequestErrorCode::InternalError,
+              0,
+              ReasonPhrase::try_new("Upstream subscription failed".to_string()).unwrap(),
+            );
+            // The publisher's session is gone, and the track with it.
+            end_upstream_subscription(
+              relay_request_id,
+              publisher.connection_id,
+              &full_track_name,
+              err,
+              PublishDoneStatusCode::TrackEnded,
+              context.clone(),
+            )
+            .await;
+            return;
+          }
+          Ok(other) => {
+            warn!("Unexpected {:?} on upstream subscribe stream", other.get_type());
+            let err = RequestError::new(
+              RequestErrorCode::InternalError,
+              0,
+              ReasonPhrase::try_new("Unexpected message on upstream subscription stream".to_string()).unwrap(),
+            );
+            // Nothing about the track changed; the pipeline misbehaved.
+            end_upstream_subscription(
+              relay_request_id,
+              publisher.connection_id,
+              &full_track_name,
+              err,
+              PublishDoneStatusCode::InternalError,
+              context.clone(),
+            )
+            .await;
+            return;
+          }
+          Err(code) => {
+            warn!("Upstream subscribe stream closed with error; resetting: {:?}", code);
+            let err = RequestError::new(
+              RequestErrorCode::InternalError,
+              0,
+              ReasonPhrase::try_new("Upstream subscription failed".to_string()).unwrap(),
+            );
+            // The upstream stream is gone, so the track is no longer being published.
+            end_upstream_subscription(
+              relay_request_id,
+              publisher.connection_id,
+              &full_track_name,
+              err,
+              PublishDoneStatusCode::TrackEnded,
+              context.clone(),
+            )
+            .await;
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  upstream.reset_and_stop(StreamResetCode::Cancelled.to_u64());
+}
+
+/// The PUBLISH_DONE status that carries an upstream REQUEST_ERROR downstream. Only a few
+/// of the two registries line up; the rest are a generic failure as far as a subscriber
+/// is concerned.
+fn publish_done_status_for(error_code: RequestErrorCode) -> PublishDoneStatusCode {
+  match error_code {
+    RequestErrorCode::Unauthorized => PublishDoneStatusCode::Unauthorized,
+    RequestErrorCode::GoingAway => PublishDoneStatusCode::GoingAway,
+    RequestErrorCode::MalformedTrack => PublishDoneStatusCode::MalformedTrack,
+    RequestErrorCode::ExcessiveLoad => PublishDoneStatusCode::ExcessiveLoad,
+    RequestErrorCode::DoesNotExist => PublishDoneStatusCode::TrackEnded,
+    _ => PublishDoneStatusCode::InternalError,
+  }
+}
+
+/// Ends every downstream subscription for a track whose upstream subscription failed.
+///
+/// Which message ends it depends on how far the downstream request got. One still
+/// waiting for its answer is answered with REQUEST_ERROR. One already accepted has had
+/// its single response, and only PUBLISH_DONE can end it — a second response on that
+/// stream would be a protocol violation.
+async fn end_upstream_subscription(
+  relay_request_id: u64,
+  publisher_connection_id: usize,
+  full_track_name: &FullTrackName,
+  error: RequestError,
+  status_code: PublishDoneStatusCode,
+  context: Arc<SessionContext>,
+) {
+  let track = context.track_manager.get_track(full_track_name).await;
+  let (confirmed, others_may_still_accept) = match &track {
+    Some(track) => {
+      let track = track.read().await;
+      let confirmed = matches!(*track.status.read().await, TrackStatus::Confirmed { .. });
+      // This publisher has answered; whatever remains counted has not.
+      let remaining = track
+        .pending_upstream_subscribe_count
+        .fetch_sub(1, Ordering::SeqCst)
+        .saturating_sub(1);
+      (confirmed, remaining > 0)
+    }
+    None => (false, false),
+  };
+
+  if !confirmed {
+    // `handle_subscribe_error_message` marks the whole track Rejected and answers the
+    // subscriber's request stream, ending the subscription for everyone. One publisher
+    // declining is not grounds for that while others may still accept, and the stream
+    // takes exactly one response either way. Every publisher answers or times out, so
+    // the last one to do so reaches this with nothing outstanding and decides.
+    if others_may_still_accept {
+      info!(
+        "A publisher declined {:?}; others have yet to answer, so the subscriber waits",
+        full_track_name
+      );
+      return;
+    }
+    let _ = handle_subscribe_error_message(relay_request_id, error, context).await;
+    return;
+  }
+
+  // The track was already accepted, so this publisher's failure ends its own upstream
+  // subscription rather than the request. Only when it was the last publisher serving
+  // the track is there nothing left to deliver, and the subscribers are told it is
+  // over; while another still serves it they carry on and must not hear PUBLISH_DONE.
+  let Some(track) = track else {
+    return;
+  };
+  let still_served = track
+    .read()
+    .await
+    .remove_publisher_quietly(publisher_connection_id)
+    .await;
+
+  if still_served {
+    info!(
+      "Upstream subscription for {:?} from publisher {} failed; other publishers still serve it",
+      full_track_name, publisher_connection_id
+    );
+    return;
+  }
+
+  info!(
+    "Last upstream subscription for {:?} failed after acceptance; ending downstream with PUBLISH_DONE",
+    full_track_name
+  );
+  {
+    let track = track.read().await;
+    // SSTS: the track is no longer available upstream; remove it from the
+    // switching sets of its subscribers.
+    track.remove_from_subscriber_switching_sets().await;
+    if let Err(e) = track
+      .notify_publish_done(status_code, error.reason_phrase.as_str().to_string())
+      .await
+    {
+      error!("Failed to end downstream subscriptions: {:?}", e);
+    }
+  }
+}
+
+/// Reads and checks a SWITCH_FROM carried by a SUBSCRIBE or REQUEST_UPDATE.
+///
+/// `Ok(None)` when there is no SWITCH_FROM and this is an ordinary request.
+/// `Err` carries the REQUEST_ERROR to answer with: the switch cannot be
+/// performed, which is not grounds for closing the session.
+pub(crate) async fn plan_switch(
+  client: &Arc<MOQTClient>,
+  context: &Arc<SessionContext>,
+  activating_request_id: u64,
+  activating: &FullTrackName,
+  parameters: &[MessageParameter],
+) -> Result<Option<SwitchPlan>, RequestError> {
+  let Some(MessageParameter::SwitchFrom {
+    request_id,
+    mode,
+    publish_done,
+  }) = parameters
+    .iter()
+    .find(|p| matches!(p, MessageParameter::SwitchFrom { .. }))
+    .cloned()
+  else {
+    return Ok(None);
+  };
+
+  let invalid = |reason: &str| {
+    RequestError::new(
+      RequestErrorCode::InvalidSwitch,
+      0,
+      ReasonPhrase::try_new(reason.to_string()).unwrap(),
+    )
+  };
+
+  // The switch decides the activating subscription's Forward State itself.
+  if parameters
+    .iter()
+    .any(|p| matches!(p, MessageParameter::Forward { .. }))
+  {
+    return Err(invalid("SWITCH_FROM cannot be combined with FORWARD"));
+  }
+
+  if request_id == activating_request_id {
+    return Err(invalid("a subscription cannot switch away from itself"));
+  }
+
+  let Some((_, subscription)) = context
+    .track_manager
+    .find_subscription_by_request_id(client.connection_id, request_id)
+    .await
+  else {
+    return Err(invalid("no such subscription to switch away from"));
+  };
+
+  // A suspending subscription in Forward State 0 is not an error; there is simply
+  // less to stop.
+  let suspending = subscription.read().await.full_track_name.clone();
+
+  // Both subscriptions would deliver the same Objects, so there is no switch to make.
+  if suspending == *activating {
+    return Err(invalid(
+      "a subscription cannot switch away from its own track",
+    ));
+  }
+
+  Ok(Some(SwitchPlan::new(
+    suspending,
+    request_id,
+    mode,
+    publish_done,
+  )))
+}
+
+/// The subscriber's RENDEZVOUS_TIMEOUT capped at `max`; zero when absent.
+fn rendezvous_timeout(parameters: &[MessageParameter], max: Duration) -> Duration {
+  parameters
+    .iter()
+    .find_map(|p| match p {
+      MessageParameter::RendezvousTimeout { timeout } => Some(Duration::from_millis(*timeout)),
+      _ => None,
+    })
+    .map_or(Duration::ZERO, |requested| requested.min(max))
 }
 
 async fn handle_subscribe_message(
   client: Arc<MOQTClient>,
-  control_stream_handler: &mut ControlStreamHandler,
+  stream_handler: &mut ControlStreamHandler,
   sub: Subscribe,
   context: Arc<SessionContext>,
-  is_switch: bool,
 ) -> Result<(), TerminationCode> {
   info!("received Subscribe message: {:?}", sub);
   let track_namespace = sub.track_namespace.clone();
-  let request_id = sub.request_id;
   let full_track_name = sub.get_full_track_name();
 
-  // check request id
-  {
-    let max_request_id = context
-      .max_request_id
-      .load(std::sync::atomic::Ordering::Relaxed);
-    if request_id >= max_request_id {
-      warn!(
-        "request id ({}) is greater than max request id ({})",
-        request_id, max_request_id
-      );
-      return Err(TerminationCode::TooManyRequests);
-    }
+  // The relay applies Range Filters itself, so ones it cannot honour are refused
+  // before anything is created rather than dropped.
+  if let Err(e) = filter_constructor::object_filter(
+    &sub.subscribe_parameters,
+    context.server_config.max_filter_ranges,
+  ) {
+    info!("Rejecting SUBSCRIBE: {e}");
+    stream_handler
+      .send_impl(&filter_constructor::invalid_filter(&e))
+      .await
+      .unwrap();
+    return Ok(());
   }
 
-  // find who is the publisher
-  // first we try with the full track name
-  // if not found, we try with the announced track namespace
-  // in both cases, the first publisher that satisfies the condition is returned
-  // TODO: support multiple publishers
-  let publisher = {
-    debug!("trying to get the publisher");
-    let m = context.client_manager.read().await;
-    debug!(
-      "client manager obtained, current client id: {}",
-      context.connection_id
-    );
-    match m.get_publisher_by_full_track_name(&full_track_name).await {
-      Some(p) => Some(p),
-      None => {
-        info!(
-          "no publisher found for full track name: {:?}",
-          &full_track_name
-        );
-        let m = context.client_manager.read().await;
-        debug!(
-          "client manager obtained, current client id: {}",
-          context.connection_id
-        );
-        m.get_publisher_by_announced_track_namespace(&track_namespace)
-          .await
-      }
+  // A SUBSCRIBE carrying SWITCH_FROM activates this subscription and suspends
+  // another. Checked first: a switch that cannot be performed is refused without
+  // creating anything.
+  let switch_plan = match plan_switch(
+    &client,
+    &context,
+    sub.request_id,
+    &full_track_name,
+    &sub.subscribe_parameters,
+  )
+  .await
+  {
+    Ok(plan) => plan,
+    Err(err) => {
+      info!(
+        "Rejecting SUBSCRIBE with SWITCH_FROM: {}",
+        err.reason_phrase.as_str()
+      );
+      stream_handler.send_impl(&err).await.unwrap();
+      return Ok(());
     }
   };
+  // A switch applies its filter and Forward State in begin_switch, well after the
+  // SUBSCRIBE_OK goes out; anything measured against the subscription's filter has to
+  // wait for that.
+  let switching = switch_plan.is_some();
 
-  let publisher = if let Some(publisher) = publisher {
-    publisher.clone()
-  } else {
+  // Reserved namespaces are resolved locally and never forwarded upstream.
+  if let Some(reason) =
+    crate::server::utils::reserved_namespace_rejection(&track_namespace, &sub.track_name)
+  {
+    info!("Rejecting SUBSCRIBE for reserved namespace: {}", reason);
+    let err = RequestError::new(
+      RequestErrorCode::DoesNotExist,
+      0,
+      ReasonPhrase::try_new(reason.to_string()).unwrap(),
+    );
+    stream_handler.send_impl(&err).await.unwrap();
+    return Ok(());
+  }
+
+  let rendezvous = rendezvous_timeout(
+    &sub.subscribe_parameters,
+    context.server_config.max_rendezvous_timeout,
+  );
+
+  // Every publisher of the exact Track, plus every publisher that announced a namespace
+  // it falls under. A SUBSCRIBE goes to all of them, not to whichever matched first.
+  let publishers = {
+    trace!("trying to get the publishers");
+    context
+      .client_manager
+      .wait_for_publishers(&full_track_name, rendezvous)
+      .await
+  };
+
+  if publishers.is_empty() {
     info!(
       "no publisher found for track namespace: {:?}",
       track_namespace
     );
+    // TIMEOUT only when the subscriber asked to wait.
+    let (code, reason) = if rendezvous.is_zero() {
+      (RequestErrorCode::DoesNotExist, "Unknown track namespace")
+    } else {
+      (RequestErrorCode::Timeout, "No publisher appeared in time")
+    };
+    // Dump what the relay actually had registered at the miss, so the sent
+    // full track name / namespace can be compared against live registrations.
+    info!(
+      "SUBSCRIBE miss: sent full_track_name={:?} namespace={:?}; registrations:{}",
+      full_track_name,
+      track_namespace,
+      context.client_manager.dump_registrations().await
+    );
     // send RequestError
     let subscribe_error = RequestError::new(
-      sub.request_id,
-      RequestErrorCode::DoesNotExist,
+      code,
       0, //TODO: Maybe decide on another retry interval?
-      ReasonPhrase::try_new("Unknown track namespace".to_string()).unwrap(),
+      ReasonPhrase::try_new(reason.to_string()).unwrap(),
     );
-    control_stream_handler
-      .send_impl(&subscribe_error)
-      .await
-      .unwrap();
+    // The subscriber may have given up while it waited.
+    if let Err(e) = stream_handler.send_impl(&subscribe_error).await {
+      info!("Could not answer an unmatched SUBSCRIBE: {:?}", e);
+    }
     return Ok(());
   };
 
-  publisher.add_subscriber(context.connection_id).await;
+  for publisher in &publishers {
+    publisher.add_subscriber(context.connection_id).await;
+  }
 
   info!(
-    "Subscriber ({}) added to the publisher ({})",
-    context.connection_id, publisher.connection_id
+    "Subscriber ({}) added to {} publisher(s) for {:?}",
+    context.connection_id,
+    publishers.len(),
+    full_track_name
   );
 
   let original_request_id = sub.request_id;
 
-  // Atomic get-or-create: first subscriber creates, subsequent ones find existing
   let (track_arc, is_creator) = context
     .track_manager
     .get_or_create_track(&full_track_name, |relay_track_id| {
@@ -150,13 +671,105 @@ async fn handle_subscribe_message(
         full_track_name.clone(),
         context.server_config,
         TrackStatus::Pending,
+        TrackOrigin::Subscribe,
       )
     })
     .await;
 
-  let track = track_arc.read().await;
+  // Scoped so the track guard is gone before anything below reaches for it again.
+  // A cache-only track has no upstream subscription, so the SUBSCRIBE that takes it
+  // over forwards upstream as if it had created it. Taken over and joined under one
+  // lock, so the track cannot let go of its upstream subscription in between.
+  let (is_creator, subscription) = {
+    let track = track_arc.read().await;
+    let _handover = track.lock_handover().await;
+    let taken_over = track
+      .take_over(TrackOrigin::Subscribe, TrackStatus::Pending)
+      .await;
+    (
+      is_creator || taken_over,
+      add_subscription(sub.clone(), &track, client.clone()).await,
+    )
+  };
+  let Some(subscription) = subscription else {
+    warn!(
+      "Rejecting SUBSCRIBE from {} for {:?}: request {} already has a subscription",
+      context.connection_id, &full_track_name, sub.request_id
+    );
+    let err = RequestError::new(
+      RequestErrorCode::InternalError,
+      0,
+      ReasonPhrase::try_new("could not add the subscription".to_string()).unwrap(),
+    );
+    stream_handler.send_impl(&err).await.unwrap();
+    return Ok(());
+  };
 
-  add_subscription(sub.clone(), &track, client.clone(), is_switch).await;
+  // Sender-side track switching: register this track in its switching set.
+  if let Some(MessageParameter::SwitchingSetAssignment {
+    switching_set_id,
+    algorithm_id,
+    throughput_threshold_kbps,
+    set_throughput_weight,
+    activate_switching,
+    set_rank,
+  }) = sub
+    .subscribe_parameters
+    .iter()
+    .find(|p| matches!(p, MessageParameter::SwitchingSetAssignment { .. }))
+  {
+    // Read before taking the set manager's lock: removing a track takes the
+    // other way around (subscription -> set manager), so holding one lock
+    // while grabbing the other would deadlock.
+    let relay_track_id = track_arc.read().await.relay_track_id;
+
+    if let Err(e) = client.ssts.validate_assignment(*algorithm_id) {
+      warn!("Rejecting SUBSCRIBE from {}: {}", context.connection_id, e);
+      reject_subscription(&track_arc, &client, &(client.connection_id, sub.request_id)).await;
+      let err = RequestError::new(
+        RequestErrorCode::UnsupportedExtension,
+        0,
+        ReasonPhrase::try_new(e).unwrap(),
+      );
+      stream_handler.send_impl(&err).await.unwrap();
+      return Ok(());
+    }
+
+    {
+      let mut manager = client.ssts.switching_sets.write().await;
+      if let Err(e) = manager.assign(
+        full_track_name.clone(),
+        relay_track_id,
+        sub.request_id,
+        *switching_set_id,
+        *algorithm_id,
+        *throughput_threshold_kbps,
+        *set_throughput_weight,
+        *activate_switching,
+        *set_rank,
+      ) {
+        warn!("Rejecting SUBSCRIBE from {}: {}", context.connection_id, e);
+        // A track MUST only be assigned to one switching set at a time; the
+        // subscription is rejected. There is no dedicated parameter-error
+        // code to return, so the unsupported-extension one carries it.
+        drop(manager);
+        reject_subscription(&track_arc, &client, &(client.connection_id, sub.request_id)).await;
+        let err = RequestError::new(
+          RequestErrorCode::UnsupportedExtension,
+          0,
+          ReasonPhrase::try_new(e.to_string()).unwrap(),
+        );
+        stream_handler.send_impl(&err).await.unwrap();
+        return Ok(());
+      }
+    }
+
+    // The spec starts switching-set subscriptions with Forward=0; keep this
+    // subscription forwarding so the Object gating can select per group.
+    let sub = subscription.read().await;
+    let mut state = sub.subscription_state.write().await;
+    state.forward = true;
+  }
 
   let res: Result<(), TerminationCode> = if is_creator {
     // First subscriber for this track: forward Subscribe to publisher
@@ -165,35 +778,49 @@ async fn handle_subscribe_message(
       &full_track_name
     );
 
-    let mut new_sub = sub.clone();
-    // Ensure forward=true in parameters
-    new_sub
-      .subscribe_parameters
-      .retain(|p| !matches!(p, MessageParameter::Forward { .. }));
-    new_sub
-      .subscribe_parameters
-      .push(MessageParameter::new_forward(true));
-    new_sub.request_id =
-      Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+    // Counted before any request goes out, since a publisher can answer while the rest
+    // are still being sent.
+    {
+      let track = track_arc.read().await;
+      track
+        .pending_upstream_subscribe_count
+        .store(publishers.len(), Ordering::SeqCst);
+    }
 
-    publisher
-      .queue_message(ControlMessage::Subscribe(Box::new(new_sub.clone())))
-      .await;
+    for publisher in &publishers {
+      let mut new_sub = sub.clone();
+      new_sub.subscribe_parameters = parameters::upstream_subscribe();
+      // Its own request id, which is what routes this publisher's response back.
+      new_sub.request_id =
+        Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
 
-    // Store relay subscribe request mapping in the unified pending requests map
-    // TODO: we need to add a timeout here or another loop to control expired requests
-    let req = SubscribeRequest::new(
-      original_request_id,
-      context.connection_id,
-      sub.clone(),
-      Some(new_sub.clone()),
-    );
-    let mut requests = context.relay_pending_requests.write().await;
-    requests.insert(new_sub.request_id, PendingRequest::Subscribe(req.clone()));
-    info!(
-      "inserted request into relay's pending requests: {:?} with relay's request id: {:?}",
-      req, new_sub.request_id
-    );
+      // Store the relay subscribe request mapping before forwarding, so the
+      // upstream response can be routed back to this subscription.
+      // TODO: we need to add a timeout here or another loop to control expired requests
+      let req = SubscribeRequest::new(
+        original_request_id,
+        context.connection_id,
+        sub.clone(),
+        Some(new_sub.clone()),
+      );
+      {
+        let mut requests = context.relay_pending_requests.write().await;
+        requests.insert(new_sub.request_id, PendingRequest::Subscribe(req.clone()));
+      }
+      info!(
+        "forwarding SUBSCRIBE for {:?} to publisher {} as relay request {}",
+        full_track_name, publisher.connection_id, new_sub.request_id
+      );
+
+      // Forward SUBSCRIBE upstream on its own bidirectional request stream and read
+      // the response there, per the request-stream model.
+      let publisher_fwd = publisher.clone();
+      let context_fwd = context.clone();
+      tokio::spawn(async move {
+        forward_subscribe_upstream(publisher_fwd, new_sub, context_fwd).await;
+      });
+    }
+
     // Do NOT send SubscribeOk yet -- wait for publisher confirmation
     Ok(())
   } else {
@@ -203,26 +830,41 @@ async fn handle_subscribe_message(
 
     match status {
       TrackStatus::Confirmed {
-        subscribe_parameters,
+        upstream_parameters,
       } => {
         info!(
           "Track confirmed, sending SubscribeOk to subscriber {}",
           client.connection_id
         );
-        let cached_extensions = { track.track_extensions.read().await.clone() };
-        let largest_loc = {
-          let ll = track.largest_location.read().await;
-          Location::new(ll.group, ll.object)
-        };
-        let mut params = subscribe_parameters;
-        params.push(MessageParameter::new_largest_object(largest_loc));
+        let cached_properties = { track.track_properties.read().await.clone() };
+        let params =
+          parameters::downstream_subscribe_ok(&upstream_parameters, track.largest_object().await);
+        let properties = subscription
+          .read()
+          .await
+          .properties_for_ok(cached_properties)
+          .await;
         let subscribe_ok = moqtail::model::control::subscribe_ok::SubscribeOk::new(
-          sub.request_id,
-          track.relay_track_id,
+          subscription.read().await.track_alias,
           params,
-          cached_extensions,
+          properties,
         );
-        control_stream_handler.send_impl(&subscribe_ok).await
+        let sent = stream_handler.send_impl(&subscribe_ok).await;
+        if sent.is_ok() {
+          subscription.read().await.mark_alias_announced();
+          // A switch decides the filter this fill is measured against, and it has not
+          // been applied yet: the fill for one is opened once begin_switch has run.
+          if !switching {
+            crate::server::fill::open_fill_fetch_stream(
+              context.clone(),
+              track_arc.clone(),
+              subscription.clone(),
+              sub.request_id,
+            )
+            .await;
+          }
+        }
+        sent
       }
       TrackStatus::Pending => {
         info!(
@@ -242,15 +884,50 @@ async fn handle_subscribe_message(
           client.connection_id
         );
         let subscribe_error = RequestError::new(
-          sub.request_id,
           error_code,
           0, //TODO: Maybe decide on another retry interval?
           reason_phrase,
         );
-        control_stream_handler.send_impl(&subscribe_error).await
+        stream_handler.send_impl(&subscribe_error).await
       }
     }
   };
+
+  // A subscriber attaching to a PUBLISH-created track is what makes the relay
+  // want Objects, so tell the publisher to start sending.
+  if res.is_ok() {
+    super::publish_handler::ensure_upstream_forwarding(&track_arc, &context).await;
+  }
+
+  if res.is_ok()
+    && let Some(plan) = switch_plan
+  {
+    // Scoped: begin_switch reaches for locks of its own, and the track guard must
+    // be gone before it does.
+    let largest = track_arc.read().await.largest_object().await;
+    {
+      // A SUBSCRIBE describes the subscription in full, so a filter it leaves out
+      // is no filter.
+      let filter = crate::server::subscription::location_filter_of(&sub.subscribe_parameters);
+      subscription
+        .read()
+        .await
+        .begin_switch(plan, Some(&filter), largest)
+        .await;
+
+      // Now that the switch has said where this subscription starts and that it is
+      // forwarding, the fill can be measured: everything already published from the
+      // group it joins, so the subscriber has the group from its start rather than
+      // from wherever it happens to arrive.
+      crate::server::fill::open_fill_fetch_stream(
+        context.clone(),
+        track_arc.clone(),
+        subscription,
+        sub.request_id,
+      )
+      .await;
+    }
+  }
 
   // Store in client's subscribe requests on success
   if res.is_ok() {
@@ -265,7 +942,7 @@ async fn handle_subscribe_message(
       PendingRequest::Subscribe(orig_req.clone()),
     );
 
-    debug!(
+    trace!(
       "inserted request into client's subscribe requests: {:?}",
       orig_req
     );
@@ -276,13 +953,14 @@ async fn handle_subscribe_message(
 }
 
 async fn handle_subscribe_ok_message(
-  _client: Arc<MOQTClient>,
-  _control_stream_handler: &mut ControlStreamHandler,
+  // The publisher that sent this SUBSCRIBE_OK; its connection id keys the track alias.
+  publisher: Arc<MOQTClient>,
+  // The relay request id we sent upstream; this stream identifies the request.
+  request_id: u64,
   msg: moqtail::model::control::subscribe_ok::SubscribeOk,
   context: Arc<SessionContext>,
 ) -> Result<(), TerminationCode> {
   info!("received SubscribeOk message: {:?}", msg);
-  let request_id = msg.request_id;
 
   // Look up the relay subscribe request from the unified map
   let sub_request = {
@@ -306,6 +984,19 @@ async fn handle_subscribe_ok_message(
     }
   };
 
+  // SUBSCRIBE_OK with an unsupported mandatory track property. Reuse the
+  // RequestError fan-out to cancel and notify downstream subscribers.
+  if has_unsupported_mandatory(&msg.track_properties) {
+    warn!(
+      "SubscribeOk for request {} carries an unsupported mandatory track property; rejecting",
+      request_id
+    );
+    let reason = ReasonPhrase::try_new("Unsupported mandatory track property".to_string())
+      .map_err(|_| TerminationCode::InternalError)?;
+    let err = RequestError::new(RequestErrorCode::UnsupportedExtension, 0, reason);
+    return handle_subscribe_error_message(request_id, err, context).await;
+  }
+
   let full_track_name = sub_request.original_subscribe_request.get_full_track_name();
 
   // The track must already exist (pre-created in Subscribe handler)
@@ -320,54 +1011,122 @@ async fn handle_subscribe_ok_message(
     }
   };
 
-  // Confirm the track with publisher's metadata; capture relay_track_id for SubscribeOk messages
-  let relay_track_id = {
-    let mut track = track_arc.write().await;
-    track
-      .confirm(
-        context.connection_id,
-        msg.track_alias,
-        msg.subscribe_parameters.clone(),
-        msg.track_extensions.clone(),
-      )
-      .await;
-    track.relay_track_id
-  };
+  // The subscription this answers was let go of when its last subscriber left; its
+  // upstream stream has been reset.
+  if track_arc.read().await.origin() == TrackOrigin::CacheOnly {
+    info!(
+      "SubscribeOk {} answers a subscription {:?} has let go of; ignoring",
+      request_id, full_track_name
+    );
+    return Ok(());
+  }
 
-  // Register the publisher's alias for data stream routing
-  context
+  // Register the publisher's alias for data stream routing.
+  if !context
     .track_manager
     .add_track_alias(
-      context.connection_id,
+      publisher.connection_id,
       msg.track_alias,
       full_track_name.clone(),
     )
-    .await;
+    .await
+  {
+    return Err(TerminationCode::DuplicateTrackAlias);
+  }
+
+  // Confirm the track with publisher's metadata
+  let confirmed_now = {
+    let mut track = track_arc.write().await;
+    let confirmed_now = track
+      .confirm(
+        publisher.connection_id,
+        msg.track_alias,
+        msg.subscribe_parameters.clone(),
+        msg.track_properties.clone(),
+      )
+      .await;
+    // This publisher has answered.
+    track
+      .pending_upstream_subscribe_count
+      .fetch_sub(1, Ordering::SeqCst);
+    confirmed_now
+  };
+
+  // Only the publisher that confirmed the track answers downstream. The others are now
+  // serving it too, but the subscribers were told once already and their request
+  // streams take exactly one response.
+  if !confirmed_now {
+    info!(
+      "Publisher {} also accepted {:?}; subscribers already answered",
+      publisher.connection_id, full_track_name
+    );
+    return Ok(());
+  }
+
+  // What the relay advertises downstream is not what upstream sent: by the time this
+  // runs the relay may already have seen a later Object than upstream knew of.
+  let downstream_params = {
+    let track = track_arc.read().await;
+    parameters::downstream_subscribe_ok(&msg.subscribe_parameters, track.largest_object().await)
+  };
 
   // Send SubscribeOk to the FIRST subscriber (the creator)
   {
-    let subscriber = {
-      let mngr = context.client_manager.read().await;
-      mngr.get(sub_request.requested_by).await
-    };
+    let subscriber = { context.client_manager.get(sub_request.requested_by).await };
     if let Some(subscriber) = subscriber {
-      let cached_extensions = {
+      let (cached_properties, subscription) = {
         let track = track_arc.read().await;
-        track.track_extensions.read().await.clone()
+        (
+          track.track_properties.read().await.clone(),
+          track
+            .get_subscription(&(subscriber.connection_id, sub_request.original_request_id))
+            .await,
+        )
       };
-      let subscribe_ok = moqtail::model::control::subscribe_ok::SubscribeOk::new(
-        sub_request.original_request_id,
-        relay_track_id,
-        msg.subscribe_parameters.clone(),
-        cached_extensions,
-      );
-      info!(
-        "sending SubscribeOk to creator subscriber: {:?}",
-        subscriber.connection_id
-      );
-      subscriber
-        .queue_message(ControlMessage::SubscribeOk(Box::new(subscribe_ok)))
-        .await;
+      // The subscriber can cancel while the publisher is still answering; then
+      // there is no one left to tell.
+      if let Some(subscription) = subscription {
+        let properties = subscription
+          .read()
+          .await
+          .properties_for_ok(cached_properties)
+          .await;
+        let subscribe_ok = moqtail::model::control::subscribe_ok::SubscribeOk::new(
+          subscription.read().await.track_alias,
+          downstream_params.clone(),
+          properties,
+        );
+        info!(
+          "sending SubscribeOk to creator subscriber: {:?}",
+          subscriber.connection_id
+        );
+        let delivered = subscriber
+          .send_response(
+            sub_request.original_request_id,
+            ControlMessage::SubscribeOk(Box::new(subscribe_ok)),
+          )
+          .await;
+        if !delivered {
+          warn!(
+            "no request stream for creator subscriber request {}",
+            sub_request.original_request_id
+          );
+        } else {
+          subscription.read().await.mark_alias_announced();
+          crate::server::fill::open_fill_fetch_stream(
+            context.clone(),
+            track_arc.clone(),
+            subscription,
+            sub_request.original_request_id,
+          )
+          .await;
+        }
+      } else {
+        info!(
+          "creator subscriber request {} cancelled before the publisher answered",
+          sub_request.original_request_id
+        );
+      }
     } else {
       warn!(
         "creator subscriber not found: {:?}",
@@ -378,35 +1137,71 @@ async fn handle_subscribe_ok_message(
 
   // Send SubscribeOk to ALL pending subscribers
   {
-    let track = track_arc.read().await;
+    // Released before the loop: the loop reads this same lock again, and a second read
+    // taken while the first is still held deadlocks against any writer queued between
+    // them.
     let pending = {
+      let track = track_arc.read().await;
       let mut pending = track.pending_subscribers.write().await;
       std::mem::take(&mut *pending)
     };
 
     for (subscriber_request_id, subscriber_connection_id) in pending {
-      let subscriber = {
-        let mngr = context.client_manager.read().await;
-        mngr.get(subscriber_connection_id).await
-      };
+      let subscriber = { context.client_manager.get(subscriber_connection_id).await };
       if let Some(subscriber) = subscriber {
-        let cached_extensions = {
+        let (cached_properties, subscription) = {
           let track = track_arc.read().await;
-          track.track_extensions.read().await.clone()
+          (
+            track.track_properties.read().await.clone(),
+            track
+              .get_subscription(&(subscriber.connection_id, subscriber_request_id))
+              .await,
+          )
         };
+        // The subscriber can cancel while the publisher is still answering; then
+        // there is no one left to tell.
+        let Some(subscription) = subscription else {
+          info!(
+            "pending subscriber request {} cancelled before the publisher answered",
+            subscriber_request_id
+          );
+          continue;
+        };
+        let properties = subscription
+          .read()
+          .await
+          .properties_for_ok(cached_properties)
+          .await;
         let subscribe_ok = moqtail::model::control::subscribe_ok::SubscribeOk::new(
-          subscriber_request_id,
-          relay_track_id,
-          msg.subscribe_parameters.clone(),
-          cached_extensions,
+          subscription.read().await.track_alias,
+          downstream_params.clone(),
+          properties,
         );
         info!(
           "sending SubscribeOk to pending subscriber: {:?}",
           subscriber.connection_id
         );
-        subscriber
-          .queue_message(ControlMessage::SubscribeOk(Box::new(subscribe_ok)))
+        let delivered = subscriber
+          .send_response(
+            subscriber_request_id,
+            ControlMessage::SubscribeOk(Box::new(subscribe_ok)),
+          )
           .await;
+        if !delivered {
+          warn!(
+            "no request stream for pending subscriber request {}",
+            subscriber_request_id
+          );
+        } else {
+          subscription.read().await.mark_alias_announced();
+          crate::server::fill::open_fill_fetch_stream(
+            context.clone(),
+            track_arc.clone(),
+            subscription,
+            subscriber_request_id,
+          )
+          .await;
+        }
       }
     }
   }
@@ -416,25 +1211,19 @@ async fn handle_subscribe_ok_message(
   Ok(())
 }
 
-async fn handle_unsubscribe_message(
+/// Cancel a subscription when its SUBSCRIBE request stream is reset or closed.
+pub(crate) async fn cancel_subscription(
   client: Arc<MOQTClient>,
-  _control_stream_handler: &mut ControlStreamHandler,
-  unsubscribe_message: moqtail::model::control::unsubscribe::Unsubscribe,
-  context: Arc<SessionContext>,
-) -> Result<(), TerminationCode> {
-  info!("received Unsubscribe message: {:?}", unsubscribe_message);
-
+  request_id: u64,
+  context: &Arc<SessionContext>,
+) {
   // find the track alias by using the request id
   let full_track_name = {
     let requests = client.subscribe_requests.read().await;
-    let request = requests.get(&unsubscribe_message.request_id);
+    let request = requests.get(&request_id);
     if request.is_none() {
-      // a warning is enough
-      warn!(
-        "request not found for request id: {:?}",
-        unsubscribe_message.request_id
-      );
-      return Ok(());
+      warn!("request not found for request id: {:?}", request_id);
+      return;
     }
     request
       .unwrap()
@@ -442,61 +1231,107 @@ async fn handle_unsubscribe_message(
       .get_full_track_name()
   }; // read lock dropped here
 
+  // Sender-side track switching: this subscription no longer holds the track in
+  // its switching set. Another subscription to the same track may still.
+  {
+    let mut manager = client.ssts.switching_sets.write().await;
+    manager.release(&full_track_name, request_id);
+  }
+
   // remove the subscription from the track
   let track_option = context.track_manager.get_track(&full_track_name).await;
 
   if let Some(track_lock) = track_option {
-    let track = track_lock.write().await;
-    track.remove_subscription(context.connection_id).await;
+    // The subscriber may hold other subscriptions to this track under other request
+    // ids. Cancel only the one this request owns, and only if it is still there.
+    let owned = track_lock
+      .read()
+      .await
+      .has_subscription(&(context.connection_id, request_id))
+      .await;
+
+    if !owned {
+      info!(
+        "Subscription cancel: request {} no longer owns the subscription for {:?}; leaving it",
+        request_id, full_track_name
+      );
+      let mut requests = client.subscribe_requests.write().await;
+      requests.remove(&request_id);
+      let mut inbound = client.inbound_requests.write().await;
+      inbound.remove(&request_id);
+      return;
+    }
+
+    // A SUBSCRIBE-created track whose last subscriber left has its upstream
+    // subscription cancelled. It becomes cache-only if it holds cached Objects, and is
+    // removed otherwise; either way the next SUBSCRIBE subscribes upstream afresh
+    // rather than being answered from it. A PUBLISH-created track has a publisher still
+    // pushing to it and outlives any number of subscribers.
+    let cleanup = track_lock
+      .read()
+      .await
+      .remove_subscriber(&(context.connection_id, request_id))
+      .await;
+    if cleanup != Cleanup::Nothing {
+      info!(
+        "Last subscriber left {:?}: {:?}; next SUBSCRIBE will re-subscribe upstream",
+        full_track_name, cleanup
+      );
+      context
+        .track_manager
+        .clean_up(&full_track_name, cleanup)
+        .await;
+    }
   } else {
-    tracing::warn!(
-      "Ignored Unsubscribe: Track {:?} already removed.",
+    warn!(
+      "Subscription cancel: Track {:?} already removed.",
       full_track_name
     );
   }
 
   // remove the subscription from the client
-  client
-    .subscriptions
-    .remove_subscription(&full_track_name)
-    .await;
+  client.subscriptions.remove(request_id).await;
 
   // Remove the request from the client's request map so it doesn't leak
   {
     let mut requests = client.subscribe_requests.write().await;
-    requests.remove(&unsubscribe_message.request_id);
+    requests.remove(&request_id);
 
     let mut inbound = client.inbound_requests.write().await;
-    inbound.remove(&unsubscribe_message.request_id);
+    inbound.remove(&request_id);
 
-    debug!(
-      "Cleaned up client subscribe request {} after Unsubscribe",
-      unsubscribe_message.request_id
+    trace!(
+      "Cleaned up client subscribe request {} on cancel",
+      request_id
     );
   }
-
-  Ok(())
 }
 
 pub async fn handle_request_update(
   client: Arc<MOQTClient>,
-  control_stream_handler: &mut ControlStreamHandler,
+  stream_handler: &mut ControlStreamHandler,
   update_msg: moqtail::model::control::request_update::RequestUpdate,
   context: Arc<SessionContext>,
+  existing_req_id: u64,
 ) -> Result<(), TerminationCode> {
-  let existing_req_id = update_msg.existing_request_id;
-  let update_req_id = update_msg.request_id;
+  // An update can carry SWITCH_FROM too, activating the subscription it arrives on.
+  let asks_for_a_fill = update_msg
+    .parameters
+    .iter()
+    .any(|p| matches!(p, MessageParameter::FillParameters { .. }));
+  // The update itself is handed on to the subscription, so a switch's filter is
+  // kept here rather than read back off it.
+  let update_parameters = update_msg.parameters.clone();
 
-  let full_track_name = {
-    let mut client_requests = client.subscribe_requests.write().await;
-    match client_requests.get_mut(&existing_req_id) {
-      Some(req) => {
-        apply_message_parameter_update(
-          &mut req.original_subscribe_request.subscribe_parameters,
-          update_msg.parameters.clone(),
-        );
-        req.original_subscribe_request.get_full_track_name()
-      }
+  // Read before anything is applied: a refused switch must leave the subscription
+  // as it was.
+  let (full_track_name, current_parameters) = {
+    let client_requests = client.subscribe_requests.read().await;
+    match client_requests.get(&existing_req_id) {
+      Some(req) => (
+        req.original_subscribe_request.get_full_track_name(),
+        req.original_subscribe_request.subscribe_parameters.clone(),
+      ),
       None => {
         warn!(
           "RequestUpdate existing_request_id {} is not a valid Subscribe request for this client",
@@ -507,6 +1342,56 @@ pub async fn handle_request_update(
     }
   };
 
+  // Filters the subscription would be left with but that cannot be honoured fail
+  // the update before any of it is applied.
+  if let Err(e) = filter_constructor::updated_filter(
+    &current_parameters,
+    &update_msg.parameters,
+    context.server_config.max_filter_ranges,
+  ) {
+    info!("Refusing REQUEST_UPDATE for {:?}: {e}", full_track_name);
+    fail_update(
+      &client,
+      stream_handler,
+      &context,
+      &full_track_name,
+      existing_req_id,
+      filter_constructor::invalid_filter(&e),
+    )
+    .await;
+    return Ok(());
+  }
+
+  let switch_plan = match plan_switch(
+    &client,
+    &context,
+    existing_req_id,
+    &full_track_name,
+    &update_msg.parameters,
+  )
+  .await
+  {
+    Ok(plan) => plan,
+    Err(err) => {
+      info!(
+        "Rejecting REQUEST_UPDATE with SWITCH_FROM: {}",
+        err.reason_phrase.as_str()
+      );
+      let _ = stream_handler.send_impl(&err).await;
+      return Ok(());
+    }
+  };
+
+  {
+    let mut client_requests = client.subscribe_requests.write().await;
+    if let Some(req) = client_requests.get_mut(&existing_req_id) {
+      apply_message_parameter_update(
+        &mut req.original_subscribe_request.subscribe_parameters,
+        update_msg.parameters.clone(),
+      );
+    }
+  }
+
   {
     let mut inbound = client.inbound_requests.write().await;
     if let Some(PendingRequest::Subscribe(req)) = inbound.get_mut(&existing_req_id) {
@@ -514,6 +1399,43 @@ pub async fn handle_request_update(
         &mut req.original_subscribe_request.subscribe_parameters,
         update_msg.parameters.clone(),
       );
+    }
+  }
+
+  // Sender-side track switching: apply switching set parameter updates. All
+  // fields are present in the parameter, and the most recently received message
+  // wins. Applied with the rest of the update, after the switch plan was
+  // accepted, so a rejected update leaves the switching set as it was.
+  if let Some(p) = update_msg
+    .parameters
+    .iter()
+    .find(|p| matches!(p, MessageParameter::SwitchingSetAssignment { .. }))
+    && let MessageParameter::SwitchingSetAssignment {
+      algorithm_id,
+      throughput_threshold_kbps,
+      set_throughput_weight,
+      activate_switching,
+      set_rank,
+      ..
+    } = p
+  {
+    let mut manager = client.ssts.switching_sets.write().await;
+    match manager.update_assignment(
+      &full_track_name,
+      Some(*algorithm_id),
+      Some(*throughput_threshold_kbps),
+      Some(*set_throughput_weight),
+      Some(*activate_switching),
+      Some(*set_rank),
+    ) {
+      Ok(warnings) => {
+        for warning in warnings {
+          warn!("SSTS REQUEST_UPDATE for {full_track_name}: {warning}");
+        }
+      }
+      // The rest of the update still applies; only the switching set part could
+      // not be, and it is the track that is not in a set.
+      Err(e) => warn!("SSTS REQUEST_UPDATE for {full_track_name}: {e}"),
     }
   }
 
@@ -526,59 +1448,173 @@ pub async fn handle_request_update(
   }
 
   let track_arc = track_lock.unwrap();
-  let track_guard = track_arc.read().await;
 
-  // 3. Update the actual active edge subscription
-  if let Some(subscription) = track_guard.get_subscription(client.connection_id).await {
-    let sub = subscription.read().await;
+  // Apply the update, releasing the track/sub read locks before responding or
+  // terminating so termination can take the track write lock.
+  let update_result = {
+    let track_guard = track_arc.read().await;
+    match track_guard
+      .get_subscription(&(client.connection_id, existing_req_id))
+      .await
+    {
+      Some(subscription) => Some(
+        subscription
+          .read()
+          .await
+          .update_subscription(update_msg)
+          .await,
+      ),
+      None => None,
+    }
+  };
 
-    match sub.update_subscription(update_msg.clone()).await {
-      Ok(_) => {
-        info!(
-          "Subscription updated successfully for track: {:?}",
-          full_track_name
-        );
+  match update_result {
+    Some(Ok(())) => {
+      info!(
+        "Subscription updated successfully for track: {:?}",
+        full_track_name
+      );
+      // The update may have turned this subscriber's Forward State on, which is
+      // the first thing wanting Objects from a PUBLISH-created track.
+      super::publish_handler::ensure_upstream_forwarding(&track_arc, &context).await;
+      let ok_msg = RequestOk::new(vec![]);
+      let _ = stream_handler.send_impl(&ok_msg).await;
 
-        use moqtail::model::control::request_ok::RequestOk;
-        let ok_msg = RequestOk::new(update_req_id, vec![]);
-        let _ = control_stream_handler.send_impl(&ok_msg).await;
+      // Scoped: what follows reaches for locks of its own, and the track guard
+      // must be gone before it does.
+      let (subscription, largest) = {
+        let track = track_arc.read().await;
+        (
+          track
+            .get_subscription(&(client.connection_id, existing_req_id))
+            .await,
+          track.largest_object().await,
+        )
+      };
+
+      // An update changes only what it carries, so a filter it leaves out leaves
+      // the subscription's own in place.
+      let filter = update_parameters.iter().find_map(|p| match p {
+        MessageParameter::LocationFilter { filter } => Some(filter),
+        _ => None,
+      });
+
+      if let Some(subscription) = &subscription {
+        if let Some(plan) = switch_plan {
+          subscription
+            .read()
+            .await
+            .begin_switch(plan, filter, largest)
+            .await;
+        } else if filter.is_some() {
+          // A filter the update changed starts where it now says, which for a live
+          // one is against the largest Object as of this update.
+          subscription.read().await.resolve_live_start(largest).await;
+        }
       }
-      Err(e) => {
-        error!(
-          "Subscription update failed for track: {:?}, error: {:?}",
-          full_track_name, e
-        );
 
-        let err_msg = RequestError::new(
-          update_req_id,
-          RequestErrorCode::InternalError,
-          0,
-          ReasonPhrase::try_new(format!("Update failed: {:?}", e))
-            .unwrap_or_else(|_| ReasonPhrase::try_new("Update failed".to_string()).unwrap()),
-        );
-        let _ = control_stream_handler.send_impl(&err_msg).await;
+      // An update that carries FILL_PARAMETERS asks for another fill, over
+      // whatever range it now specifies.
+      if asks_for_a_fill
+        && let Some(subscription) = track_arc
+          .read()
+          .await
+          .get_subscription(&(client.connection_id, existing_req_id))
+          .await
+      {
+        crate::server::fill::open_fill_fetch_stream(
+          context.clone(),
+          track_arc.clone(),
+          subscription,
+          existing_req_id,
+        )
+        .await;
       }
     }
-  } else {
-    warn!(
-      "No active subscription found for client {} on track {:?}",
-      client.connection_id, full_track_name
-    );
+    Some(Err(e)) => {
+      error!(
+        "Subscription update failed for track: {:?}, error: {:?}",
+        full_track_name, e
+      );
 
-    let err_msg = RequestError::new(
-      update_req_id,
-      RequestErrorCode::DoesNotExist,
-      0,
-      ReasonPhrase::try_new("Subscription not found".to_string()).unwrap(),
-    );
-    let _ = control_stream_handler.send_impl(&err_msg).await;
+      let err_msg = RequestError::new(
+        RequestErrorCode::InternalError,
+        0,
+        ReasonPhrase::try_new(format!("Update failed: {:?}", e))
+          .unwrap_or_else(|_| ReasonPhrase::try_new("Update failed".to_string()).unwrap()),
+      );
+      fail_update(
+        &client,
+        stream_handler,
+        &context,
+        &full_track_name,
+        existing_req_id,
+        err_msg,
+      )
+      .await;
+    }
+    None => {
+      warn!(
+        "No active subscription found for client {} on track {:?}",
+        client.connection_id, full_track_name
+      );
+
+      let err_msg = RequestError::new(
+        RequestErrorCode::DoesNotExist,
+        0,
+        ReasonPhrase::try_new("Subscription not found".to_string()).unwrap(),
+      );
+      let _ = stream_handler.send_impl(&err_msg).await;
+    }
   }
 
   Ok(())
 }
+/// Refuses a REQUEST_UPDATE with `error`, then ends the subscription it was for with
+/// PUBLISH_DONE(UPDATE_FAILED), which is what a failed update does to a subscription.
+async fn fail_update(
+  client: &Arc<MOQTClient>,
+  stream_handler: &mut ControlStreamHandler,
+  context: &Arc<SessionContext>,
+  full_track_name: &FullTrackName,
+  request_id: u64,
+  error: RequestError,
+) {
+  let _ = stream_handler.send_impl(&error).await;
+
+  let track_arc = context.track_manager.get_track(full_track_name).await;
+  let stream_count = match &track_arc {
+    Some(track) => match track
+      .read()
+      .await
+      .get_subscription(&(client.connection_id, request_id))
+      .await
+    {
+      Some(sub) => sub.read().await.opened_stream_count(),
+      None => 0,
+    },
+    None => 0,
+  };
+  let done = PublishDone::new(
+    PublishDoneStatusCode::UpdateFailed,
+    stream_count,
+    ReasonPhrase::try_new("REQUEST_UPDATE failed".to_string()).unwrap(),
+  );
+  let _ = stream_handler.send_impl(&done).await;
+
+  if let Some(track) = track_arc {
+    track
+      .write()
+      .await
+      .remove_subscription(&(client.connection_id, request_id))
+      .await;
+  }
+  client.subscriptions.remove(request_id).await;
+}
+
 async fn handle_subscribe_error_message(
-  _client: Arc<MOQTClient>,
-  _control_stream_handler: &mut ControlStreamHandler,
+  // The relay request id we sent upstream; this stream identifies the request.
+  request_id: u64,
   subscribe_error_message: RequestError,
   context: Arc<SessionContext>,
 ) -> Result<(), TerminationCode> {
@@ -587,7 +1623,6 @@ async fn handle_subscribe_error_message(
     subscribe_error_message
   );
   let msg = subscribe_error_message;
-  let request_id = msg.request_id;
 
   // Look up and remove the relay subscribe request from the unified map
   let sub_request = {
@@ -607,8 +1642,18 @@ async fn handle_subscribe_error_message(
 
   let full_track_name = sub_request.original_subscribe_request.get_full_track_name();
 
-  // Mark track as Rejected (if it exists)
-  let track_arc = context.track_manager.get_track(&full_track_name).await;
+  // Mark track as Rejected (if it exists). A track that let go of its upstream
+  // subscription before this answer came keeps what it has cached.
+  let track_arc = match context.track_manager.get_track(&full_track_name).await {
+    Some(track) if track.read().await.origin() == TrackOrigin::CacheOnly => {
+      info!(
+        "RequestError {} answers a subscription {:?} has let go of; ignoring",
+        request_id, full_track_name
+      );
+      return Ok(());
+    }
+    track => track,
+  };
   if let Some(track_arc) = &track_arc {
     let track = track_arc.read().await;
     track
@@ -618,19 +1663,18 @@ async fn handle_subscribe_error_message(
 
   // Send RequestError to the FIRST subscriber (the creator)
   {
-    let subscriber = {
-      let mngr = context.client_manager.read().await;
-      mngr.get(sub_request.requested_by).await
-    };
+    let subscriber = { context.client_manager.get(sub_request.requested_by).await };
     if let Some(subscriber) = subscriber {
       let subscribe_error = RequestError::new(
-        sub_request.original_request_id,
         msg.error_code,
         0, //TODO: Maybe decide on another retry interval?
         msg.reason_phrase.clone(),
       );
       subscriber
-        .queue_message(ControlMessage::RequestError(Box::new(subscribe_error)))
+        .send_response(
+          sub_request.original_request_id,
+          ControlMessage::RequestError(Box::new(subscribe_error)),
+        )
         .await;
     }
   }
@@ -644,187 +1688,114 @@ async fn handle_subscribe_error_message(
     };
 
     for (subscriber_request_id, subscriber_connection_id) in pending {
-      let subscriber = {
-        let mngr = context.client_manager.read().await;
-        mngr.get(subscriber_connection_id).await
-      };
+      let subscriber = { context.client_manager.get(subscriber_connection_id).await };
       if let Some(subscriber) = subscriber {
         let subscribe_error = RequestError::new(
-          subscriber_request_id,
           msg.error_code,
           0, //TODO: Maybe decide on another retry interval?
           msg.reason_phrase.clone(),
         );
         subscriber
-          .queue_message(ControlMessage::RequestError(Box::new(subscribe_error)))
+          .send_response(
+            subscriber_request_id,
+            ControlMessage::RequestError(Box::new(subscribe_error)),
+          )
           .await;
       }
     }
   }
 
-  // Remove the pre-created track from TrackManager
+  // Nothing upstream serves the track: it stays only if it holds cached Objects.
   if track_arc.is_some() {
-    let mut tracks = context.track_manager.tracks.write().await;
-    tracks.remove(&full_track_name);
+    context.track_manager.retire_track(&full_track_name).await;
   }
 
   Ok(())
 }
 
-async fn handle_switch_message(
-  client: Arc<MOQTClient>,
-  control_stream_handler: &mut ControlStreamHandler,
-  switch_message: moqtail::model::control::switch::Switch,
-  context: Arc<SessionContext>,
-) -> Result<(), TerminationCode> {
-  info!("received Switch message: {:?}", switch_message);
-
-  // now different from a normal subscribe, we need to
-  // check whether there is a related track to switch from
-  let switch_from_track = {
-    let requests = client.subscribe_requests.read().await;
-
-    let req = requests.get(&switch_message.subscription_request_id);
-    match req {
-      Some(req) => {
-        let track_name = req.original_subscribe_request.get_full_track_name();
-        if let Some(track) = context.track_manager.get_track(&track_name).await {
-          info!(
-            "found old track request, original request id: {:?}",
-            req.original_request_id
-          );
-          Some(track.clone())
-        } else {
-          warn!("old track not found for track name: {:?}", track_name);
-          None
-        }
-      }
-      None => None,
-    }
-  };
-
-  if switch_from_track.is_none() {
-    warn!(
-      "no existing track found for switch subscription request id: {:?}",
-      switch_message.subscription_request_id
-    );
-    return Err(TerminationCode::ProtocolViolation);
-  }
-
-  let switch_from_track_guard = switch_from_track.unwrap();
-
-  let switch_from_track = switch_from_track_guard.read().await;
-
-  if let Some(sub) = client
-    .subscriptions
-    .get_subscription(&switch_from_track.full_track_name)
-    .await
-  {
-    if sub.upgrade().is_none() {
-      warn!(
-        "subscription weak reference is dead for track: {:?} subscriber: {}",
-        switch_from_track.full_track_name, context.connection_id
-      );
-      return Err(TerminationCode::ProtocolViolation);
-    }
-
-    let mut is_active = false;
-    if let Some(sub) = sub.upgrade() {
-      let sub = sub.read().await;
-      is_active = sub.is_active().await;
-    }
-
-    if !is_active {
-      warn!(
-        "subscription is not active for track: {:?} subscriber: {}",
-        switch_from_track.full_track_name, context.connection_id
-      );
-      return Err(TerminationCode::ProtocolViolation);
-    }
-  } else {
-    warn!(
-      "no subscription found for track: {:?} subscriber: {}",
-      switch_from_track.full_track_name, context.connection_id
-    );
-    return Err(TerminationCode::ProtocolViolation);
-  }
-
-  let mut switch_params: Vec<MessageParameter> = switch_message
-    .subscribe_parameters
-    .iter()
-    .filter_map(|kvp| MessageParameter::deserialize(kvp).ok())
-    .collect();
-
-  switch_params.set_param(MessageParameter::new_forward(true)); // forward always true for switch
-
-  let subscribe = Subscribe::new_latest_object(
-    switch_message.request_id,
-    switch_message.track_namespace.clone(),
-    switch_message.track_name.clone(),
-    switch_params,
-  );
-
-  let new_full_track_name = subscribe.get_full_track_name();
-
-  if let Err(e) = handle_subscribe_message(
-    client.clone(),
-    control_stream_handler,
-    subscribe,
-    context.clone(),
-    true, // is_switch
-  )
-  .await
-  {
-    error!("error handling switch subscribe message: {:?}", e);
-    Err(e)
-  } else {
-    info!("switch subscribe message handled successfully");
-
-    // update the switch context
-    client
-      .switch_context
-      .add_or_update_switch_item(new_full_track_name, SwitchStatus::Next)
-      .await;
-
-    let switch_from_track_name = switch_from_track.full_track_name.clone();
-
-    client
-      .switch_context
-      .add_or_update_switch_item(switch_from_track_name, SwitchStatus::Current)
-      .await;
-
-    Ok(())
-  }
-}
-
 pub async fn handle(
   client: Arc<MOQTClient>,
-  control_stream_handler: &mut ControlStreamHandler,
+  stream_handler: &mut ControlStreamHandler,
   msg: ControlMessage,
   context: Arc<SessionContext>,
+  opening_request_id: Option<u64>,
 ) -> Result<(), TerminationCode> {
   match msg {
     ControlMessage::Subscribe(m) => {
-      handle_subscribe_message(client, control_stream_handler, *m, context, false).await
-    }
-    ControlMessage::SubscribeOk(m) => {
-      handle_subscribe_ok_message(client, control_stream_handler, *m, context).await
-    }
-    ControlMessage::Unsubscribe(m) => {
-      handle_unsubscribe_message(client, control_stream_handler, *m, context).await
+      handle_subscribe_message(client, stream_handler, *m, context).await
     }
     ControlMessage::RequestUpdate(m) => {
-      handle_request_update(client, control_stream_handler, *m, context).await
-    }
-    ControlMessage::RequestError(m) => {
-      handle_subscribe_error_message(client, control_stream_handler, *m, context).await
-    }
-    ControlMessage::Switch(m) => {
-      handle_switch_message(client, control_stream_handler, *m, context).await
+      let Some(target_request_id) = opening_request_id else {
+        return Err(TerminationCode::ProtocolViolation);
+      };
+      handle_request_update(client, stream_handler, *m, context, target_request_id).await
     }
     _ => {
       // no-op
       Ok(())
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn rendezvous_timeout_defaults_to_zero_and_is_capped() {
+    let max = Duration::from_millis(1000);
+    assert_eq!(rendezvous_timeout(&[], max), Duration::ZERO);
+    assert_eq!(
+      rendezvous_timeout(&[MessageParameter::new_rendezvous_timeout(500)], max),
+      Duration::from_millis(500)
+    );
+    assert_eq!(
+      rendezvous_timeout(&[MessageParameter::new_rendezvous_timeout(5000)], max),
+      max
+    );
+    assert_eq!(
+      rendezvous_timeout(
+        &[MessageParameter::new_rendezvous_timeout(500)],
+        Duration::ZERO
+      ),
+      Duration::ZERO
+    );
+  }
+
+  #[test]
+  fn upstream_errors_map_to_a_publish_done_status() {
+    for (error, status) in [
+      (
+        RequestErrorCode::Unauthorized,
+        PublishDoneStatusCode::Unauthorized,
+      ),
+      (
+        RequestErrorCode::GoingAway,
+        PublishDoneStatusCode::GoingAway,
+      ),
+      (
+        RequestErrorCode::MalformedTrack,
+        PublishDoneStatusCode::MalformedTrack,
+      ),
+      (
+        RequestErrorCode::ExcessiveLoad,
+        PublishDoneStatusCode::ExcessiveLoad,
+      ),
+      (
+        RequestErrorCode::DoesNotExist,
+        PublishDoneStatusCode::TrackEnded,
+      ),
+      // No counterpart: a subscriber can only be told something went wrong.
+      (
+        RequestErrorCode::InvalidRange,
+        PublishDoneStatusCode::InternalError,
+      ),
+      (
+        RequestErrorCode::Timeout,
+        PublishDoneStatusCode::InternalError,
+      ),
+    ] {
+      assert_eq!(publish_done_status_for(error), status, "for {error:?}");
     }
   }
 }

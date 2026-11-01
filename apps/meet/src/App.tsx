@@ -15,15 +15,22 @@
  */
 
 import { useRef, useState } from 'react';
+import { Mic, MicOff, PhoneOff, ScrollText, Settings, Video, VideoOff } from 'lucide-react';
 import { MOQtailClient } from 'moqtail/client';
 import { RequestError } from 'moqtail/model';
 import {
   FullTrackName,
   Tuple,
+  MoqtObject,
   ObjectForwardingPreference,
-  DefaultPublisherPriorityExtension,
+  DefaultPublisherPriorityProperty,
 } from 'moqtail/model';
 import { createMOQtailClient } from './moq/client';
+import { SettingsPane } from './SettingsPane';
+import { MessageLogPane } from './MessageLogPane';
+import { LogEntry, MessageDirection, toLogEntry, toSignalEntry } from './moq/describe';
+import { ControlMessage, Publish } from 'moqtail/model';
+import { DataStats } from './moq/dataStats';
 import { setupSignalling } from './moq/signalling';
 import {
   announceNamespaces,
@@ -40,12 +47,57 @@ type Screen = 'entrance' | 'connecting' | 'main';
 
 const USERNAME_MAX_LEN = 25;
 const USERNAME_REGEX = /^[a-zA-Z0-9 ]+$/;
-const NS_PREFIX = '/moqtail/demo/';
+const ROOM_MAX_LEN = 25;
+const ROOM_REGEX = /^[a-zA-Z0-9]+$/;
+/** Each room is a namespace under this one; its users' namespaces sit under the room's. */
+const NS_ROOT = '/moqtail/demo';
+const RELAY_SCHEME = 'moqt://';
+const SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 
+const RELAY_STORAGE_KEY = 'meet.relay';
+/** Oldest message-log entries are dropped past this many. */
+const MESSAGE_LOG_LIMIT = 2000;
+
+/** The relay from appsettings.js, without its scheme. */
 function getDefaultRelay(): string {
-  const url = window.appSettings?.relayUrl ?? 'https://localhost:4433';
-  return url.replace(/^https?:\/\//, '');
+  const url = window.appSettings?.relayUrl ?? `${RELAY_SCHEME}localhost:4433`;
+  return url.replace(SCHEME_RE, '');
 }
+
+/** The relay picked in the settings pane, falling back to the default. */
+function getSavedRelay(): string {
+  try {
+    return localStorage.getItem(RELAY_STORAGE_KEY) || getDefaultRelay();
+  } catch {
+    return getDefaultRelay();
+  }
+}
+
+function saveRelay(relay: string) {
+  try {
+    if (relay === getDefaultRelay()) localStorage.removeItem(RELAY_STORAGE_KEY);
+    else localStorage.setItem(RELAY_STORAGE_KEY, relay);
+  } catch {
+    // Storage blocked: the choice still holds for this page load.
+  }
+}
+
+function toRelayUrl(input: string): string {
+  return `${RELAY_SCHEME}${input.trim().replace(SCHEME_RE, '')}`;
+}
+
+type Publication = {
+  namespace: Tuple;
+  videoFTN: FullTrackName;
+  audioFTN: FullTrackName;
+  getVideoStreamController: () => ReadableStreamDefaultController<MoqtObject> | null;
+  getAudioStreamController: () => ReadableStreamDefaultController<MoqtObject> | null;
+  videoRequestId: bigint;
+  audioRequestId: bigint;
+  /** Where the next encoder run picks its group numbering up from. */
+  videoGroupId: number;
+  audioGroupId: number;
+};
 
 function toTrackUsername(username: string): string {
   return username.trim().replace(/ /g, '-');
@@ -68,7 +120,10 @@ const GITHUB_REPO = 'moqtail/moqtail';
 export default function App() {
   const [screen, setScreen] = useState<Screen>('entrance');
   const [usernameInput, setUsernameInput] = useState('');
-  const [relayInput, setRelayInput] = useState(getDefaultRelay);
+  const [roomInput, setRoomInput] = useState('');
+  const [displayRoom, setDisplayRoom] = useState('');
+  const [relayInput, setRelayInput] = useState(getSavedRelay);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [displayUsername, setDisplayUsername] = useState('');
   const [peers, setPeers] = useState<string[]>([]);
   const [isCamOn, setIsCamOn] = useState(false);
@@ -76,16 +131,27 @@ export default function App() {
   const [isPublishing, setIsPublishing] = useState(false);
   const [isReceiving, setIsReceiving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [messageLog, setMessageLog] = useState<LogEntry[]>([]);
+  const [isMessageLogOpen, setIsMessageLogOpen] = useState(false);
+  // Mutated on every data event and read by the Data tab on a timer, so it never re-renders App.
+  const [dataStats] = useState(() => new DataStats());
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const stopEncoderRef = useRef<(() => Promise<void>) | null>(null);
+  type EncoderHandle = { stop: () => Promise<void>; currentGroupId: () => number };
+  const videoEncoderRef = useRef<EncoderHandle | null>(null);
+  const audioEncoderRef = useRef<
+    (EncoderHandle & { setEncoding: (enabled: boolean) => void }) | null
+  >(null);
+  const publicationRef = useRef<Publication | null>(null);
   // Stable refs for use inside async callbacks
   const moqClientRef = useRef<MOQtailClient | null>(null);
   const trackUsernameRef = useRef<string>('');
+  /** `/moqtail/demo/<room>/`, which every user namespace in the room starts with. */
+  const nsPrefixRef = useRef<string>('');
   const sendSignalRef = useRef<((text: string) => void) | null>(null);
   const isMicOnRef = useRef(false);
-  const subscribedNsRef = useRef(new Set<string>());
+  const subscribedTracksRef = useRef(new Set<string>());
   const signalCleanupRef = useRef<(() => void) | null>(null);
   // Per-peer canvas elements, decode workers, and pending streams (queued before worker is ready)
   const peerCanvasesRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
@@ -102,17 +168,36 @@ export default function App() {
     return null;
   }
 
-  async function subscribeNamespaceOnce(client: MOQtailClient, ns: Tuple) {
-    console.log('subscribeNamespaceOnce: ns: %s', ns.toUtf8Path());
+  function validateRoomInput(value: string): string | null {
+    if (!value) return 'Room name is required';
+    if (!ROOM_REGEX.test(value)) return 'Room name: only letters and numbers allowed';
+    if (value.length > ROOM_MAX_LEN) return `Room name: max ${ROOM_MAX_LEN} characters`;
+    return null;
+  }
+
+  async function subscribeTracksOnce(client: MOQtailClient, ns: Tuple) {
     const key = ns.toUtf8Path();
-    if (subscribedNsRef.current.has(key)) return;
-    subscribedNsRef.current.add(key);
-    const { response } = await client.subscribeNamespace(ns);
-    console.log('subscribeNamespaceOnce: response for ns %s: %o', ns.toUtf8Path(), response);
+    if (subscribedTracksRef.current.has(key)) return;
+    subscribedTracksRef.current.add(key);
+    const { response } = await client.subscribeTracks(ns);
+    console.log('subscribeTracksOnce: response for ns %s: %o', key, response);
     if (response instanceof RequestError) {
-      console.warn('subscribeNamespace failed for', key, ':', response);
-      subscribedNsRef.current.delete(key);
+      console.warn('subscribeTracks failed for', key, ':', response);
+      subscribedTracksRef.current.delete(key);
     }
+  }
+
+  function appendToMessageLog(entry: LogEntry) {
+    setMessageLog(prev =>
+      prev.length < MESSAGE_LOG_LIMIT ? [...prev, entry] : [...prev.slice(1), entry],
+    );
+  }
+
+  function logControlMessage(msg: ControlMessage, direction: MessageDirection) {
+    appendToMessageLog(toLogEntry(msg, direction));
+    // A PUBLISH names the alias its data streams will carry, in the direction it went.
+    if (msg instanceof Publish)
+      dataStats.nameAlias(direction === 'sent' ? 'out' : 'in', msg.trackAlias, msg.fullTrackName);
   }
 
   function addPeer(peerUsername: string) {
@@ -128,34 +213,44 @@ export default function App() {
   }
 
   async function handleEnter() {
-    const validationError = validateUsernameInput(usernameInput);
+    const validationError = validateRoomInput(roomInput) ?? validateUsernameInput(usernameInput);
     if (validationError) {
       setError(validationError);
       return;
     }
 
     const trackUsername = toTrackUsername(usernameInput);
+    const roomNamespace = `${NS_ROOT}/${roomInput}`;
+    const nsPrefix = `${roomNamespace}/`;
+    nsPrefixRef.current = nsPrefix;
     const token = generateToken();
-    const relayUrl = `https://${relayInput}`;
+    const relayUrl = toRelayUrl(relayInput);
 
     trackUsernameRef.current = trackUsername;
     setDisplayUsername(usernameInput.trim());
+    setDisplayRoom(roomInput);
     setError(null);
     setPeers([]);
-    subscribedNsRef.current.clear();
+    subscribedTracksRef.current.clear();
     peerCanvasesRef.current.clear();
     peerWorkersRef.current.clear();
     pendingStreamsRef.current.clear();
+    setMessageLog([]);
+    dataStats.reset();
     setScreen('connecting');
 
     try {
-      const client = await createMOQtailClient(relayUrl);
+      const client = await createMOQtailClient(relayUrl, {
+        onMessageSent: msg => logControlMessage(msg, 'sent'),
+        onMessageReceived: msg => logControlMessage(msg, 'received'),
+        onDataEvent: event => dataStats.add(event),
+      });
       moqClientRef.current = client;
 
       // Route incoming publish streams to the correct peer's decode worker
       client.onPeerPublish = (msg, stream) => {
         const nsPath = msg.fullTrackName.namespace.toUtf8Path();
-        const peerUsername = nsPath.startsWith(NS_PREFIX) ? nsPath.slice(NS_PREFIX.length) : null;
+        const peerUsername = nsPath.startsWith(nsPrefix) ? nsPath.slice(nsPrefix.length) : null;
         console.log('onPeerPublish | peerUsername: %s', peerUsername, nsPath);
         if (!peerUsername) return;
 
@@ -191,31 +286,44 @@ export default function App() {
 
       setScreen('main');
 
-      const { sendSignal, cleanup } = await setupSignalling(client, trackUsername, token, {
-        onPeerJoin: peerUsername => {
-          console.log('onPeerJoin peerUsername: %s', peerUsername);
-          addPeer(peerUsername);
-          const peerNs = Tuple.fromUtf8Path(`${NS_PREFIX}${peerUsername}`);
-          // add a random delay
-          delay(Math.ceil(Math.random() * 100)).then(_ => {
-            subscribeNamespaceOnce(client, peerNs);
-          });
+      const { sendSignal, cleanup } = await setupSignalling(
+        client,
+        roomNamespace,
+        trackUsername,
+        token,
+        {
+          onPeerJoin: peerUsername => {
+            console.log('onPeerJoin peerUsername: %s', peerUsername);
+            addPeer(peerUsername);
+            const peerNs = Tuple.fromUtf8Path(`${nsPrefix}${peerUsername}`);
+            // add a random delay
+            delay(Math.ceil(Math.random() * 100)).then(_ => {
+              subscribeTracksOnce(client, peerNs);
+            });
+          },
+          onOwnJoinWelcomed: peerUsername => {
+            console.log('onOwnJoinWelcomed: welcomed by %s', peerUsername);
+            addPeer(peerUsername);
+            const peerNs = Tuple.fromUtf8Path(`${nsPrefix}${peerUsername}`);
+            delay(Math.ceil(Math.random() * 100)).then(_ => {
+              subscribeTracksOnce(client, peerNs);
+            });
+          },
+          onDuplicateUser: () => {
+            console.warn('Duplicate username detected, returning to entrance');
+            // Drop the whole session, not just the signalling track: otherwise this name
+            // keeps its namespace announced and its tracks published from a page that has
+            // already gone back to the entrance screen.
+            void leaveRoom();
+            setError('Username already taken. Please choose a different one.');
+            setScreen('entrance');
+          },
+          onSignal: (text, direction, group) =>
+            appendToMessageLog(
+              toSignalEntry(text, direction, group, { username: trackUsername, token }),
+            ),
         },
-        onOwnJoinWelcomed: peerUsername => {
-          console.log('onOwnJoinWelcomed: welcomed by %s', peerUsername);
-          addPeer(peerUsername);
-          const peerNs = Tuple.fromUtf8Path(`${NS_PREFIX}${peerUsername}`);
-          delay(Math.ceil(Math.random() * 100)).then(_ => {
-            subscribeNamespaceOnce(client, peerNs);
-          });
-        },
-        onDuplicateUser: () => {
-          console.warn('Duplicate username detected, returning to entrance');
-          cleanup();
-          setError('Username already taken. Please choose a different one.');
-          setScreen('entrance');
-        },
-      });
+      );
 
       sendSignalRef.current = sendSignal;
       signalCleanupRef.current = cleanup;
@@ -226,10 +334,84 @@ export default function App() {
     }
   }
 
+  async function ensurePublication(
+    client: MOQtailClient,
+    trackUsername: string,
+  ): Promise<Publication | null> {
+    if (publicationRef.current) return publicationRef.current;
+
+    const namespace = Tuple.fromUtf8Path(`${nsPrefixRef.current}${trackUsername}`);
+    const videoFTN = FullTrackName.tryNew(namespace, 'video');
+    const audioFTN = FullTrackName.tryNew(namespace, 'audio');
+
+    await announceNamespaces(client, namespace);
+    const tracks = setupTracks(client, audioFTN, videoFTN);
+
+    const videoTrack = client.trackSources.get(videoFTN.toString())!;
+    const audioTrack = client.trackSources.get(audioFTN.toString())!;
+
+    const video = await client.publish(videoFTN, false, videoTrack.trackAlias!, undefined, [
+      new DefaultPublisherPriorityProperty(128),
+    ]);
+    if (video instanceof RequestError) {
+      console.error('publish rejected for the video track', video);
+      setError('The relay rejected the video track.');
+      await client.unpublishNamespace(namespace);
+      return null;
+    }
+
+    const audio = await client.publish(audioFTN, false, audioTrack.trackAlias!, undefined, [
+      new DefaultPublisherPriorityProperty(0),
+    ]);
+    if (audio instanceof RequestError) {
+      console.error('publish rejected for the audio track', audio);
+      setError('The relay rejected the audio track.');
+      // Leave nothing half-published: end the video track we just opened.
+      await client.publishDone(video.requestId);
+      await client.unpublishNamespace(namespace);
+      return null;
+    }
+
+    publicationRef.current = {
+      namespace,
+      videoFTN,
+      audioFTN,
+      getVideoStreamController: tracks.getVideoStreamController,
+      getAudioStreamController: tracks.getAudioStreamController,
+      videoRequestId: video.requestId,
+      audioRequestId: audio.requestId,
+      videoGroupId: 0,
+      audioGroupId: 0,
+    };
+    return publicationRef.current;
+  }
+
+  async function teardownPublication() {
+    const client = moqClientRef.current;
+    const publication = publicationRef.current;
+    publicationRef.current = null;
+    if (!client || !publication) return;
+    try {
+      await client.publishDone(publication.videoRequestId);
+      await client.publishDone(publication.audioRequestId);
+      await client.unpublishNamespace(publication.namespace);
+    } catch (err) {
+      console.warn('teardownPublication failed', err);
+    }
+  }
+
   async function startPublishing() {
     const client = moqClientRef.current;
     const trackUsername = trackUsernameRef.current;
     if (!client || !trackUsername) return;
+
+    setError(null);
+
+    const publication = await ensurePublication(client, trackUsername);
+    if (!publication) {
+      setIsCamOn(false);
+      return;
+    }
 
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { aspectRatio: 16 / 9 },
@@ -245,47 +427,42 @@ export default function App() {
       localVideoRef.current.muted = true;
     }
 
-    const userNs = Tuple.fromUtf8Path(`${NS_PREFIX}${trackUsername}`);
-    const videoFTN = FullTrackName.tryNew(userNs, 'video');
-    const audioFTN = FullTrackName.tryNew(userNs, 'audio');
-
-    await announceNamespaces(client, userNs);
-    const tracks = setupTracks(client, audioFTN, videoFTN);
-
-    const videoTrack = client.trackSources.get(videoFTN.toString())!;
-    const audioTrack = client.trackSources.get(audioFTN.toString())!;
-
-    await client.publish(videoFTN, true, videoTrack.trackAlias!, undefined, [
-      new DefaultPublisherPriorityExtension(128),
-    ]);
-    await client.publish(audioFTN, true, audioTrack.trackAlias!, undefined, [
-      new DefaultPublisherPriorityExtension(0),
-    ]);
-
-    const videoResult = await startVideoEncoder({
+    videoEncoderRef.current = await startVideoEncoder({
       stream,
-      videoFullTrackName: videoFTN,
-      videoStreamController: tracks.getVideoStreamController(),
+      videoFullTrackName: publication.videoFTN,
+      videoStreamController: publication.getVideoStreamController(),
       publisherPriority: 1,
       objectForwardingPreference: ObjectForwardingPreference.Subgroup,
+      startGroupId: publication.videoGroupId,
     });
 
-    await startAudioEncoder({
+    audioEncoderRef.current = await startAudioEncoder({
       stream,
-      audioFullTrackName: audioFTN,
-      audioStreamController: tracks.getAudioStreamController(),
+      audioFullTrackName: publication.audioFTN,
+      audioStreamController: publication.getAudioStreamController(),
       publisherPriority: 1,
-      audioGroupId: 0,
+      audioGroupId: publication.audioGroupId,
       objectForwardingPreference: ObjectForwardingPreference.Subgroup,
     });
+    // A muted track still yields silence, which would be encoded and sent: encode only
+    // while the mic is on.
+    audioEncoderRef.current.setEncoding(isMicOnRef.current);
 
-    stopEncoderRef.current = videoResult?.stop ?? null;
     setIsPublishing(true);
   }
 
   async function stopPublishing() {
-    await stopEncoderRef.current?.();
-    stopEncoderRef.current = null;
+    const publication = publicationRef.current;
+    if (publication) {
+      publication.videoGroupId =
+        videoEncoderRef.current?.currentGroupId() ?? publication.videoGroupId;
+      publication.audioGroupId =
+        audioEncoderRef.current?.currentGroupId() ?? publication.audioGroupId;
+    }
+    await videoEncoderRef.current?.stop();
+    videoEncoderRef.current = null;
+    await audioEncoderRef.current?.stop();
+    audioEncoderRef.current = null;
     mediaStreamRef.current?.getTracks().forEach(t => t.stop());
     mediaStreamRef.current = null;
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
@@ -295,12 +472,40 @@ export default function App() {
     setIsMicOn(false);
   }
 
+  /** Leaves the room: stops publishing, ends the tracks, and drops the session. */
+  async function leaveRoom() {
+    signalCleanupRef.current?.();
+    signalCleanupRef.current = null;
+    sendSignalRef.current = null;
+    await stopPublishing();
+    await teardownPublication();
+    subscribedTracksRef.current.clear();
+    const client = moqClientRef.current;
+    moqClientRef.current = null;
+    await client?.disconnect();
+  }
+
+  async function handleLeave() {
+    await leaveRoom();
+    peerWorkersRef.current.forEach(w => w.terminate());
+    setPeers([]);
+    setIsReceiving(false);
+    setError(null);
+    setScreen('entrance');
+  }
+
   async function toggleCam() {
     if (isCamOn) {
       await stopPublishing();
-    } else {
-      setIsCamOn(true);
+      return;
+    }
+    setIsCamOn(true);
+    try {
       await startPublishing();
+    } catch (err) {
+      console.error('startPublishing failed', err);
+      setError(err instanceof Error ? err.message : String(err));
+      setIsCamOn(false);
     }
   }
 
@@ -313,17 +518,29 @@ export default function App() {
         t.enabled = next;
       });
     }
+    audioEncoderRef.current?.setEncoding(next);
   }
 
   // ── Entrance screen ────────────────────────────────────────────────────────
   if (screen === 'entrance') {
+    const isRoomInvalid =
+      roomInput.length > 0 && (roomInput.length > ROOM_MAX_LEN || !ROOM_REGEX.test(roomInput));
     const isUsernameInvalid =
       usernameInput.length > 0 &&
       (usernameInput.length > USERNAME_MAX_LEN || !USERNAME_REGEX.test(usernameInput));
 
     return (
       <div className="flex min-h-dvh items-center justify-center bg-neutral-950 font-sans antialiased">
-        <div className="flex min-w-80 flex-col items-center gap-5 rounded-xl border border-white/6 bg-neutral-900/60 px-10 py-8 backdrop-blur-sm">
+        <div className="relative flex min-w-80 flex-col items-center gap-5 rounded-xl border border-white/6 bg-neutral-900/60 px-10 py-8 backdrop-blur-sm">
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            aria-label="Settings"
+            title="Settings"
+            className="absolute top-3 right-3 rounded-md p-1.5 text-neutral-500 transition-colors hover:bg-white/5 hover:text-neutral-200"
+          >
+            <Settings className="h-4 w-4" />
+          </button>
+
           <div className="flex items-center gap-2.5">
             <img src="/favicon.svg" alt="MOQtail logo" className="h-5 w-5" />
             <span className="text-sm font-semibold tracking-tight text-neutral-100">
@@ -332,6 +549,49 @@ export default function App() {
           </div>
 
           <div className="flex w-full flex-col gap-3">
+            <div className="flex flex-col gap-1.5">
+              <label className="text-xs font-medium text-neutral-400" htmlFor="room">
+                Room
+              </label>
+              <input
+                id="room"
+                type="text"
+                value={roomInput}
+                maxLength={ROOM_MAX_LEN}
+                placeholder="Room name"
+                autoFocus
+                spellCheck={false}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') handleEnter();
+                }}
+                onChange={e => {
+                  setRoomInput(e.target.value);
+                  setError(null);
+                }}
+                className={`w-full rounded-lg border bg-neutral-800/60 px-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 transition-colors outline-none focus:ring-1 ${
+                  isRoomInvalid
+                    ? 'border-red-500/40 focus:border-red-500/60 focus:ring-red-500/30'
+                    : 'border-white/8 focus:border-white/20 focus:ring-white/10'
+                }`}
+              />
+              <div className="flex items-center justify-between">
+                {isRoomInvalid ? (
+                  <span className="text-[11px] text-red-400">
+                    {!ROOM_REGEX.test(roomInput)
+                      ? 'Only letters and numbers'
+                      : `Max ${ROOM_MAX_LEN} characters`}
+                  </span>
+                ) : (
+                  <span />
+                )}
+                <span
+                  className={`ml-auto text-[11px] ${roomInput.length > ROOM_MAX_LEN ? 'text-red-400' : 'text-neutral-600'}`}
+                >
+                  {roomInput.length}/{ROOM_MAX_LEN}
+                </span>
+              </div>
+            </div>
+
             <div className="flex flex-col gap-1.5">
               <label className="text-xs font-medium text-neutral-400" htmlFor="username">
                 Username
@@ -342,7 +602,6 @@ export default function App() {
                 value={usernameInput}
                 maxLength={USERNAME_MAX_LEN}
                 placeholder="Your name"
-                autoFocus
                 onKeyDown={e => {
                   if (e.key === 'Enter') handleEnter();
                 }}
@@ -373,33 +632,21 @@ export default function App() {
                 </span>
               </div>
             </div>
-
-            <div className="flex flex-col gap-1.5">
-              <label className="text-xs font-medium text-neutral-400" htmlFor="relay">
-                Relay
-              </label>
-              <input
-                id="relay"
-                type="text"
-                value={relayInput}
-                onKeyDown={e => {
-                  if (e.key === 'Enter') handleEnter();
-                }}
-                onChange={e => {
-                  setRelayInput(e.target.value);
-                  setError(null);
-                }}
-                className="w-full rounded-lg border border-white/8 bg-neutral-800/60 px-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 transition-colors outline-none focus:border-white/20 focus:ring-1 focus:ring-white/10"
-              />
-            </div>
           </div>
 
           <button
             onClick={handleEnter}
-            disabled={isUsernameInvalid || !usernameInput.trim()}
+            disabled={isRoomInvalid || !roomInput || isUsernameInvalid || !usernameInput.trim()}
             className="w-full rounded-lg bg-blue-600 px-8 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-500 active:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-40"
           >
             Enter
+          </button>
+
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className="-mt-2 max-w-full truncate text-[11px] text-neutral-600 transition-colors hover:text-neutral-400"
+          >
+            Relay: {relayInput}
           </button>
 
           {error && (
@@ -408,6 +655,20 @@ export default function App() {
             </p>
           )}
         </div>
+
+        {isSettingsOpen && (
+          <SettingsPane
+            relay={relayInput}
+            defaultRelay={getDefaultRelay()}
+            onSave={relay => {
+              setRelayInput(relay);
+              saveRelay(relay);
+              setError(null);
+              setIsSettingsOpen(false);
+            }}
+            onClose={() => setIsSettingsOpen(false)}
+          />
+        )}
       </div>
     );
   }
@@ -436,6 +697,8 @@ export default function App() {
           <img src="/favicon.svg" alt="MOQtail logo" className="h-5 w-5" />
           <span className="text-sm font-semibold tracking-tight">Meet by MOQtail</span>
           <span className="text-neutral-700 select-none">·</span>
+          <span className="text-xs text-neutral-300 select-none">{displayRoom}</span>
+          <span className="text-neutral-700 select-none">·</span>
           <span className="text-xs text-neutral-400 select-none">{displayUsername}</span>
         </div>
         <div className="flex items-center gap-2">
@@ -449,6 +712,19 @@ export default function App() {
               Receiving
             </span>
           )}
+          <button
+            onClick={() => setIsMessageLogOpen(open => !open)}
+            aria-label="Messages"
+            aria-pressed={isMessageLogOpen}
+            title="Messages"
+            className={`rounded-md p-1.5 transition-colors ${
+              isMessageLogOpen
+                ? 'bg-white/10 text-neutral-100'
+                : 'text-neutral-400 hover:bg-white/5 hover:text-neutral-100'
+            }`}
+          >
+            <ScrollText className="h-4 w-4" />
+          </button>
           <a
             href={`https://github.com/${GITHUB_REPO}`}
             target="_blank"
@@ -461,84 +737,127 @@ export default function App() {
         </div>
       </header>
 
-      {/* Videos — fixed 3×2 grid: 1 local + 5 peer slots */}
-      <div className="grid min-h-0 flex-1 grid-cols-3 gap-4 p-4">
-        {/* Local */}
-        <div className="flex min-w-0 flex-col gap-2 rounded-xl border border-white/6 bg-neutral-900/60 p-3">
-          <span className="text-center text-[11px] font-semibold tracking-widest text-neutral-500 uppercase select-none">
-            {displayUsername} (You)
-          </span>
-          <video
-            ref={localVideoRef}
-            autoPlay
-            playsInline
-            muted
-            className="w-full rounded-lg bg-black"
-            style={{ aspectRatio: '16/9' }}
-          />
+      {/* Failures raised after the entrance screen -- a rejected PUBLISH, a camera that
+          would not open. Same palette as the entrance error, laid out as a strip so a
+          full sentence fits without crowding the header badges. */}
+      {error && (
+        <div
+          role="alert"
+          className="flex shrink-0 items-center justify-between gap-3 border-b border-red-500/20 bg-red-500/10 px-4 py-2 md:px-5"
+        >
+          <span className="text-xs leading-relaxed text-red-400">{error}</span>
+          <button
+            onClick={() => setError(null)}
+            aria-label="Dismiss"
+            className="shrink-0 rounded px-1.5 text-sm text-red-400/70 transition-colors hover:text-red-300"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      <div className="flex min-h-0 flex-1">
+        {/* Videos — fixed 3×2 grid: 1 local + 5 peer slots */}
+        <div className="grid min-h-0 min-w-0 flex-1 grid-cols-3 gap-4 overflow-y-auto p-4">
+          {/* Local */}
+          <div className="flex min-w-0 flex-col gap-2 rounded-xl border border-white/6 bg-neutral-900/60 p-3">
+            <span className="text-center text-[11px] font-semibold tracking-widest text-neutral-500 uppercase select-none">
+              {displayUsername} (You)
+            </span>
+            <video
+              ref={localVideoRef}
+              autoPlay
+              playsInline
+              muted
+              className="w-full rounded-lg bg-black"
+              style={{ aspectRatio: '16/9' }}
+            />
+          </div>
+
+          {/* 5 peer slots */}
+          {peerSlots.map((peerUsername, i) => (
+            <div
+              key={peerUsername ?? `empty-${i}`}
+              className="flex min-w-0 flex-col gap-2 rounded-xl border border-white/6 bg-neutral-900/60 p-3"
+            >
+              {peerUsername ? (
+                <>
+                  <span className="text-center text-[11px] font-semibold tracking-widest text-neutral-500 uppercase select-none">
+                    {peerUsername}
+                  </span>
+                  <canvas
+                    ref={el => {
+                      if (!el || peerCanvasesRef.current.has(peerUsername)) return;
+                      peerCanvasesRef.current.set(peerUsername, el);
+                      prepareReceiverForCanvas({ current: el }).then(w => {
+                        if (!w) return;
+                        peerWorkersRef.current.set(peerUsername, w);
+                        // Drain any streams that arrived before the worker was ready
+                        pendingStreamsRef.current.get(peerUsername)?.forEach(fn => fn(w));
+                        pendingStreamsRef.current.delete(peerUsername);
+                      });
+                    }}
+                    className="w-full rounded-lg bg-black"
+                    style={{ aspectRatio: '16/9' }}
+                  />
+                </>
+              ) : (
+                <div
+                  className="flex flex-1 items-center justify-center rounded-lg border border-dashed border-white/10"
+                  style={{ aspectRatio: '16/9' }}
+                >
+                  <span className="text-[11px] text-neutral-700 select-none">Waiting…</span>
+                </div>
+              )}
+            </div>
+          ))}
         </div>
 
-        {/* 5 peer slots */}
-        {peerSlots.map((peerUsername, i) => (
-          <div
-            key={peerUsername ?? `empty-${i}`}
-            className="flex min-w-0 flex-col gap-2 rounded-xl border border-white/6 bg-neutral-900/60 p-3"
-          >
-            {peerUsername ? (
-              <>
-                <span className="text-center text-[11px] font-semibold tracking-widest text-neutral-500 uppercase select-none">
-                  {peerUsername}
-                </span>
-                <canvas
-                  ref={el => {
-                    if (!el || peerCanvasesRef.current.has(peerUsername)) return;
-                    peerCanvasesRef.current.set(peerUsername, el);
-                    prepareReceiverForCanvas({ current: el }).then(w => {
-                      if (!w) return;
-                      peerWorkersRef.current.set(peerUsername, w);
-                      // Drain any streams that arrived before the worker was ready
-                      pendingStreamsRef.current.get(peerUsername)?.forEach(fn => fn(w));
-                      pendingStreamsRef.current.delete(peerUsername);
-                    });
-                  }}
-                  className="w-full rounded-lg bg-black"
-                  style={{ aspectRatio: '16/9' }}
-                />
-              </>
-            ) : (
-              <div
-                className="flex flex-1 items-center justify-center rounded-lg border border-dashed border-white/10"
-                style={{ aspectRatio: '16/9' }}
-              >
-                <span className="text-[11px] text-neutral-700 select-none">Waiting…</span>
-              </div>
-            )}
-          </div>
-        ))}
+        <MessageLogPane
+          isOpen={isMessageLogOpen}
+
+          entries={messageLog}
+
+          dataStats={dataStats}
+
+          onResetData={() => dataStats.reset()}
+
+          onClear={() => setMessageLog([])}
+
+          onClose={() => setIsMessageLogOpen(false)}
+        />
       </div>
 
       {/* Controls */}
-      <div className="flex shrink-0 items-center justify-center gap-3 border-t border-white/6 px-4 py-3">
-        <button
-          onClick={toggleCam}
-          className={`rounded-lg px-8 py-2 text-sm font-medium transition-colors ${
-            isCamOn
-              ? 'bg-blue-600 text-white hover:bg-blue-500 active:bg-blue-700'
-              : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700 active:bg-neutral-900'
-          }`}
-        >
-          {isCamOn ? 'Cam On' : 'Cam Off'}
-        </button>
+      <div className="flex shrink-0 items-center justify-center gap-4 border-t border-white/6 px-6 py-4">
         <button
           onClick={toggleMic}
           disabled={!isCamOn}
-          className={`rounded-lg px-8 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-            isMicOn
-              ? 'bg-blue-600 text-white hover:bg-blue-500 active:bg-blue-700'
-              : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700 active:bg-neutral-900'
+          aria-label={isMicOn ? 'Turn microphone off' : 'Turn microphone on'}
+          title={isMicOn ? 'Turn microphone off' : 'Turn microphone on'}
+          className={`rounded-full p-3 text-white transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-40 ${
+            isMicOn ? 'bg-neutral-700 hover:bg-neutral-600' : 'bg-red-600 hover:bg-red-700'
           }`}
         >
-          {isMicOn ? 'Mic On' : 'Mic Off'}
+          {isMicOn ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
+        </button>
+        <button
+          onClick={toggleCam}
+          aria-label={isCamOn ? 'Turn camera off' : 'Turn camera on'}
+          title={isCamOn ? 'Turn camera off' : 'Turn camera on'}
+          className={`rounded-full p-3 text-white transition-all duration-200 ${
+            isCamOn ? 'bg-neutral-700 hover:bg-neutral-600' : 'bg-red-600 hover:bg-red-700'
+          }`}
+        >
+          {isCamOn ? <Video className="h-5 w-5" /> : <VideoOff className="h-5 w-5" />}
+        </button>
+        <button
+          onClick={handleLeave}
+          aria-label="Leave"
+          title="Leave"
+          className="ml-8 rounded-full bg-red-600 p-3 text-white transition-all duration-200 hover:bg-red-700"
+        >
+          <PhoneOff className="h-5 w-5 rotate-135" />
         </button>
       </div>
     </div>

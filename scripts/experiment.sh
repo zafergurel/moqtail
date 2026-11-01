@@ -72,20 +72,20 @@ source "$ENV_FILE"
 
 RELAY_PORT="${RELAY_PORT:-4433}"
 RELAY_HOST_IP="${RELAY_SSH##*@}"
-RELAY_URL="https://${RELAY_HOST_IP}:${RELAY_PORT}"
+RELAY_URL="moqt://${RELAY_HOST_IP}:${RELAY_PORT}"
 NAMESPACE="${NAMESPACE:-moqtail-experiment}"
 
 PUB_SSH="${PUB_SSH:-}"
 PUB_PROJECT="${PUB_PROJECT:-$ROOT_DIR}"
 if [ -n "$PUB_SSH" ] && [ "$PUB_SSH" = "$RELAY_SSH" ]; then
-  PUB_RELAY_URL="https://127.0.0.1:${RELAY_PORT}"
+  PUB_RELAY_URL="moqt://127.0.0.1:${RELAY_PORT}"
 else
   PUB_RELAY_URL="$RELAY_URL"
 fi
 
 # ── Experiment defaults ─────────────────────────────────────────────────────────
 
-ALL_METHODS=("switch" "sub-update-forward" "joining-fetch")
+ALL_METHODS=("switch" "sub-update-forward")
 SWITCH_AFTER=4400
 JITTER_BUFFER_MS=500
 REPS=3
@@ -326,7 +326,7 @@ do_build() {
 
 start_relay() {
   log "Stopping any lingering relay on relay host..."
-  relay_ssh "pkill -x relay 2>/dev/null; true"
+  relay_ssh "pkill -INT -x relay 2>/dev/null; true"
   sleep 2
 
   log "Starting relay on relay host (port $RELAY_PORT)..."
@@ -345,7 +345,7 @@ PYEOF"
 stop_relay() {
   log "Stopping relay on relay host..."
   relay_ssh "[ -f /tmp/moqtail-relay.pid ] && \
-    kill \$(cat /tmp/moqtail-relay.pid) 2>/dev/null; \
+    kill -INT \$(cat /tmp/moqtail-relay.pid) 2>/dev/null; \
     rm -f /tmp/moqtail-relay.pid; \
     true"
 }
@@ -514,7 +514,7 @@ run_one() {
     --no-cert-validation \
     --track-sequence "$sequence" \
     --method "$method" \
-    --switch-after "$SWITCH_AFTER" \
+    --switch-after-ms "$SWITCH_AFTER" \
     --jitter-buffer-ms "$JITTER_BUFFER_MS" \
     --bandwidth-cap-bps "$bw" \
     --output-json "$outfile"; then

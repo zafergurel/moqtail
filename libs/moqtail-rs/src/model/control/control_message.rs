@@ -17,15 +17,12 @@ use crate::model::error::ParseError;
 use bytes::{Buf, Bytes};
 
 use super::{
-  client_setup::ClientSetup, constant::ControlMessageType, fetch::Fetch, fetch_cancel::FetchCancel,
-  fetch_ok::FetchOk, goaway::GoAway, max_request_id::MaxRequestId, namespace::Namespace,
-  namespace_done::NamespaceDone, publish::Publish, publish_done::PublishDone,
-  publish_namespace::PublishNamespace, publish_namespace_cancel::PublishNamespaceCancel,
-  publish_namespace_done::PublishNamespaceDone, publish_ok::PublishOk, request_error::RequestError,
-  request_ok::RequestOk, request_update::RequestUpdate, requests_blocked::RequestsBlocked,
-  server_setup::ServerSetup, subscribe::Subscribe, subscribe_namespace::SubscribeNamespace,
-  subscribe_ok::SubscribeOk, switch::Switch, track_status::TrackStatus, unsubscribe::Unsubscribe,
-  unsubscribe_namespace::UnsubscribeNamespace,
+  constant::ControlMessageType, fetch::Fetch, fetch_ok::FetchOk, goaway::GoAway,
+  namespace::Namespace, namespace_done::NamespaceDone, publish::Publish, publish_done::PublishDone,
+  publish_namespace::PublishNamespace, publish_skipped::PublishSkipped,
+  request_error::RequestError, request_ok::RequestOk, request_update::RequestUpdate, setup::Setup,
+  subscribe::Subscribe, subscribe_namespace::SubscribeNamespace, subscribe_ok::SubscribeOk,
+  subscribe_tracks::SubscribeTracks, track_status::TrackStatus,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,29 +30,21 @@ pub enum ControlMessage {
   Namespace(Box<Namespace>),
   NamespaceDone(Box<NamespaceDone>),
   PublishNamespace(Box<PublishNamespace>),
-  PublishNamespaceCancel(Box<PublishNamespaceCancel>),
   RequestOk(Box<RequestOk>),
   Publish(Box<Publish>),
-  PublishOk(Box<PublishOk>),
   PublishDone(Box<PublishDone>),
-  ClientSetup(Box<ClientSetup>),
   Fetch(Box<Fetch>),
-  FetchCancel(Box<FetchCancel>),
   FetchOk(Box<FetchOk>),
   Goaway(Box<GoAway>),
-  MaxRequestId(Box<MaxRequestId>),
-  ServerSetup(Box<ServerSetup>),
+  Setup(Box<Setup>),
   Subscribe(Box<Subscribe>),
   SubscribeOk(Box<SubscribeOk>),
   RequestUpdate(Box<RequestUpdate>),
-  RequestsBlocked(Box<RequestsBlocked>),
   TrackStatus(Box<TrackStatus>),
-  PublishNamespaceDone(Box<PublishNamespaceDone>),
-  Unsubscribe(Box<Unsubscribe>),
   SubscribeNamespace(Box<SubscribeNamespace>),
+  SubscribeTracks(Box<SubscribeTracks>),
   RequestError(Box<RequestError>),
-  UnsubscribeNamespace(Box<UnsubscribeNamespace>),
-  Switch(Box<Switch>),
+  PublishSkipped(Box<PublishSkipped>),
 }
 
 pub trait ControlMessageTrait: std::fmt::Debug {
@@ -99,13 +88,6 @@ impl ControlMessage {
       ControlMessageType::PublishNamespace => {
         PublishNamespace::parse_payload(&mut payload).map(ControlMessage::PublishNamespace)
       }
-      ControlMessageType::PublishNamespaceCancel => {
-        PublishNamespaceCancel::parse_payload(&mut payload)
-          .map(ControlMessage::PublishNamespaceCancel)
-      }
-      ControlMessageType::PublishNamespaceDone => {
-        PublishNamespaceDone::parse_payload(&mut payload).map(ControlMessage::PublishNamespaceDone)
-      }
       ControlMessageType::RequestError => {
         RequestError::parse_payload(&mut payload).map(ControlMessage::RequestError)
       }
@@ -115,29 +97,20 @@ impl ControlMessage {
       ControlMessageType::Publish => {
         Publish::parse_payload(&mut payload).map(ControlMessage::Publish)
       }
+      // PUBLISH_OK (0x1E) is a REQUEST_OK alias with no body of its own: PUBLISH is
+      // answered by REQUEST_OK. Parse its body as REQUEST_OK.
       ControlMessageType::PublishOk => {
-        PublishOk::parse_payload(&mut payload).map(ControlMessage::PublishOk)
+        RequestOk::parse_payload(&mut payload).map(ControlMessage::RequestOk)
       }
       ControlMessageType::PublishDone => {
         PublishDone::parse_payload(&mut payload).map(ControlMessage::PublishDone)
       }
-      ControlMessageType::ClientSetup => {
-        ClientSetup::parse_payload(&mut payload).map(ControlMessage::ClientSetup)
-      }
+      ControlMessageType::Setup => Setup::parse_payload(&mut payload).map(ControlMessage::Setup),
       ControlMessageType::Fetch => Fetch::parse_payload(&mut payload).map(ControlMessage::Fetch),
-      ControlMessageType::FetchCancel => {
-        FetchCancel::parse_payload(&mut payload).map(ControlMessage::FetchCancel)
-      }
       ControlMessageType::FetchOk => {
         FetchOk::parse_payload(&mut payload).map(ControlMessage::FetchOk)
       }
       ControlMessageType::GoAway => GoAway::parse_payload(&mut payload).map(ControlMessage::Goaway),
-      ControlMessageType::MaxRequestId => {
-        MaxRequestId::parse_payload(&mut payload).map(ControlMessage::MaxRequestId)
-      }
-      ControlMessageType::ServerSetup => {
-        ServerSetup::parse_payload(&mut payload).map(ControlMessage::ServerSetup)
-      }
       ControlMessageType::Subscribe => {
         Subscribe::parse_payload(&mut payload).map(ControlMessage::Subscribe)
       }
@@ -147,22 +120,18 @@ impl ControlMessage {
       ControlMessageType::RequestUpdate => {
         RequestUpdate::parse_payload(&mut payload).map(ControlMessage::RequestUpdate)
       }
-      ControlMessageType::RequestsBlocked => {
-        RequestsBlocked::parse_payload(&mut payload).map(ControlMessage::RequestsBlocked)
-      }
       ControlMessageType::TrackStatus => {
         TrackStatus::parse_payload(&mut payload).map(ControlMessage::TrackStatus)
-      }
-      ControlMessageType::Unsubscribe => {
-        Unsubscribe::parse_payload(&mut payload).map(ControlMessage::Unsubscribe)
       }
       ControlMessageType::SubscribeNamespace => {
         SubscribeNamespace::parse_payload(&mut payload).map(ControlMessage::SubscribeNamespace)
       }
-      ControlMessageType::UnsubscribeNamespace => {
-        UnsubscribeNamespace::parse_payload(&mut payload).map(ControlMessage::UnsubscribeNamespace)
+      ControlMessageType::SubscribeTracks => {
+        SubscribeTracks::parse_payload(&mut payload).map(ControlMessage::SubscribeTracks)
       }
-      ControlMessageType::Switch => Switch::parse_payload(&mut payload).map(ControlMessage::Switch),
+      ControlMessageType::PublishSkipped => {
+        PublishSkipped::parse_payload(&mut payload).map(ControlMessage::PublishSkipped)
+      }
     }
     .map_err(|err| ParseError::ProtocolViolation {
       context: "ControlMessage::deserialize(payload)",
@@ -186,29 +155,21 @@ impl ControlMessage {
       ControlMessage::Namespace(msg) => msg.serialize(),
       ControlMessage::NamespaceDone(msg) => msg.serialize(),
       ControlMessage::PublishNamespace(msg) => msg.serialize(),
-      ControlMessage::PublishNamespaceCancel(msg) => msg.serialize(),
-      ControlMessage::PublishNamespaceDone(msg) => msg.serialize(),
       ControlMessage::RequestError(msg) => msg.serialize(),
       ControlMessage::RequestOk(msg) => msg.serialize(),
       ControlMessage::Publish(msg) => msg.serialize(),
-      ControlMessage::PublishOk(msg) => msg.serialize(),
       ControlMessage::PublishDone(msg) => msg.serialize(),
-      ControlMessage::ClientSetup(msg) => msg.serialize(),
       ControlMessage::Fetch(msg) => msg.serialize(),
-      ControlMessage::FetchCancel(msg) => msg.serialize(),
       ControlMessage::FetchOk(msg) => msg.serialize(),
       ControlMessage::Goaway(msg) => msg.serialize(),
-      ControlMessage::MaxRequestId(msg) => msg.serialize(),
-      ControlMessage::ServerSetup(msg) => msg.serialize(),
+      ControlMessage::Setup(msg) => msg.serialize(),
       ControlMessage::Subscribe(msg) => msg.serialize(),
       ControlMessage::SubscribeOk(msg) => msg.serialize(),
       ControlMessage::RequestUpdate(msg) => msg.serialize(),
-      ControlMessage::RequestsBlocked(msg) => msg.serialize(),
       ControlMessage::TrackStatus(msg) => msg.serialize(),
-      ControlMessage::Unsubscribe(msg) => msg.serialize(),
       ControlMessage::SubscribeNamespace(msg) => msg.serialize(),
-      ControlMessage::UnsubscribeNamespace(msg) => msg.serialize(),
-      ControlMessage::Switch(msg) => msg.serialize(),
+      ControlMessage::SubscribeTracks(msg) => msg.serialize(),
+      ControlMessage::PublishSkipped(msg) => msg.serialize(),
     }
   }
 
@@ -218,29 +179,37 @@ impl ControlMessage {
       ControlMessage::Namespace(_) => ControlMessageType::Namespace,
       ControlMessage::NamespaceDone(_) => ControlMessageType::NamespaceDone,
       ControlMessage::PublishNamespace(_) => ControlMessageType::PublishNamespace,
-      ControlMessage::PublishNamespaceCancel(_) => ControlMessageType::PublishNamespaceCancel,
-      ControlMessage::PublishNamespaceDone(_) => ControlMessageType::PublishNamespaceDone,
       ControlMessage::RequestError(_) => ControlMessageType::RequestError,
       ControlMessage::RequestOk(_) => ControlMessageType::RequestOk,
       ControlMessage::Publish(_) => ControlMessageType::Publish,
-      ControlMessage::PublishOk(_) => ControlMessageType::PublishOk,
       ControlMessage::PublishDone(_) => ControlMessageType::PublishDone,
-      ControlMessage::ClientSetup(_) => ControlMessageType::ClientSetup,
       ControlMessage::Fetch(_) => ControlMessageType::Fetch,
-      ControlMessage::FetchCancel(_) => ControlMessageType::FetchCancel,
       ControlMessage::FetchOk(_) => ControlMessageType::FetchOk,
       ControlMessage::Goaway(_) => ControlMessageType::GoAway,
-      ControlMessage::MaxRequestId(_) => ControlMessageType::MaxRequestId,
-      ControlMessage::ServerSetup(_) => ControlMessageType::ServerSetup,
+      ControlMessage::Setup(_) => ControlMessageType::Setup,
       ControlMessage::Subscribe(_) => ControlMessageType::Subscribe,
       ControlMessage::SubscribeOk(_) => ControlMessageType::SubscribeOk,
       ControlMessage::RequestUpdate(_) => ControlMessageType::RequestUpdate,
-      ControlMessage::RequestsBlocked(_) => ControlMessageType::RequestsBlocked,
       ControlMessage::TrackStatus(_) => ControlMessageType::TrackStatus,
-      ControlMessage::Unsubscribe(_) => ControlMessageType::Unsubscribe,
       ControlMessage::SubscribeNamespace(_) => ControlMessageType::SubscribeNamespace,
-      ControlMessage::UnsubscribeNamespace(_) => ControlMessageType::UnsubscribeNamespace,
-      ControlMessage::Switch(_) => ControlMessageType::Switch,
+      ControlMessage::SubscribeTracks(_) => ControlMessageType::SubscribeTracks,
+      ControlMessage::PublishSkipped(_) => ControlMessageType::PublishSkipped,
+    }
+  }
+
+  /// The Request ID a request message consumes, or `None` for a message that is not
+  /// a request. Responses carry none: they travel on their request's own stream.
+  pub fn request_id(&self) -> Option<u64> {
+    match self {
+      ControlMessage::Subscribe(m) => Some(m.request_id),
+      ControlMessage::Publish(m) => Some(m.request_id),
+      ControlMessage::Fetch(m) => Some(m.request_id),
+      ControlMessage::SubscribeNamespace(m) => Some(m.request_id),
+      ControlMessage::SubscribeTracks(m) => Some(m.request_id),
+      ControlMessage::PublishNamespace(m) => Some(m.request_id),
+      ControlMessage::RequestUpdate(m) => Some(m.request_id),
+      ControlMessage::TrackStatus(m) => Some(m.request_id),
+      _ => None,
     }
   }
 }
@@ -253,6 +222,18 @@ mod tests {
   };
 
   use super::*;
+
+  #[test]
+  fn a_request_reports_its_request_id() {
+    let update = ControlMessage::RequestUpdate(Box::new(RequestUpdate::new(42, vec![])));
+    assert_eq!(update.request_id(), Some(42));
+  }
+
+  #[test]
+  fn a_message_that_is_not_a_request_has_no_request_id() {
+    let goaway = ControlMessage::Goaway(Box::new(GoAway::new(None, 0)));
+    assert_eq!(goaway.request_id(), None);
+  }
 
   #[test]
   fn test_announce_roundtrip() {

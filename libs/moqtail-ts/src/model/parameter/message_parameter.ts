@@ -14,29 +14,49 @@
  * limitations under the License.
  */
 
-import { KeyValuePair } from '../common/pair'
-import { FilterType } from '../control/constant'
+import { KeyValuePair, deserializeKvpList, isBytes, isVarInt, serializeKvpList } from '../common/pair'
+import { BaseByteBuffer, ByteBuffer, FrozenByteBuffer } from '../common/byte_buffer'
+import { greaseValue } from '../common/grease'
+import { ProtocolViolationError } from '../error/error'
+import { GroupOrder, LocationFilterType, SwitchMode } from '../control/constant'
+import { MessageParameterType } from './constant'
 import { Location } from '../common'
 import { AuthorizationToken } from './common'
-import { DeliveryTimeout } from './message/delivery_timeout'
+import { FillTimeout } from './message/fill_timeout'
+import { ObjectDeliveryTimeout } from './message/object_delivery_timeout'
+import { RendezvousTimeout } from './message/rendezvous_timeout'
+import { SubgroupDeliveryTimeout } from './message/subgroup_delivery_timeout'
 import { Expires } from './message/expires'
 import { Forward } from './message/forward'
+import { IncludeProperties } from './message/include_properties'
 import { GroupOrderParam } from './message/group_order_param'
 import { LargestObject } from './message/largest_object'
 import { NewGroupRequest } from './message/new_group_request'
+import { SwitchingSetAssignment } from './message/switching_set_assignment'
 import { SubscriberPriority } from './message/subscriber_priority'
-import { SubscriptionFilter } from './message/subscription_filter'
+import { LocationFilter } from './message/location_filter'
+import { SwitchFrom } from './message/switch_from'
+import { FillParameters } from './message/fill_parameters'
+import { RangeFilter, RangeFilterKind, encodeRanges } from './message/range_filter'
 
 export type MessageParameter =
-  | DeliveryTimeout
+  | ObjectDeliveryTimeout
+  | SubgroupDeliveryTimeout
+  | RendezvousTimeout
+  | FillTimeout
   | AuthorizationToken
   | Expires
   | LargestObject
   | Forward
   | SubscriberPriority
   | GroupOrderParam
-  | SubscriptionFilter
+  | LocationFilter
   | NewGroupRequest
+  | SwitchFrom
+  | FillParameters
+  | RangeFilter
+  | IncludeProperties
+  | SwitchingSetAssignment
 
 export namespace MessageParameter {
   /**
@@ -46,15 +66,23 @@ export namespace MessageParameter {
    */
   export function fromKeyValuePair(pair: KeyValuePair): MessageParameter | undefined {
     return (
-      DeliveryTimeout.fromKeyValuePair(pair) ??
+      ObjectDeliveryTimeout.fromKeyValuePair(pair) ??
+      SubgroupDeliveryTimeout.fromKeyValuePair(pair) ??
+      RendezvousTimeout.fromKeyValuePair(pair) ??
+      FillTimeout.fromKeyValuePair(pair) ??
       AuthorizationToken.fromKeyValuePair(pair) ??
       Expires.fromKeyValuePair(pair) ??
       LargestObject.fromKeyValuePair(pair) ??
       Forward.fromKeyValuePair(pair) ??
       SubscriberPriority.fromKeyValuePair(pair) ??
       GroupOrderParam.fromKeyValuePair(pair) ??
-      SubscriptionFilter.fromKeyValuePair(pair) ??
-      NewGroupRequest.fromKeyValuePair(pair)
+      LocationFilter.fromKeyValuePair(pair) ??
+      NewGroupRequest.fromKeyValuePair(pair) ??
+      SwitchFrom.fromKeyValuePair(pair) ??
+      FillParameters.fromKeyValuePair(pair) ??
+      RangeFilter.fromKeyValuePair(pair) ??
+      IncludeProperties.fromKeyValuePair(pair) ??
+      SwitchingSetAssignment.fromKeyValuePair(pair)
     )
   }
 
@@ -62,8 +90,20 @@ export namespace MessageParameter {
     return param.toKeyValuePair()
   }
 
-  export function isDeliveryTimeout(param: MessageParameter): param is DeliveryTimeout {
-    return param instanceof DeliveryTimeout
+  export function isObjectDeliveryTimeout(param: MessageParameter): param is ObjectDeliveryTimeout {
+    return param instanceof ObjectDeliveryTimeout
+  }
+
+  export function isSubgroupDeliveryTimeout(param: MessageParameter): param is SubgroupDeliveryTimeout {
+    return param instanceof SubgroupDeliveryTimeout
+  }
+
+  export function isRendezvousTimeout(param: MessageParameter): param is RendezvousTimeout {
+    return param instanceof RendezvousTimeout
+  }
+
+  export function isFillTimeout(param: MessageParameter): param is FillTimeout {
+    return param instanceof FillTimeout
   }
 
   export function isAuthorizationToken(param: MessageParameter): param is AuthorizationToken {
@@ -90,18 +130,70 @@ export namespace MessageParameter {
     return param instanceof GroupOrderParam
   }
 
-  export function isSubscriptionFilter(param: MessageParameter): param is SubscriptionFilter {
-    return param instanceof SubscriptionFilter
+  export function isSwitchingSetAssignment(param: MessageParameter): param is SwitchingSetAssignment {
+    return param instanceof SwitchingSetAssignment
+  }
+
+  /** The negotiated Group Order, or {@link (GroupOrder:enum).Original} when unparameterized. */
+  export function groupOrderOf(params: readonly MessageParameter[]): GroupOrder {
+    return params.find(isGroupOrderParam)?.order ?? GroupOrder.Original
+  }
+
+  export function isLocationFilter(param: MessageParameter): param is LocationFilter {
+    return param instanceof LocationFilter
   }
 
   export function isNewGroupRequest(param: MessageParameter): param is NewGroupRequest {
     return param instanceof NewGroupRequest
   }
+
+  export function isSwitchFrom(param: MessageParameter): param is SwitchFrom {
+    return param instanceof SwitchFrom
+  }
+
+  export function isFillParameters(param: MessageParameter): param is FillParameters {
+    return param instanceof FillParameters
+  }
+
+  export function isRangeFilter(param: MessageParameter): param is RangeFilter {
+    return param instanceof RangeFilter
+  }
+
+  /**
+   * Whether `params` carry a Range Filter, either directly or inside FILL_PARAMETERS,
+   * removals included. An endpoint that allows no filter ranges rejects any of them.
+   */
+  export function carriesRangeFilter(params: readonly MessageParameter[]): boolean {
+    return params.some((p) => isRangeFilter(p) || (isFillParameters(p) && carriesRangeFilter(p.parameters)))
+  }
+
+  export function isIncludeProperties(param: MessageParameter): param is IncludeProperties {
+    return param instanceof IncludeProperties
+  }
+
+  /**
+   * The parameters a PUBLISH answering a SUBSCRIBE_TRACKS states: the request's
+   * settings that a PUBLISH can carry (FORWARD, GROUP_ORDER, LOCATION_FILTER), which
+   * are the new subscription's initial settings. AUTHORIZATION_TOKEN is never copied.
+   * The Range Filters, FILL_PARAMETERS and INCLUDE_PROPERTIES cannot go in a PUBLISH;
+   * they are the publisher's to apply.
+   */
+  export function publishParametersFor(subscribeTracks: readonly MessageParameter[]): MessageParameter[] {
+    return subscribeTracks.filter((p) => isForward(p) || isGroupOrderParam(p) || isLocationFilter(p))
+  }
+
+  /**
+   * Whether a request's response should carry Track Properties: false only when it
+   * has INCLUDE_PROPERTIES set to 0.
+   */
+  export function includesProperties(params: readonly MessageParameter[]): boolean {
+    return !params.some((p) => isIncludeProperties(p) && !p.include)
+  }
 }
 
 /**
  * Builder for constructing a list of MessageParameters.
- * Mirrors the SetupParameters builder pattern.
+ * Mirrors the SetupOptions builder pattern.
  */
 export class MessageParameters {
   private params: MessageParameter[] = []
@@ -111,8 +203,20 @@ export class MessageParameters {
     return this
   }
 
-  addDeliveryTimeout(timeout: bigint | number): this {
-    return this.add(new DeliveryTimeout(BigInt(timeout)))
+  addObjectDeliveryTimeout(timeout: bigint | number): this {
+    return this.add(new ObjectDeliveryTimeout(BigInt(timeout)))
+  }
+
+  addSubgroupDeliveryTimeout(timeout: bigint | number): this {
+    return this.add(new SubgroupDeliveryTimeout(BigInt(timeout)))
+  }
+
+  addRendezvousTimeout(timeout: bigint | number): this {
+    return this.add(new RendezvousTimeout(BigInt(timeout)))
+  }
+
+  addFillTimeout(timeout: bigint | number): this {
+    return this.add(new FillTimeout(BigInt(timeout)))
   }
 
   addAuthorizationToken(token: AuthorizationToken): this {
@@ -127,6 +231,10 @@ export class MessageParameters {
     return this.add(new Forward(forward))
   }
 
+  addIncludeProperties(include: boolean): this {
+    return this.add(new IncludeProperties(include))
+  }
+
   addSubscriberPriority(priority: number): this {
     return this.add(new SubscriberPriority(priority))
   }
@@ -135,12 +243,24 @@ export class MessageParameters {
     return this.add(new GroupOrderParam(order))
   }
 
-  addSubscriptionFilter(filter: SubscriptionFilter): this {
+  addLocationFilter(filter: LocationFilter): this {
     return this.add(filter)
   }
 
   addNewGroupRequest(group: bigint | number): this {
     return this.add(new NewGroupRequest(BigInt(group)))
+  }
+
+  addSwitchFrom(requestId: bigint | number, mode: SwitchMode, publishDone: boolean): this {
+    return this.add(new SwitchFrom(BigInt(requestId), mode, publishDone))
+  }
+
+  addFillParameters(parameters: MessageParameter[]): this {
+    return this.add(new FillParameters(parameters))
+  }
+
+  addRangeFilter(filter: RangeFilter): this {
+    return this.add(filter)
   }
 
   build(): MessageParameter[] {
@@ -163,20 +283,138 @@ export class MessageParameters {
 }
 
 /**
+ * How a message parameter's Value is laid out on the wire. The parameter Type
+ * decides this, not its parity, and reading one the wrong way desyncs the rest
+ * of the list. The same Type number means something else in the setup-option
+ * namespace, so this belongs here and not in the shared codec.
+ */
+enum ValueShape {
+  VarInt,
+  /** A single byte: FORWARD, SUBSCRIBER_PRIORITY, GROUP_ORDER, INCLUDE_PROPERTIES. */
+  Uint8,
+  /** Two varints, no length prefix: LARGEST_OBJECT. */
+  BareLocation,
+  /** A Location Filter Type and the varints it calls for, no length prefix. */
+  LocationFilter,
+  LengthPrefixedBytes,
+}
+
+function valueShapeOf(typeValue: bigint): ValueShape {
+  switch (typeValue) {
+    case BigInt(MessageParameterType.Forward):
+    case BigInt(MessageParameterType.SubscriberPriority):
+    case BigInt(MessageParameterType.GroupOrder):
+    case BigInt(MessageParameterType.IncludeProperties):
+      return ValueShape.Uint8
+    case BigInt(MessageParameterType.LargestObject):
+      return ValueShape.BareLocation
+    case BigInt(MessageParameterType.LocationFilter):
+      return ValueShape.LocationFilter
+    case BigInt(MessageParameterType.SwitchFrom):
+    case BigInt(MessageParameterType.TrackNamespacePrefix):
+    case BigInt(MessageParameterType.SubgroupFilter):
+    case BigInt(MessageParameterType.ObjectIdFilter):
+    case BigInt(MessageParameterType.PriorityFilter):
+    case BigInt(MessageParameterType.ObjectPropertyFilter):
+    case BigInt(MessageParameterType.TrackPropertyFilter):
+      return ValueShape.LengthPrefixedBytes
+    default:
+      return typeValue % 2n === 0n ? ValueShape.VarInt : ValueShape.LengthPrefixedBytes
+  }
+}
+
+/**
+ * Serializes a list of message-parameter KVPs, delta-encoding the Types.
+ * Mirrors {@link serializeKvpList} but honours per-parameter value encodings.
+ */
+export function serializeMessageParameterKvps(items: KeyValuePair[]): FrozenByteBuffer {
+  const sorted = [...items].sort((a, b) => (a.typeValue < b.typeValue ? -1 : a.typeValue > b.typeValue ? 1 : 0))
+  const buf = new ByteBuffer()
+  let prevType = 0n
+  for (const kvp of sorted) {
+    buf.putVI(kvp.typeValue - prevType)
+    switch (valueShapeOf(kvp.typeValue)) {
+      case ValueShape.Uint8:
+        if (!isVarInt(kvp) || kvp.value < 0n || kvp.value > 255n) {
+          throw new ProtocolViolationError(
+            'serializeMessageParameterKvps',
+            `uint8 parameter 0x${kvp.typeValue.toString(16)} value ${kvp.value} exceeds 255`,
+          )
+        }
+        buf.putU8(Number(kvp.value))
+        break
+      case ValueShape.BareLocation:
+      case ValueShape.LocationFilter:
+        if (isBytes(kvp)) buf.putBytes(kvp.value)
+        break
+      case ValueShape.LengthPrefixedBytes:
+        if (isBytes(kvp)) buf.putLengthPrefixedBytes(kvp.value)
+        break
+      case ValueShape.VarInt:
+        if (isVarInt(kvp)) buf.putVI(kvp.value)
+        break
+    }
+    prevType = kvp.typeValue
+  }
+  return buf.freeze()
+}
+
+/**
+ * Reads exactly `count` delta-encoded message-parameter KVPs.
+ * Mirrors {@link deserializeKvpList} but honours per-parameter value encodings.
+ */
+export function deserializeMessageParameterKvps(buf: BaseByteBuffer, count: number | bigint): KeyValuePair[] {
+  const n = typeof count === 'bigint' ? Number(count) : count
+  let read = 0
+  return readMessageParameterKvps(buf, () => read++ < n)
+}
+
+function readMessageParameterKvps(buf: BaseByteBuffer, more: () => boolean): KeyValuePair[] {
+  const items: KeyValuePair[] = []
+  let prevType = 0n
+  while (more()) {
+    const typeValue = prevType + buf.getVI()
+    switch (valueShapeOf(typeValue)) {
+      case ValueShape.Uint8:
+        items.push(KeyValuePair.newVarInt(typeValue, BigInt(buf.getU8())))
+        break
+      case ValueShape.BareLocation: {
+        const loc = new ByteBuffer()
+        loc.putVI(buf.getVI())
+        loc.putVI(buf.getVI())
+        items.push(KeyValuePair.newBytes(typeValue, loc.toUint8Array()))
+        break
+      }
+      case ValueShape.LocationFilter:
+        // Decoded here because nothing else knows where it ends.
+        items.push(KeyValuePair.newBytes(typeValue, LocationFilter.deserializeValue(buf).serializeValue()))
+        break
+      case ValueShape.LengthPrefixedBytes:
+        items.push(KeyValuePair.deserializeBytesValue(buf, typeValue))
+        break
+      case ValueShape.VarInt:
+        items.push(KeyValuePair.tryNewVarInt(typeValue, buf.getVI()))
+        break
+    }
+    prevType = typeValue
+  }
+  return items
+}
+
+/**
  * Applies a set of parameter updates to an existing parameter list.
- * For each update, replaces the matching parameter (by wire type value) or appends it.
- * Per spec: "If omitted from REQUEST_UPDATE/SUBSCRIBE_UPDATE, the value is unchanged."
+ *
+ * A Type the update leaves out keeps its value. A Type it carries is replaced
+ * outright, every instance of it: a Range Filter can repeat, and an update that
+ * names a filter kind states the whole of that kind, so one left over from before
+ * would quietly widen or narrow what the subscriber asked for. A zero-length Range
+ * Filter replaces its kind with nothing.
  */
 export function applyMessageParameterUpdate(current: MessageParameter[], updates: MessageParameter[]): void {
-  for (const update of updates) {
-    const updateType = update.toKeyValuePair().typeValue
-    const idx = current.findIndex((p) => p.toKeyValuePair().typeValue === updateType)
-    if (idx >= 0) {
-      current[idx] = update
-    } else {
-      current.push(update)
-    }
-  }
+  const typeOf = (p: MessageParameter) => p.toKeyValuePair().typeValue
+  const updated = new Set(updates.map(typeOf))
+  const kept = current.filter((p) => !updated.has(typeOf(p)))
+  current.splice(0, current.length, ...kept, ...updates.filter((u) => !(u instanceof RangeFilter && u.isRemoval)))
 }
 
 if (import.meta.vitest) {
@@ -189,41 +427,347 @@ if (import.meta.vitest) {
     })
   })
 
+  describe('message parameter wire encodings', () => {
+    test('LARGEST_OBJECT is an unprefixed Location', () => {
+      // Type Delta 0x09 then the Group and Object varints, no length prefix.
+      // These are the bytes another implementation put on the wire for {1, 13}.
+      const wire = new Uint8Array([0x09, 0x01, 0x0d])
+
+      const buf = new ByteBuffer()
+      buf.putBytes(wire)
+      const frozen = buf.freeze()
+      const params = MessageParameters.fromKeyValuePairs(deserializeMessageParameterKvps(frozen, 1))
+
+      expect(params).toEqual([new LargestObject(new Location(1n, 13n))])
+      expect(frozen.remaining).toBe(0)
+      expect(serializeMessageParameterKvps(params.map((p) => p.toKeyValuePair())).toUint8Array()).toEqual(wire)
+    })
+
+    test('SUBSCRIBER_PRIORITY is a single byte, not a varint', () => {
+      // 128 is the default priority and the first value where uint8 and varint
+      // encodings differ: one byte 0x80 rather than the two bytes 0x40 0x80.
+      const params = [new SubscriberPriority(128)]
+      const wire = serializeMessageParameterKvps(params.map((p) => p.toKeyValuePair())).toUint8Array()
+
+      expect(wire).toEqual(new Uint8Array([0x20, 0x80]))
+
+      const buf = new ByteBuffer()
+      buf.putBytes(wire)
+      const frozen = buf.freeze()
+      expect(MessageParameters.fromKeyValuePairs(deserializeMessageParameterKvps(frozen, 1))).toEqual(params)
+    })
+
+    test('SWITCH_FROM is a length-prefixed byte string despite its even Type', () => {
+      const params = [new SwitchFrom(7n, SwitchMode.Hard, true)]
+      const wire = serializeMessageParameterKvps(params.map((p) => p.toKeyValuePair())).toUint8Array()
+
+      expect(wire).toEqual(new Uint8Array([0x24, 0x03, 0x07, 0x00, 0x80]))
+
+      const buf = new ByteBuffer()
+      buf.putBytes(wire)
+      const frozen = buf.freeze()
+      expect(MessageParameters.fromKeyValuePairs(deserializeMessageParameterKvps(frozen, 1))).toEqual(params)
+      expect(frozen.remaining).toBe(0)
+    })
+
+    test('SWITCH_FROM survives a list with neighbours on both sides', () => {
+      const params = [new SubscriberPriority(128), new SwitchFrom(7n, SwitchMode.Hard, true), new NewGroupRequest(3n)]
+      const buf = new ByteBuffer()
+      buf.putBytes(serializeMessageParameterKvps(params.map((p) => p.toKeyValuePair())).toUint8Array())
+      const frozen = buf.freeze()
+
+      const parsed = MessageParameters.fromKeyValuePairs(deserializeMessageParameterKvps(frozen, params.length))
+
+      expect(frozen.remaining).toBe(0)
+      expect(parsed).toEqual(params)
+    })
+  })
+
+  describe('INCLUDE_PROPERTIES wire encoding', () => {
+    test('is a single byte on its odd Type', () => {
+      const wire = serializeMessageParameterKvps([new IncludeProperties(false).toKeyValuePair()]).toUint8Array()
+      expect(wire).toEqual(new Uint8Array([0x35, 0x00]))
+      const buf = new ByteBuffer()
+      buf.putBytes(wire)
+      const frozen = buf.freeze()
+      expect(MessageParameters.fromKeyValuePairs(deserializeMessageParameterKvps(frozen, 1))).toEqual([
+        new IncludeProperties(false),
+      ])
+      expect(frozen.remaining).toBe(0)
+    })
+
+    test('a value other than 0 or 1 is a protocol violation', () => {
+      const buf = new ByteBuffer()
+      buf.putBytes(new Uint8Array([0x35, 0x02]))
+      const frozen = buf.freeze()
+      expect(() => MessageParameters.fromKeyValuePairs(deserializeMessageParameterKvps(frozen, 1))).toThrow(
+        ProtocolViolationError,
+      )
+    })
+
+    test('a PUBLISH for SUBSCRIBE_TRACKS states its settings but never its token', () => {
+      const request: MessageParameter[] = [
+        AuthorizationToken.newUseValue(0n, new TextEncoder().encode('t')),
+        new Forward(false),
+        new LocationFilter(LocationFilterType.RelativeStart, 1n),
+        new GroupOrderParam(GroupOrder.Descending),
+        new FillParameters([]),
+        new IncludeProperties(false),
+      ]
+      expect(MessageParameter.publishParametersFor(request)).toEqual([
+        new Forward(false),
+        new LocationFilter(LocationFilterType.RelativeStart, 1n),
+        new GroupOrderParam(GroupOrder.Descending),
+      ])
+    })
+
+    test('properties are included unless asked not to be', () => {
+      expect(MessageParameter.includesProperties([])).toBe(true)
+      expect(MessageParameter.includesProperties([new IncludeProperties(true)])).toBe(true)
+      expect(MessageParameter.includesProperties([new IncludeProperties(false)])).toBe(false)
+    })
+  })
+
+  describe('LOCATION_FILTER wire encoding', () => {
+    const decodeList = (wire: Uint8Array, count: number) => {
+      const buf = new ByteBuffer()
+      buf.putBytes(wire)
+      const frozen = buf.freeze()
+      const params = MessageParameters.fromKeyValuePairs(deserializeMessageParameterKvps(frozen, count))
+      expect(frozen.remaining).toBe(0)
+      return params
+    }
+    const encodeList = (params: MessageParameter[]) =>
+      serializeMessageParameterKvps(params.map((p) => p.toKeyValuePair())).toUint8Array()
+
+    test('has no length prefix', () => {
+      const cases: [LocationFilter, number[]][] = [
+        [new LocationFilter(LocationFilterType.NextObject), [0x21, 0x05]],
+        [new LocationFilter(LocationFilterType.RelativeStart, 1n), [0x21, 0x01, 0x01]],
+        // End Group 20 travels as the delta 15 from Start Group 5.
+        [new LocationFilter(LocationFilterType.AbsoluteRange, 5n, 0n, 20n, 3n), [0x21, 0x04, 0x05, 0x00, 0x0f, 0x03]],
+      ]
+      for (const [filter, wire] of cases) {
+        expect(encodeList([filter])).toEqual(new Uint8Array(wire))
+        expect(decodeList(new Uint8Array(wire), 1)).toEqual([filter])
+      }
+    })
+
+    test('ends where its type says in a list', () => {
+      // A field-less filter type followed by another parameter: the decoder must
+      // not mistake the next parameter's Type Delta for a length or a field.
+      const params = [
+        new SubscriberPriority(7),
+        new LocationFilter(LocationFilterType.NextObject),
+        new GroupOrderParam(GroupOrder.Descending),
+      ]
+      const wire = new Uint8Array([0x20, 0x07, 0x01, 0x05, 0x01, 0x02])
+      expect(encodeList(params)).toEqual(wire)
+      expect(decodeList(wire, params.length)).toEqual(params)
+    })
+
+    test('an unknown filter type is a protocol violation', () => {
+      expect(() => decodeList(new Uint8Array([0x21, 0x06]), 1)).toThrow(ProtocolViolationError)
+    })
+
+    test('may appear inside FILL_PARAMETERS', () => {
+      const params = [new FillParameters([new LocationFilter(LocationFilterType.RelativeStart, 1n)])]
+      // FILL_PARAMETERS 0x23, length 4, one parameter, then LOCATION_FILTER 0x21
+      // type 1 StartGroup 1.
+      const wire = new Uint8Array([0x23, 0x04, 0x01, 0x21, 0x01, 0x01])
+      expect(encodeList(params)).toEqual(wire)
+      expect(decodeList(wire, 1)).toEqual(params)
+    })
+  })
+
   describe('MessageParameters builder', () => {
     test('builds and roundtrips parameters', () => {
       const kvps = new MessageParameters()
-        .addDeliveryTimeout(150n)
+        .addObjectDeliveryTimeout(150n)
         .addForward(false)
         .addSubscriberPriority(42)
-        .addSubscriptionFilter(new SubscriptionFilter(FilterType.AbsoluteRange, new Location(10n, 0n), 20n))
+        .addLocationFilter(new LocationFilter(LocationFilterType.AbsoluteStartGroupEnd, 10n, 0n, 20n))
         .build()
         .map((p) => p.toKeyValuePair())
 
       const parsed = MessageParameters.fromKeyValuePairs(kvps)
       expect(parsed.length).toBe(4)
-      expect(MessageParameter.isDeliveryTimeout(parsed[0]!) && parsed[0].timeout).toBe(150n)
+      expect(MessageParameter.isObjectDeliveryTimeout(parsed[0]!) && parsed[0].timeout).toBe(150n)
       expect(MessageParameter.isForward(parsed[1]!) && parsed[1].forward).toBe(false)
       expect(MessageParameter.isSubscriberPriority(parsed[2]!) && parsed[2].priority).toBe(42)
-      expect(MessageParameter.isSubscriptionFilter(parsed[3]!) && parsed[3].filterType).toBe(FilterType.AbsoluteRange)
+      expect(MessageParameter.isLocationFilter(parsed[3]!) && parsed[3].filterType).toBe(
+        LocationFilterType.AbsoluteStartGroupEnd,
+      )
+    })
+
+    // §14: a greased parameter is just another unknown one -- skipped, never fatal.
+    test('fromKeyValuePairs skips a greased type', () => {
+      const grease = KeyValuePair.tryNewVarInt(greaseValue(1)!, 1n)
+      const valid = new ObjectDeliveryTimeout(100n).toKeyValuePair()
+      expect(MessageParameters.fromKeyValuePairs([grease, valid])).toEqual([new ObjectDeliveryTimeout(100n)])
     })
 
     test('fromKeyValuePairs skips unknown types', () => {
       const unknown = KeyValuePair.tryNewVarInt(998n, 1n)
-      const valid = new DeliveryTimeout(100n).toKeyValuePair()
+      const valid = new ObjectDeliveryTimeout(100n).toKeyValuePair()
       const parsed = MessageParameters.fromKeyValuePairs([unknown, valid])
       expect(parsed.length).toBe(1)
-      expect(MessageParameter.isDeliveryTimeout(parsed[0]!)).toBe(true)
+      expect(MessageParameter.isObjectDeliveryTimeout(parsed[0]!)).toBe(true)
     })
   })
 
   describe('applyMessageParameterUpdate', () => {
     test('replaces existing parameter and appends new ones', () => {
       const current: MessageParameter[] = [new SubscriberPriority(100), new Forward(true)]
-      applyMessageParameterUpdate(current, [new SubscriberPriority(50), new DeliveryTimeout(500n)])
+      applyMessageParameterUpdate(current, [new SubscriberPriority(50), new ObjectDeliveryTimeout(500n)])
       expect(current.length).toBe(3)
       expect(current.some((p) => MessageParameter.isSubscriberPriority(p) && p.priority === 50)).toBe(true)
       expect(current.some((p) => MessageParameter.isForward(p) && p.forward === true)).toBe(true)
-      expect(current.some((p) => MessageParameter.isDeliveryTimeout(p) && p.timeout === 500n)).toBe(true)
+      expect(current.some((p) => MessageParameter.isObjectDeliveryTimeout(p) && p.timeout === 500n)).toBe(true)
+    })
+  })
+
+  describe('delta-encoding regression', () => {
+    test('bug report wire format is delta-encoded', () => {
+      // Regression for the reported interop bug: SUBSCRIBER_PRIORITY (0x20),
+      // FORWARD (0x10) and LOCATION_FILTER (0x21), built in non-ascending
+      // insertion order. A spec-compliant v16 peer decodes Type as a delta
+      // from the previous Type in the list; encoding them "as-is" (absolute)
+      // made a correct delta-decoder compute the wrong types.
+      const params: MessageParameter[] = [
+        new SubscriberPriority(0),
+        new Forward(true),
+        new LocationFilter(LocationFilterType.NextObject),
+      ]
+      const wire = serializeMessageParameterKvps(params.map((p) => p.toKeyValuePair())).toUint8Array()
+
+      // Checked against the bytes themselves rather than our own decoder, to
+      // prove the Types are genuinely delta-encoded and not just
+      // self-consistent with a (potentially still-buggy) decoder:
+      //   10 01  FORWARD (delta 0x10) = 1
+      //   10 00  SUBSCRIBER_PRIORITY (delta 0x10 -> 0x20) = 0
+      //   01 05  LOCATION_FILTER (delta 0x01 -> 0x21), Next Object
+      expect(wire).toEqual(new Uint8Array([0x10, 0x01, 0x10, 0x00, 0x01, 0x05]))
+    })
+
+    test('decodes a delta-encoded peer stream', () => {
+      // Simulates a spec-compliant peer sending FORWARD then SUBSCRIBER_PRIORITY,
+      // correctly delta-encoded. This is the direction the reporter's own
+      // workaround (disabling delta decoding) broke.
+      const buf = new ByteBuffer()
+      buf.putVI(BigInt(Forward.TYPE)) // delta from 0 -> Forward
+      buf.putVI(1n) // true
+      buf.putVI(BigInt(SubscriberPriority.TYPE) - BigInt(Forward.TYPE)) // delta from Forward -> SubscriberPriority
+      buf.putVI(5n)
+      const frozen = buf.freeze()
+
+      const kvps = deserializeKvpList(frozen, 2)
+      const params = MessageParameters.fromKeyValuePairs(kvps)
+      expect(params).toEqual([new Forward(true), new SubscriberPriority(5)])
+    })
+  })
+
+  describe('Range Filters', () => {
+    const filter = (kind: RangeFilterKind, setId: number, start: bigint, end?: bigint) =>
+      new RangeFilter(
+        kind,
+        setId,
+        RangeFilterKind.hasPropertyType(kind) ? 0x3cn : undefined,
+        encodeRanges([end === undefined ? { start } : { start, end }]),
+      )
+    const decode = (wire: Uint8Array, count: number) => {
+      const buf = new ByteBuffer()
+      buf.putBytes(wire)
+      const frozen = buf.freeze()
+      const params = MessageParameters.fromKeyValuePairs(deserializeMessageParameterKvps(frozen, count))
+      expect(frozen.remaining).toBe(0)
+      return params
+    }
+    const encode = (params: MessageParameter[]) =>
+      serializeMessageParameterKvps(params.map((p) => p.toKeyValuePair())).toUint8Array()
+
+    test('an even-typed range filter is length-prefixed', () => {
+      // OBJECTID_FILTER (0x26) is even, yet length-prefixed. Read as a varint, its
+      // Length would be taken for the Value and the rest of the list would desync.
+      const params = [filter(RangeFilterKind.ObjectId, 0, 3n, 5n), new NewGroupRequest(9n)]
+      const wire = encode(params)
+      expect(wire).toEqual(new Uint8Array([0x26, 0x03, 0x00, 0x03, 0x02, 0x0c, 0x09]))
+      expect(decode(wire, 2)).toEqual(params)
+    })
+
+    test('range filters repeat in one message', () => {
+      const params = [
+        filter(RangeFilterKind.Subgroup, 0, 0n, 1n),
+        filter(RangeFilterKind.Subgroup, 1, 4n),
+        filter(RangeFilterKind.ObjectId, 0, 0n, 0n),
+        filter(RangeFilterKind.Priority, 1, 0n, 127n),
+        filter(RangeFilterKind.ObjectProperty, 0, 10n, 20n),
+        filter(RangeFilterKind.ObjectProperty, 1, 30n, 40n),
+      ]
+      expect(decode(encode(params), params.length)).toEqual(params)
+    })
+
+    test('a zero-length range filter roundtrips as a removal', () => {
+      for (const kind of [
+        RangeFilterKind.Subgroup,
+        RangeFilterKind.ObjectId,
+        RangeFilterKind.Priority,
+        RangeFilterKind.ObjectProperty,
+        RangeFilterKind.TrackProperty,
+      ]) {
+        const wire = encode([new RangeFilter(kind)])
+        expect(wire).toEqual(new Uint8Array([kind, 0x00]))
+        expect(decode(wire, 1)).toEqual([new RangeFilter(kind)])
+      }
+    })
+
+    test('fill parameters carry object filters', () => {
+      const params = [
+        new FillParameters([
+          filter(RangeFilterKind.Subgroup, 0, 0n, 0n),
+          filter(RangeFilterKind.ObjectId, 0, 0n, 3n),
+          filter(RangeFilterKind.Priority, 0, 0n, 64n),
+          filter(RangeFilterKind.ObjectProperty, 0, 1n, 1n),
+        ]),
+      ]
+      expect(decode(encode(params), 1)).toEqual(params)
+      expect(() => new FillParameters([filter(RangeFilterKind.TrackProperty, 0, 1n, 1n)]).toKeyValuePair()).toThrow(
+        ProtocolViolationError,
+      )
+    })
+
+    test('carriesRangeFilter looks inside fill parameters', () => {
+      expect(MessageParameter.carriesRangeFilter([new Forward(true)])).toBe(false)
+      expect(MessageParameter.carriesRangeFilter([new RangeFilter(RangeFilterKind.Priority)])).toBe(true)
+      expect(
+        MessageParameter.carriesRangeFilter([new FillParameters([filter(RangeFilterKind.ObjectId, 0, 0n, 0n)])]),
+      ).toBe(true)
+    })
+
+    test('an update replaces every filter of a kind it names', () => {
+      const current: MessageParameter[] = [
+        filter(RangeFilterKind.Subgroup, 0, 0n, 0n),
+        filter(RangeFilterKind.Subgroup, 1, 5n, 5n),
+        filter(RangeFilterKind.ObjectId, 0, 0n, 3n),
+        new Forward(true),
+      ]
+      const replacement = filter(RangeFilterKind.Subgroup, 2, 9n, 9n)
+      applyMessageParameterUpdate(current, [replacement])
+      expect(current.filter((p) => p instanceof RangeFilter && p.kind === RangeFilterKind.Subgroup)).toEqual([
+        replacement,
+      ])
+      expect(current).toContainEqual(filter(RangeFilterKind.ObjectId, 0, 0n, 3n))
+      expect(current).toContainEqual(new Forward(true))
+    })
+
+    test('a zero-length update removes the kind', () => {
+      const current: MessageParameter[] = [
+        filter(RangeFilterKind.Priority, 0, 0n, 10n),
+        filter(RangeFilterKind.Priority, 1, 20n, 30n),
+        filter(RangeFilterKind.ObjectId, 0, 0n, 3n),
+      ]
+      applyMessageParameterUpdate(current, [new RangeFilter(RangeFilterKind.Priority)])
+      expect(current).toEqual([filter(RangeFilterKind.ObjectId, 0, 0n, 3n)])
     })
   })
 }

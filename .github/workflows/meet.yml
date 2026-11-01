@@ -1,0 +1,64 @@
+name: Meet
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - apps/meet/**
+      - libs/moqtail-ts/**
+      - .github/workflows/meet.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: 'meet-page'
+  cancel-in-progress: true
+
+jobs:
+  meet:
+    if: ${{ github.repository_owner == 'moqtail' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: cloudflare
+      url: 'https://meet.moqtail.dev'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: npm
+          node-version: lts/*
+
+      - run: npm clean-install
+      - run: corepack enable
+      - run: npm audit signatures
+
+      - name: Get build information
+        run: |
+          commit=$(git rev-parse --short HEAD)
+          date=$(date +'%Y-%m-%d')
+          echo "VITE_BUILD_COMMIT=$commit" >> $GITHUB_ENV
+          echo "VITE_BUILD_DATE=$date" >> $GITHUB_ENV
+
+      - name: Build MOQtail Library and Meet
+        run: npm run build
+
+      - name: Update app settings
+        working-directory: apps/meet/dist
+        run: |
+          sed -i "s|relayUrl:.*|relayUrl: 'https://relay.n1.fra.moqtail.dev',|g" appsettings.js
+
+      - name: Deploy
+        id: deploy
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          command: deploy --name meet --assets apps/meet/dist --compatibility-date 2026-07-13

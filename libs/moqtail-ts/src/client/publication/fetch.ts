@@ -18,18 +18,21 @@ import {
   Fetch,
   FetchHeader,
   FetchHeaderType,
-  FetchType,
   InternalError,
   Location,
   MOQtailError,
+  MessageParameter,
   MoqtObject,
 } from '@/model'
-import { FetchObjectContext } from '@/model/data/fetch_object'
+import { CombinedFilter } from '@/model/parameter/message/combined_filter'
+import { StreamResetCode } from '@/model/error/stream_reset'
+import { SendStream } from '../data_stream'
 import { MOQtailClient } from '../client'
 import { Track } from '../track/track'
 import { SubscribePublication } from './subscribe'
 import { PublishPublication } from './publish'
 import { logger } from '../../util/logger'
+import { SubgroupIds } from './subgroup'
 
 // TODO: Use group order
 // TODO: Use fetch parameters
@@ -37,57 +40,43 @@ export class FetchPublication {
   readonly #requestId: bigint
   readonly #track: Track
   readonly #startLocation: Location
+  /** The last Location to send, inclusive. */
   readonly #endLocation: Location
   readonly #msg: Fetch
   readonly #client: MOQtailClient
-  #stream: WritableStream | undefined
-  #writer: WritableStreamDefaultWriter | undefined
+  /** What the FETCH's Range Filters let through. */
+  readonly #filter: CombinedFilter
+  #sendStream: SendStream | undefined
   #objects: MoqtObject[] | undefined
   #isCanceled = false
 
-  constructor(client: MOQtailClient, track: Track, fetchRequest: Fetch) {
+  /** `start` and `end` are the FETCH's range resolved against the Largest Object, inclusive. */
+  constructor(client: MOQtailClient, track: Track, fetchRequest: Fetch, start: Location, end: Location) {
     this.#client = client
     this.#requestId = fetchRequest.requestId
     this.#track = track
     this.#msg = fetchRequest
-    let joiningRequest: SubscribePublication | PublishPublication | FetchPublication | undefined
-    switch (this.#msg.typeAndProps.type) {
-      case FetchType.Standalone:
-        // TODO: Tie up fetch type and relevant props as {type: 1, props: standAlone} | {type: 2, props: joining} | {type: 3, props: joining}
-        this.#startLocation = this.#msg.typeAndProps.props.startLocation
-        this.#endLocation = this.#msg.typeAndProps.props.endLocation
-        break
-
-      case FetchType.Relative:
-        joiningRequest = client.publications.get(this.#msg.typeAndProps.props.joiningRequestId)
-        if (!(joiningRequest instanceof SubscribePublication))
-          throw new InternalError('FetchPublication.constructor', 'No subscription for the joining request id')
-        if (!joiningRequest.latestLocation)
-          throw new InternalError('FetchPublication.constructor', 'joiningRequest.largestLocation does not exist')
-        this.#startLocation = new Location(
-          joiningRequest.latestLocation.group - this.#msg.typeAndProps.props.joiningStart,
-          0n,
-        )
-        this.#endLocation = joiningRequest.latestLocation
-        break
-
-      case FetchType.Absolute:
-        joiningRequest = client.publications.get(this.#msg.typeAndProps.props.joiningRequestId)
-        if (!(joiningRequest instanceof SubscribePublication))
-          throw new InternalError('FetchPublication.constructor', 'No subscription for the joining request id')
-        if (!joiningRequest.latestLocation)
-          throw new InternalError('FetchPublication.constructor', 'joiningRequest.largestLocation does not exist')
-        this.#startLocation = new Location(this.#msg.typeAndProps.props.joiningStart, 0n)
-        this.#endLocation = joiningRequest.latestLocation
-        break
-    }
-    logger.debug('publication/fetch', `created requestId=${this.#requestId} type=${this.#msg.typeAndProps.type}`)
+    this.#startLocation = start
+    this.#endLocation = end
+    // The handler has already refused a FETCH with filters that cannot be applied.
+    this.#filter = new CombinedFilter(fetchRequest.parameters)
+    logger.debug('publication/fetch', `created requestId=${this.#requestId}`)
     this.publish()
   }
 
   cancel() {
     logger.debug('publication/fetch', `canceled requestId=${this.#requestId}`)
     this.#isCanceled = true
+  }
+
+  /**
+   * Resets the data stream this fetch is being delivered on, which §10.9.1 requires when
+   * a REQUEST_UPDATE for a FETCH fails.
+   */
+  async resetDataStream(code: StreamResetCode): Promise<void> {
+    logger.debug('publication/fetch', `reset data stream requestId=${this.#requestId} code=${code}`)
+    this.#isCanceled = true
+    await this.#sendStream?.reset(code)
   }
 
   async publish(): Promise<void> {
@@ -98,30 +87,49 @@ export class FetchPublication {
       `publishing requestId=${this.#requestId} start=${this.#startLocation} end=${this.#endLocation}`,
     )
     try {
-      this.#objects = await this.#track.trackSource.past.getRange(this.#startLocation, this.#endLocation)
+      // getRange stops before its end, and #endLocation is the last Object to send, so
+      // the end is applied here.
+      const objects = await this.#track.trackSource.past.getRange(this.#startLocation)
+      this.#objects = objects.filter((obj) => obj.location.compare(this.#endLocation) <= 0)
       // TODO: Calculate and use stream priority from subscriber priority from the msg + publisher priority from the track
-      this.#stream = await this.#client.webTransport.createUnidirectionalStream()
-      this.#writer = this.#stream.getWriter()
+      const writeStream = await this.#client.webTransport.createUnidirectionalStream()
       const header = new FetchHeader(FetchHeaderType.Type0x05, this.#requestId)
-      await this.#writer.write(header)
-      let fetchPrevCtx: FetchObjectContext | undefined = undefined
+      // The Group Order signs the Group ID deltas SendStream writes. Note the objects are
+      // not yet reordered to match (see the TODO above), so a Descending request is
+      // rejected by the encoder.
+      this.#sendStream = await SendStream.new(
+        writeStream,
+        header,
+        this.#client.onDataSent,
+        MessageParameter.groupOrderOf(this.#msg.parameters),
+        this.#client.dataStreamObserver(() => this.#track.fullTrackName),
+      )
+      const subgroupIds = new SubgroupIds()
+      let sent = 0
       for (const obj of this.#objects) {
+        subgroupIds.note(obj)
+        // A filtered Object is skipped without reaching SendStream, so the next one
+        // written is delta-encoded against the last one written.
+        if (!this.#filter.matches(obj, subgroupIds.of(obj))) continue
         if (this.#isCanceled) {
           logger.debug('publication/fetch', `aborted during publish requestId=${this.#requestId}`)
-          await this.#writer.abort('Fetch cancelled during publish')
+          await this.#sendStream.reset(StreamResetCode.Cancelled)
           this.#client.publications.delete(this.#requestId)
           return
         }
-        const fetchObj = obj.tryIntoFetchObject()
-        await this.#writer.write(fetchObj.serialize(fetchPrevCtx).toUint8Array())
-        const newCtx = fetchObj.toContext()
-        if (newCtx) fetchPrevCtx = newCtx
+        await this.#sendStream.write(obj.tryIntoFetchObject())
+        sent++
       }
-      await this.#writer.close()
-      logger.debug('publication/fetch', `published requestId=${this.#requestId} objects=${this.#objects.length}`)
+      await this.#sendStream.close()
+      logger.debug(
+        'publication/fetch',
+        `published requestId=${this.#requestId} objects=${sent} of ${this.#objects.length}`,
+      )
       this.#client.publications.delete(this.#requestId)
     } catch (error: unknown) {
-      await this.#writer?.abort('Fetch failed during publish')
+      // A write that fails because the stream was reset on purpose is not a failure.
+      if (this.#isCanceled) return
+      await this.#sendStream?.reset(StreamResetCode.InternalError)
       const message = error instanceof Error ? error.message : String(error)
       logger.error('publication/fetch', `publish failed requestId=${this.#requestId}`, message)
       throw new InternalError('FetchPublication.publish', `Failed to publish: ${message}`)
