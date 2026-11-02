@@ -336,7 +336,7 @@ PUBLISHER (publish-multi)          RELAY                  SUBSCRIBER (switch-tes
  ──────────────► SubscribeOk ──────────────────────────────────────►   received_at }
                                                                    │
                                [switch_after secs]                 │
- ◄─ SWITCH/REQUEST_UPDATE ────────────────────────────────────────►│
+ ◄─ SUBSCRIBE+SWITCH_FROM/REQ_UPD ────────────────────────────────►│
  ──────────────► SubscribeOk B ────────────────────────────────────►
                    relay executes
                    at next B boundary
@@ -347,18 +347,18 @@ Each track is published as a sequence of **groups** (one GoP = 25 objects × 40 
 
 ### 5.2 The three switching methods
 
-**Method 1 — SWITCH** (1 control message)
+**Method 1 — SWITCH** (1 control message: SUBSCRIBE B carrying SWITCH_FROM)
 
 ```
 Subscriber                           Relay
     │                                  │
-    │──── SWITCH(A→B) ────────────────►│  relay queues: "at B's next group boundary,
+    │── SUBSCRIBE(B, SWITCH_FROM=A) ──►│  relay queues: "at B's next group boundary,
     │                                  │   stop A, start B"
     │◄─── SubscribeOk(B) ─────────────│
     │◄═══ B objects (from group N) ═══│  (first object is always object_id=0)
 ```
 
-The relay stops forwarding A almost immediately upon receiving SWITCH and begins B at B's next group boundary. A few trailing A objects may already be in-flight. The relay delivers B from its cache; since the relay caches all publisher data unconditionally, no pre-warming step is needed.
+SUBSCRIBE B goes on a new request stream with a SWITCH_FROM parameter naming A's request ID and the switch mode (`--switch-mode`, default `hard`); the standalone SWITCH message is no longer used. The relay stops forwarding A almost immediately upon receiving it and begins B at B's next group boundary. A few trailing A objects may already be in-flight. The relay delivers B from its cache; since the relay caches all publisher data unconditionally, no pre-warming step is needed.
 
 **Method 2 — Sub Update Forward** (3 control messages)
 

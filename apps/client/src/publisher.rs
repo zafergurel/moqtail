@@ -1144,10 +1144,10 @@ fn generate_payload(size: usize) -> Vec<u8> {
 /// Publish multiple tracks simultaneously in push (PUBLISH) mode with
 /// synchronized timing so that all tracks stay at the same group counter.
 ///
-/// This is the correct publisher mode for the `switch-test --method switch-message`
+/// This is the correct publisher mode for the `switch-test --method switch`
 /// experiment: the relay caches objects for every track from the start, so when a
-/// SWITCH message fires, the relay can immediately find the target track's latest
-/// object at the current group.
+/// SUBSCRIBE with SWITCH_FROM arrives, the relay can immediately find the target
+/// track's latest object at the current group.
 pub async fn run_multi(moq: MoqConnection, config: PublishMultiConfig) -> Result<()> {
   // `moq` stays alive to the end: its control stream must outlive the session.
   let connection = moq.connection.clone();
