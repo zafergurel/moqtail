@@ -203,7 +203,7 @@ start_relay() {
   sleep 1
 
   log "Starting local relay (port $RELAY_PORT) → $RELAY_LOG"
-  "$RELAY_BIN" --port "$RELAY_PORT" >"$RELAY_LOG" 2>&1 &
+  "$RELAY_BIN" --bind "[::]:$RELAY_PORT" >"$RELAY_LOG" 2>&1 &
   echo $! >"$RELAY_PID_FILE"
   sleep 2
   log "Relay PID $(cat "$RELAY_PID_FILE")"

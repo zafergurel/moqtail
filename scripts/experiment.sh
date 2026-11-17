@@ -319,6 +319,8 @@ do_build() {
   fi
 
   log "Building client locally (for subscriber)..."
+  # A non-login shell (nohup over ssh) has no ~/.cargo/bin on PATH.
+  source "$HOME/.cargo/env" 2>/dev/null || true
   cargo build --release --bin client --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -5
 }
 
@@ -333,7 +335,7 @@ start_relay() {
   relay_ssh "cd $RELAY_PROJECT && python3 - <<'PYEOF'
 import subprocess, sys
 p = subprocess.Popen(
-    ['target/release/relay', '--port', '$RELAY_PORT'],
+    ['target/release/relay', '--bind', '[::]:$RELAY_PORT'],
     stdin=open('/dev/null'), stdout=open('/tmp/moqtail-relay.log','w'),
     stderr=subprocess.STDOUT, close_fds=True, start_new_session=True)
 open('/tmp/moqtail-relay.pid','w').write(str(p.pid))
