@@ -1,0 +1,1061 @@
+// Copyright 2025 The MOQtail Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+pub(crate) mod request_subscription_map;
+pub(crate) mod switch_context;
+
+use crate::server::cluster;
+use crate::server::{
+  config::{AppConfig, TrackAliasMode},
+  requests::DownstreamRequests,
+  session::client::request_subscription_map::RequestSubscriptionMap,
+  ssts,
+  stream_id::{SendStreamKey, StreamType},
+  track::Track,
+  utils,
+};
+use anyhow::Result;
+use bytes::Bytes;
+use moqtail::{
+  model::{
+    common::tuple::Tuple,
+    control::{control_message::ControlMessage, setup::Setup},
+    data::full_track_name::FullTrackName,
+    error::StreamResetCode,
+  },
+  transport::{
+    connection::{TransportConnection, TransportKind, TransportSendStream, TransportWriteError},
+    data_stream_handler::FetchRequest,
+  },
+};
+use switch_context::SwitchContext;
+
+use std::{
+  collections::{BTreeMap, HashMap, HashSet, VecDeque},
+  sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+  },
+  time::Duration,
+};
+use tokio::sync::Notify;
+use tokio::sync::{Mutex, RwLock, RwLockWriteGuard, mpsc};
+use tokio::time::Instant;
+use tracing::{debug, error, trace, warn};
+
+/// Token-bucket rate limiter. All streams of one subscriber share a single
+/// bucket so they compete for bandwidth — the QUIC scheduler then drains
+/// higher-priority streams first when writes are pending.
+#[derive(Debug)]
+struct TokenBucket {
+  rate_bytes_per_sec: f64,
+  tokens: f64,
+  last_refill: Instant,
+}
+
+impl TokenBucket {
+  fn new(rate_kbps: u64) -> Self {
+    let rate = rate_kbps as f64 * 1000.0 / 8.0; // kbps → bytes/sec
+    Self {
+      rate_bytes_per_sec: rate,
+      tokens: rate, // start with one second worth of tokens
+      last_refill: Instant::now(),
+    }
+  }
+
+  async fn consume(&mut self, bytes: usize) {
+    let now = Instant::now();
+    let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+    self.tokens = (self.tokens + elapsed * self.rate_bytes_per_sec).min(self.rate_bytes_per_sec); // cap at 1 second of burst
+    self.last_refill = now;
+
+    let needed = bytes as f64;
+    if self.tokens < needed {
+      let deficit = needed - self.tokens;
+      let wait = Duration::from_secs_f64(deficit / self.rate_bytes_per_sec);
+      tokio::time::sleep(wait).await;
+      self.tokens = 0.0;
+    } else {
+      self.tokens -= needed;
+    }
+  }
+}
+
+/// Number of partitions for send stream management to reduce lock contention.
+/// Each partition contains a separate HashMap protected by its own RwLock.
+/// Higher values reduce contention but increase memory overhead.
+/// Should be a power of 2 for optimal modulo performance.
+pub const SEND_STREAM_PARTITION_COUNT: usize = 16;
+
+pub type SendStreamMap = HashMap<SendStreamKey, Arc<Mutex<TransportSendStream>>>;
+pub type SendStreamLock = Arc<RwLock<SendStreamMap>>;
+pub type SendStreamList = Vec<SendStreamLock>;
+
+// Per-request response channels, sharded like the send-stream map so a
+// register/lookup only locks one partition.
+pub type ResponseSenderMap = HashMap<u64, mpsc::UnboundedSender<ControlMessage>>;
+pub type ResponseSenderList = Vec<Arc<RwLock<ResponseSenderMap>>>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct MOQTClient {
+  pub connection_id: usize,
+  pub transport_kind: TransportKind,
+  pub connection: Arc<TransportConnection>,
+  #[allow(dead_code)]
+  pub client_setup: Arc<Setup>,
+  pub announced_track_namespaces: Arc<RwLock<Vec<Tuple>>>, // the track namespaces the publisher announced
+  pub outbound_announcements: Arc<RwLock<HashMap<Tuple, u64>>>, //Maps a Namespace to the outbound request_id we used to announce it to the client
+  pub published_tracks: Arc<RwLock<HashMap<u64, FullTrackName>>>, // request_id -> track the client is publishing
+  malformed_tracks: Arc<RwLock<HashSet<FullTrackName>>>,
+  /// The tracks a disconnect has to visit: every track the client ever subscribed to
+  /// or published. Recorded before the client joins the track, so a disconnect never
+  /// misses one. An unsubscribe prunes the track once the client holds no role on it;
+  /// other exits (PUBLISH_DONE, a finished track) leave a stale entry, which only costs
+  /// a lookup that finds nothing to remove.
+  cleanup_tracks: Arc<RwLock<HashSet<FullTrackName>>>,
+  pub subscribers: Arc<RwLock<Vec<usize>>>, // the subscribers the client is subscribed to
+
+  pub message_queue: Arc<RwLock<VecDeque<ControlMessage>>>, // the control messages the client has sent
+  pub message_notify: Arc<Notify>, // notify when a new message is available
+  pub send_streams: Arc<SendStreamList>,
+
+  // Per-request response channels, keyed by the request's (downstream) request id
+  // and sharded across partitions. A request stream registers its sender here so
+  // responses/follow-ups produced elsewhere (e.g. a deferred SUBSCRIBE_OK fan-out)
+  // are delivered onto that stream instead of the control stream.
+  pub response_senders: Arc<ResponseSenderList>,
+
+  /// Upstream FETCHes the relay sent to this client, by the relay's request id. Kept
+  /// here rather than in `UpstreamRequests` because the data stream reader reads it.
+  pub outgoing_fetch_requests: Arc<RwLock<BTreeMap<u64, FetchRequest>>>,
+
+  /// The requests this client has sent, by request id.
+  pub downstream_requests: DownstreamRequests,
+
+  // this contains the subscriptions made by the client
+  pub subscriptions: RequestSubscriptionMap,
+
+  pub switch_context: SwitchContext,
+
+  // Optional per-connection write rate limiter. All streams of this client share
+  // the same bucket so they compete for bandwidth, exercising QUIC stream priority.
+  rate_limiter: Option<Arc<Mutex<TokenBucket>>>,
+
+  /// Sender-side track switching: the negotiation, switching sets, ABR
+  /// controller channel and decision cache, behind one handle.
+  pub ssts: Arc<ssts::SstsState>,
+
+  /// The settings this relay started with, handed in the way `Track` and
+  /// `Subscription` take theirs, rather than reached for through the global.
+  config: &'static AppConfig,
+
+  /// The next Track Alias handed out under `per-subscription`.
+  next_track_alias: Arc<AtomicU64>,
+
+  /// The Hop ID this peer declared, when both ends negotiated the cluster extension.
+  pub peer_hop_id: Option<u64>,
+  /// The RELAY_COST this peer declared (1 when absent).
+  pub peer_relay_cost: u64,
+  /// The namespaces this relay advertises to this peer, at most one each.
+  pub cluster_adverts: Arc<Mutex<HashMap<Tuple, cluster::Advert>>>,
+  /// The SUBSCRIBE_TRACKS prefixes this relay holds on this peer for its own clients.
+  pub cluster_tracks: Arc<Mutex<HashMap<Tuple, cluster::TracksRequest>>>,
+  /// Whether this relay dialed the session, which makes it the client there.
+  dialed: bool,
+}
+
+/// The Track Alias `mode` gives a new subscription to the track the relay knows as
+/// `relay_track_id`, drawing fresh ones from `next`.
+fn pick_track_alias(mode: TrackAliasMode, relay_track_id: u64, next: &AtomicU64) -> u64 {
+  match mode {
+    TrackAliasMode::PerTrack => relay_track_id,
+    TrackAliasMode::PerSubscription => next.fetch_add(1, Ordering::Relaxed),
+  }
+}
+
+impl MOQTClient {
+  pub(crate) fn new(
+    connection_id: usize,
+    connection: Arc<TransportConnection>,
+    client_setup: Arc<Setup>,
+    config: &'static AppConfig,
+    dialed: bool,
+  ) -> Self {
+    let mut send_streams = Vec::with_capacity(SEND_STREAM_PARTITION_COUNT);
+    for _ in 0..SEND_STREAM_PARTITION_COUNT {
+      send_streams.push(Arc::new(RwLock::new(HashMap::new())));
+    }
+
+    let kbps = config.write_kbps_limit;
+    let rate_limiter = if kbps > 0 {
+      Some(Arc::new(Mutex::new(TokenBucket::new(kbps))))
+    } else {
+      None
+    };
+
+    // SSTS for this connection.
+    let ssts = Arc::new(ssts::SstsState::new(
+      client_setup.as_ref(),
+      &config.ssts_algorithms,
+    ));
+
+    let peer_hop_id = config
+      .hop_id
+      .and(cluster::setup_varint(&client_setup, cluster::HOP_ID));
+    let peer_relay_cost = cluster::setup_varint(&client_setup, cluster::RELAY_COST).unwrap_or(1);
+
+    MOQTClient {
+      connection_id,
+      transport_kind: connection.kind(),
+      connection,
+      client_setup,
+      announced_track_namespaces: Arc::new(RwLock::new(Vec::new())),
+      outbound_announcements: Arc::new(RwLock::new(HashMap::new())),
+      published_tracks: Arc::new(RwLock::new(HashMap::new())),
+      malformed_tracks: Arc::new(RwLock::new(HashSet::new())),
+      cleanup_tracks: Arc::new(RwLock::new(HashSet::new())),
+      subscribers: Arc::new(RwLock::new(Vec::new())),
+      message_queue: Arc::new(RwLock::new(VecDeque::new())),
+      message_notify: Arc::new(Notify::default()),
+      send_streams: Arc::new(send_streams),
+      response_senders: Arc::new(
+        (0..SEND_STREAM_PARTITION_COUNT)
+          .map(|_| Arc::new(RwLock::new(HashMap::new())))
+          .collect(),
+      ),
+      outgoing_fetch_requests: Arc::new(RwLock::new(BTreeMap::new())),
+      downstream_requests: DownstreamRequests::default(),
+      subscriptions: RequestSubscriptionMap::new(),
+      switch_context: SwitchContext::new(),
+      rate_limiter,
+      ssts,
+      peer_hop_id,
+      peer_relay_cost,
+      cluster_adverts: Arc::new(Mutex::new(HashMap::new())),
+      cluster_tracks: Arc::new(Mutex::new(HashMap::new())),
+      dialed,
+      config,
+      next_track_alias: Arc::new(AtomicU64::new(0)),
+    }
+  }
+
+  /// A Request ID for a request the relay sends this peer: even where the relay is
+  /// the client (it dialed), odd where it is the server, so it can never equal one the
+  /// peer picks. One counter feeds both, so the id is also unique relay-wide.
+  pub(crate) fn next_request_id(&self, counter: &AtomicU64) -> u64 {
+    2 * counter.fetch_add(1, Ordering::Relaxed) + u64::from(!self.dialed)
+  }
+
+  pub(crate) async fn add_announced_track_namespace(&self, track_namespace: Tuple) {
+    let mut announced_track_namespaces = self.announced_track_namespaces.write().await;
+    announced_track_namespaces.push(track_namespace);
+  }
+
+  pub(crate) async fn mark_track_malformed(&self, full_track_name: FullTrackName) {
+    self.malformed_tracks.write().await.insert(full_track_name);
+  }
+
+  pub(crate) async fn is_track_malformed(&self, full_track_name: &FullTrackName) -> bool {
+    self.malformed_tracks.read().await.contains(full_track_name)
+  }
+
+  /// Records the track and returns the set still locked: hold it until the client has
+  /// joined the track, so a concurrent prune cannot drop the entry in between.
+  pub(crate) async fn add_cleanup_track(
+    &self,
+    full_track_name: &FullTrackName,
+  ) -> RwLockWriteGuard<'_, HashSet<FullTrackName>> {
+    let mut tracks = self.cleanup_tracks.write().await;
+    if !tracks.contains(full_track_name) {
+      tracks.insert(full_track_name.clone());
+    }
+    tracks
+  }
+
+  /// Forgets `track` once this client neither subscribes to nor publishes it.
+  pub(crate) async fn prune_cleanup_track(&self, track: &Track) {
+    let mut tracks = self.cleanup_tracks.write().await;
+    if !track.has_any_subscription(self.connection_id).await
+      && !track.is_published_by(self.connection_id).await
+    {
+      tracks.remove(&track.full_track_name);
+    }
+  }
+
+  pub(crate) async fn cleanup_tracks(&self) -> Vec<FullTrackName> {
+    self.cleanup_tracks.read().await.iter().cloned().collect()
+  }
+
+  /// Leaving a withdrawn namespace here would keep routing subscriptions to this client.
+  pub(crate) async fn remove_announced_track_namespace(&self, track_namespace: &Tuple) {
+    let mut announced_track_namespaces = self.announced_track_namespaces.write().await;
+    announced_track_namespaces.retain(|ns| ns != track_namespace);
+  }
+
+  /// The Track Alias to give this subscriber for a new subscription to the track
+  /// the relay knows as `relay_track_id`: that id itself under `per-track`, or a
+  /// fresh one under `per-subscription`. Fresh ones come from a counter of this
+  /// connection's own, so no two are alike within its session.
+  pub(crate) fn assign_track_alias(&self, relay_track_id: u64) -> u64 {
+    pick_track_alias(
+      self.config.track_alias_mode,
+      relay_track_id,
+      &self.next_track_alias,
+    )
+  }
+
+  pub(crate) async fn add_subscriber(&self, subscriber_id: usize) {
+    let mut subscribers = self.subscribers.write().await;
+    subscribers.push(subscriber_id);
+  }
+
+  pub(crate) async fn get_outbound_announce_id(&self, namespace: &Tuple) -> Option<u64> {
+    let map = self.outbound_announcements.read().await;
+    map.get(namespace).cloned()
+  }
+
+  pub(crate) async fn add_published_track(&self, request_id: u64, full_track_name: FullTrackName) {
+    let mut published_tracks = self.published_tracks.write().await;
+    published_tracks.insert(request_id, full_track_name);
+  }
+
+  /// Get the next control message from the queue.
+  /// This function will block until a message is available and will return the message.
+  pub(crate) async fn wait_for_next_message(&self) -> ControlMessage {
+    loop {
+      // Acquire the lock and check if there's a message
+      let mut message_queue = self.message_queue.write().await;
+      if let Some(message) = message_queue.pop_front() {
+        return message;
+      }
+      // Drop the lock before waiting
+      drop(message_queue);
+      // TODO: what happens when the client disconnects?
+      self.message_notify.notified().await;
+    }
+  }
+
+  // Also, update queue_message to notify:
+  pub(crate) async fn queue_message(&self, control_message: ControlMessage) {
+    let mut message_queue = self.message_queue.write().await;
+    message_queue.push_back(control_message);
+    self.message_notify.notify_one();
+  }
+
+  /// The response-sender shard for a request id (sequential ids spread evenly).
+  fn response_partition(&self, request_id: u64) -> usize {
+    (request_id % self.response_senders.len() as u64) as usize
+  }
+
+  /// Register a request stream's response channel under its request id.
+  pub(crate) async fn register_response_sender(
+    &self,
+    request_id: u64,
+    tx: mpsc::UnboundedSender<ControlMessage>,
+  ) {
+    let idx = self.response_partition(request_id);
+    self.response_senders[idx]
+      .write()
+      .await
+      .insert(request_id, tx);
+  }
+
+  /// Remove a request stream's response channel (on stream close).
+  pub(crate) async fn unregister_response_sender(&self, request_id: u64) {
+    let idx = self.response_partition(request_id);
+    self.response_senders[idx].write().await.remove(&request_id);
+  }
+
+  /// Deliver a message onto the request stream registered for `request_id`.
+  /// Returns true if a request stream was registered and accepted it; false
+  /// otherwise (the caller may fall back to the control-stream queue).
+  pub(crate) async fn send_response(&self, request_id: u64, message: ControlMessage) -> bool {
+    let idx = self.response_partition(request_id);
+    let senders = self.response_senders[idx].read().await;
+    match senders.get(&request_id) {
+      Some(tx) => tx.send(message).is_ok(),
+      None => false,
+    }
+  }
+
+  /// Calculate the partition index for stream distribution across buckets.
+  /// This method implements a load balancing strategy to distribute streams
+  /// across multiple stream buckets to improve performance and reduce contention.
+  fn get_partition_index(&self, key: &SendStreamKey) -> usize {
+    let stream_id = &key.stream_id;
+    let value = match stream_id.stream_type {
+      StreamType::Fetch => {
+        // Use a simple hash combining relay_track_id and fetch_request_id
+        stream_id
+          .relay_track_id
+          .wrapping_add(stream_id.fetch_request_id.unwrap_or(0).wrapping_mul(13))
+      }
+      StreamType::Subgroup => {
+        // Better distribution using prime number multipliers
+        stream_id
+          .relay_track_id
+          .wrapping_add(stream_id.group_id.unwrap_or(0).wrapping_mul(17))
+          .wrapping_add(stream_id.subgroup_id.unwrap_or(0).wrapping_mul(31))
+      }
+    };
+
+    // Streams of different requests for the same track spread apart too.
+    let value = value.wrapping_add(key.request_id.wrapping_mul(7));
+
+    // Convert to bytes for fnv_hash function
+    let value_bytes = value.to_le_bytes();
+    (utils::fnv_hash(&value_bytes) % SEND_STREAM_PARTITION_COUNT as u64) as usize
+  }
+
+  fn get_stream_map(&self, stream_key: &SendStreamKey) -> SendStreamLock {
+    let partition_index = self.get_partition_index(stream_key);
+    trace!(
+      "get_stream_map | stream_key: {} partition_index: {}",
+      stream_key, partition_index
+    );
+    self.send_streams[partition_index].clone()
+  }
+
+  pub async fn get_stream(
+    &self,
+    stream_key: &SendStreamKey,
+  ) -> Option<Arc<Mutex<TransportSendStream>>> {
+    let send_stream_map = self.get_stream_map(stream_key);
+    let send_streams = send_stream_map.read().await;
+    let send_stream = send_streams.get(stream_key);
+    send_stream.cloned()
+  }
+
+  pub async fn open_stream(
+    &self,
+    stream_key: &SendStreamKey,
+    header_payload: Bytes,
+    priority: i32, // Priority for the stream
+  ) -> Result<Arc<Mutex<TransportSendStream>>> {
+    let (send_stream, newly_created) = {
+      let send_stream_map = self.get_stream_map(stream_key);
+      let mut send_streams = send_stream_map.write().await;
+      match send_streams.entry(stream_key.clone()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+          let send_stream = self
+            .connection
+            .open_uni()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open send stream: {:?}", e))?;
+
+          send_stream.set_priority(priority);
+          let s = Arc::new(Mutex::new(send_stream));
+          entry.insert(s.clone());
+          debug!(
+            "open_stream | added send_stream to send streams ({}) connection_id: {}",
+            stream_key, self.connection_id
+          );
+          (s, true)
+        }
+        std::collections::hash_map::Entry::Occupied(s) => {
+          trace!(
+            "open_stream | Send stream for {} already exists connection_id: {}",
+            stream_key, self.connection_id
+          );
+          (s.get().clone(), false)
+        }
+      }
+    };
+
+    // A subgroup header belongs at the beginning of a stream and must be
+    // written exactly once. A concurrent caller reuses the existing stream.
+    if !newly_created {
+      return Ok(send_stream);
+    }
+
+    // Only the creator counts against the switching set, mirroring the
+    // release on every path that drops the stream from the map.
+    self
+      .ssts
+      .on_stream_opened(stream_key.stream_id.relay_track_id)
+      .await;
+
+    trace!(
+      "open_stream |  writing to stream ({}) connection_id: {}",
+      stream_key, self.connection_id
+    );
+
+    // Write the header payload to the stream
+    match send_stream.lock().await.write_all(&header_payload).await {
+      Ok(..) => {
+        trace!(
+          "open_stream |  wrote to stream ({}) connection_id: {}",
+          stream_key, self.connection_id
+        );
+      }
+      Err(e) => {
+        error!(
+          "open_stream |  Failed to write header payload to send stream ({}) connection_id: {}",
+          stream_key, self.connection_id
+        );
+
+        // remove this from the streams
+        let send_stream_map = self.get_stream_map(stream_key);
+        let mut send_streams = send_stream_map.write().await;
+        send_streams.remove(stream_key);
+        self
+          .ssts
+          .on_stream_closed(stream_key.stream_id.relay_track_id)
+          .await;
+
+        return Err(anyhow::anyhow!(
+          "Failed to write header payload to send stream ({}): {:?} connection_id: {}",
+          stream_key,
+          self.connection_id,
+          e
+        ));
+      }
+    };
+
+    Ok(send_stream.clone())
+  }
+
+  // Remove the stream from the map and finish it
+  // if the stream is found, return true, else false
+  pub async fn close_stream(&self, stream_key: &SendStreamKey) -> Result<bool> {
+    // Taken without releasing the slot: the stream stays counted against its
+    // switching set until it has actually finished or been reset below, so the
+    // set's depth reflects the bandwidth the stream is still occupying.
+    let stream = self.take_stream(stream_key).await;
+    let group_id = stream_key.stream_id.group_id.unwrap_or(0);
+
+    if let Some(send_stream) = stream {
+      let mut stream = send_stream.lock().await;
+      // Only SSTS clients use a discard timeout: a connection that never
+      // negotiated the feature always closes gracefully, so in-flight data is
+      // never discarded for traffic that never opted in.
+      let timeout = if self.ssts_enabled() {
+        self.config.ssts_discard_timeout
+      } else {
+        std::time::Duration::ZERO
+      };
+
+      if timeout.is_zero() {
+        // No discard timeout: always close gracefully.
+        // No new data may be written after calling this method.
+        // Completes when the peer has acknowledged all sent data, retransmitting data as needed.
+        stream.finish().await.map_err(|e| {
+          error!(
+            "close_stream | Failed to finish send stream ({}): {:?} connection_id: {}",
+            stream_key, e, self.connection_id
+          );
+          anyhow::anyhow!("Failed to finish send stream ({}): {:?}", stream_key, e)
+        })?;
+        self
+          .ssts
+          .on_stream_closed(stream_key.stream_id.relay_track_id)
+          .await;
+        return Ok(true);
+      }
+
+      tokio::select! {
+        finish_result = stream.finish() => {
+            self.ssts.on_stream_closed(stream_key.stream_id.relay_track_id).await;
+            finish_result.map_err(|e| anyhow::anyhow!(
+                "close_stream | Failed to finish ({}): {:?}", stream_key, e
+            )).map(|_| true)
+        }
+        _ = tokio::time::sleep(timeout) => {
+            warn!(
+                connection_id = %self.connection_id,
+                group_id = %group_id,
+                "Stream timeout on close — resetting"
+            );
+            self.ssts.on_stream_closed(stream_key.stream_id.relay_track_id).await;
+            // The stream was discarded because it did not finish in time,
+            // which is what this code is for: the peer must be able to tell a
+            // late delivery apart from a cancelled or failed one.
+            let _ = stream.reset(StreamResetCode::DeliveryTimeout.to_u64());
+            let _ = self.ssts.abr_tx.try_send(ssts::AbrMessage::StreamTimeout {
+                group_id,
+            });
+            Ok(true)
+        }
+      }
+    } else {
+      // it is possible that no stream was created for this stream id
+      // because the subscription can be in no forwarding state
+      trace!(
+        "close_stream | Send stream not found for {} connection_id: {}",
+        stream_key, self.connection_id
+      );
+      Ok(false)
+    }
+  }
+
+  /// Take a stream out of the map without releasing its switching-set stream
+  /// slot. Private because leaving the slot held is only correct for
+  /// `close_stream`, which keeps the stream counted until it has actually
+  /// finished; everything else goes through `release_stream`.
+  async fn take_stream(
+    &self,
+    stream_key: &SendStreamKey,
+  ) -> Option<Arc<Mutex<TransportSendStream>>> {
+    let send_stream_map = self.get_stream_map(stream_key);
+    let mut send_streams = send_stream_map.write().await;
+    send_streams.remove(stream_key)
+  }
+
+  /// Take a stream out of the map once the caller has finished or reset it,
+  /// and release the switching-set stream slot it held. Returns the stream so
+  /// the caller can still act on it.
+  ///
+  /// The slot is released only when a stream was actually in the map, so a
+  /// second removal cannot borrow the count of another stream of the same set.
+  pub async fn release_stream(
+    &self,
+    stream_key: &SendStreamKey,
+  ) -> Option<Arc<Mutex<TransportSendStream>>> {
+    let removed = self.take_stream(stream_key).await;
+    if removed.is_some() {
+      self
+        .ssts
+        .on_stream_closed(stream_key.stream_id.relay_track_id)
+        .await;
+    }
+    removed
+  }
+
+  /// Reset a data stream with an application error code (QUIC RESET_STREAM) and
+  /// drop it from the send-stream map, releasing its switching-set stream slot.
+  pub async fn reset_stream(&self, stream_key: &SendStreamKey, code: u64) {
+    if let Some(stream) = self.release_stream(stream_key).await
+      && let Err(e) = stream.lock().await.reset(code)
+    {
+      warn!("Error resetting data stream {}: {:?}", stream_key, e);
+    }
+  }
+
+  pub async fn write_stream_object(
+    &self,
+    stream_key: &SendStreamKey,
+    object_id: u64,
+    mut chunks: Vec<Bytes>,
+    the_stream: Option<Arc<Mutex<TransportSendStream>>>,
+  ) -> Result<(), anyhow::Error> {
+    trace!(
+      "write_stream_object | Writing object to stream ({} - {}) connection_id: {}",
+      object_id, stream_key, self.connection_id
+    );
+
+    let send_stream = {
+      if let Some(send_stream) = the_stream {
+        Some(send_stream)
+      } else {
+        let stream_map = self.get_stream_map(stream_key);
+        let send_streams = stream_map.read().await;
+        send_streams.get(stream_key).cloned()
+      }
+    };
+
+    // Rate-limit before writing so all streams of this connection compete for
+    // the shared bandwidth budget, causing QUIC buffers to fill and the QUIC
+    // stream priority scheduler to choose between them.
+    if let Some(rl) = &self.rate_limiter {
+      rl.lock()
+        .await
+        .consume(chunks.iter().map(Bytes::len).sum())
+        .await;
+    }
+
+    if let Some(s) = send_stream {
+      let mut stream = s.lock().await;
+      match stream.write_all_chunks(&mut chunks).await {
+        Ok(..) => {}
+        Err(e) => {
+          if let TransportWriteError::ClosedOrStopped = &e {
+            warn!(
+              "write_stream_object | Send stream is closed or stopped ({})",
+              stream_key
+            );
+            drop(stream);
+            // The peer stopped the stream, so it is gone even if a close for
+            // it arrives later: drop it from the map and release its
+            // switching-set slot now.
+            self.release_stream(stream_key).await;
+          }
+        }
+      };
+      Ok(())
+    } else {
+      warn!(
+        "write_stream_object | Send stream not found for {} connection_id: {}",
+        stream_key, self.connection_id
+      );
+      // This is not an error. The stream already started, wait for the next group...
+      // Err(anyhow::anyhow!("Send stream not found ({})", stream_key))
+      Ok(())
+    }
+  }
+
+  pub async fn write_datagram_object(&self, object: Bytes) -> Result<(), anyhow::Error> {
+    trace!(
+      "write_datagram_object | Writing datagram object connection_id: {}",
+      self.connection_id
+    );
+
+    // Write the object payload directly to the connection as a datagram
+    self.connection.send_datagram(object)?;
+    Ok(())
+  }
+
+  /// SSTS was negotiated for this connection.
+  pub fn ssts_enabled(&self) -> bool {
+    self.ssts.enabled()
+  }
+
+  pub fn start_abr_controller(self: Arc<Self>) {
+    ssts::controller::start(self);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn per_track_gives_every_subscription_the_tracks_alias() {
+    let next = AtomicU64::new(0);
+    assert_eq!(pick_track_alias(TrackAliasMode::PerTrack, 7, &next), 7);
+    assert_eq!(pick_track_alias(TrackAliasMode::PerTrack, 7, &next), 7);
+  }
+
+  #[test]
+  fn per_subscription_gives_each_subscription_its_own_alias() {
+    let next = AtomicU64::new(0);
+    let first = pick_track_alias(TrackAliasMode::PerSubscription, 7, &next);
+    let second = pick_track_alias(TrackAliasMode::PerSubscription, 7, &next);
+    assert_ne!(first, second);
+  }
+  use crate::server::stream_id::{StreamId, StreamType};
+
+  /// Test helper struct that exposes the partition logic for testing
+  struct PartitionTester;
+
+  impl PartitionTester {
+    /// Expose the partition index calculation logic for testing
+    /// This replicates the logic from MOQTClient::get_partition_index
+    fn get_partition_index(stream_id: &StreamId) -> usize {
+      let value = match stream_id.stream_type {
+        StreamType::Fetch => {
+          // Use a simple hash combining relay_track_id and fetch_request_id
+          stream_id
+            .relay_track_id
+            .wrapping_add(stream_id.fetch_request_id.unwrap_or(0).wrapping_mul(13))
+        }
+        StreamType::Subgroup => {
+          // Better distribution using prime number multipliers
+          stream_id
+            .relay_track_id
+            .wrapping_add(stream_id.group_id.unwrap_or(0).wrapping_mul(17))
+            .wrapping_add(stream_id.subgroup_id.unwrap_or(0).wrapping_mul(31))
+        }
+      };
+
+      // Convert to bytes for fnv_hash function
+      let value_bytes = value.to_le_bytes();
+      (utils::fnv_hash(&value_bytes) % SEND_STREAM_PARTITION_COUNT as u64) as usize
+    }
+  }
+
+  /// Helper function to create a Fetch stream ID
+  fn create_fetch_stream_id(relay_track_id: u64, fetch_request_id: u64) -> StreamId {
+    StreamId {
+      stream_type: StreamType::Fetch,
+      relay_track_id,
+      group_id: None,
+      subgroup_id: None,
+      fetch_request_id: Some(fetch_request_id),
+    }
+  }
+
+  /// Helper function to create a Subgroup stream ID
+  fn create_subgroup_stream_id(
+    relay_track_id: u64,
+    group_id: Option<u64>,
+    subgroup_id: Option<u64>,
+  ) -> StreamId {
+    StreamId {
+      stream_type: StreamType::Subgroup,
+      relay_track_id,
+      group_id,
+      subgroup_id,
+      fetch_request_id: None,
+    }
+  }
+
+  #[test]
+  fn test_get_partition_index_fetch_streams() {
+    // Test basic fetch stream partitioning
+    let stream_id1 = create_fetch_stream_id(100, 1);
+    let partition1 = PartitionTester::get_partition_index(&stream_id1);
+    assert!(
+      partition1 < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds"
+    );
+
+    let stream_id2 = create_fetch_stream_id(100, 2);
+    let partition2 = PartitionTester::get_partition_index(&stream_id2);
+    assert!(
+      partition2 < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds"
+    );
+
+    // Different fetch request IDs should potentially give different partitions
+    // (though not guaranteed due to hash collisions)
+    let stream_id3 = create_fetch_stream_id(100, 1000);
+    let partition3 = PartitionTester::get_partition_index(&stream_id3);
+    assert!(
+      partition3 < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds"
+    );
+  }
+
+  #[test]
+  fn test_get_partition_index_fetch_streams_consistency() {
+    // Test that the same inputs always produce the same output
+    let stream_id = create_fetch_stream_id(42, 123);
+    let partition1 = PartitionTester::get_partition_index(&stream_id);
+    let partition2 = PartitionTester::get_partition_index(&stream_id);
+    assert_eq!(
+      partition1, partition2,
+      "Same input should always produce same partition"
+    );
+  }
+
+  #[test]
+  fn test_get_partition_index_fetch_streams_edge_cases() {
+    // Test with fetch_request_id = None (should default to 0)
+    let mut stream_id = create_fetch_stream_id(100, 1);
+    stream_id.fetch_request_id = None;
+    let partition = PartitionTester::get_partition_index(&stream_id);
+    assert!(
+      partition < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds"
+    );
+
+    // Test with large values
+    let stream_id_large = create_fetch_stream_id(u64::MAX, u64::MAX);
+    let partition_large = PartitionTester::get_partition_index(&stream_id_large);
+    assert!(
+      partition_large < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds for large values"
+    );
+
+    // Test with zero values
+    let stream_id_zero = create_fetch_stream_id(0, 0);
+    let partition_zero = PartitionTester::get_partition_index(&stream_id_zero);
+    assert!(
+      partition_zero < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds for zero values"
+    );
+  }
+
+  #[test]
+  fn test_get_partition_index_subgroup_streams() {
+    // Test basic subgroup stream partitioning
+    let stream_id1 = create_subgroup_stream_id(100, Some(1), Some(1));
+    let partition1 = PartitionTester::get_partition_index(&stream_id1);
+    assert!(
+      partition1 < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds"
+    );
+
+    let stream_id2 = create_subgroup_stream_id(100, Some(2), Some(1));
+    let partition2 = PartitionTester::get_partition_index(&stream_id2);
+    assert!(
+      partition2 < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds"
+    );
+
+    let stream_id3 = create_subgroup_stream_id(200, Some(1), Some(1));
+    let partition3 = PartitionTester::get_partition_index(&stream_id3);
+    assert!(
+      partition3 < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds"
+    );
+  }
+
+  #[test]
+  fn test_get_partition_index_subgroup_streams_consistency() {
+    // Test that the same inputs always produce the same output
+    let stream_id = create_subgroup_stream_id(42, Some(7), Some(13));
+    let partition1 = PartitionTester::get_partition_index(&stream_id);
+    let partition2 = PartitionTester::get_partition_index(&stream_id);
+    assert_eq!(
+      partition1, partition2,
+      "Same input should always produce same partition"
+    );
+  }
+
+  #[test]
+  fn test_get_partition_index_subgroup_streams_none_values() {
+    // Test with None group_id and subgroup_id (should default to 0)
+    let stream_id1 = create_subgroup_stream_id(100, None, None);
+    let partition1 = PartitionTester::get_partition_index(&stream_id1);
+    assert!(
+      partition1 < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds"
+    );
+
+    // Test with Some group_id and None subgroup_id
+    let stream_id2 = create_subgroup_stream_id(100, Some(5), None);
+    let partition2 = PartitionTester::get_partition_index(&stream_id2);
+    assert!(
+      partition2 < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds"
+    );
+
+    // Test with None group_id and Some subgroup_id
+    let stream_id3 = create_subgroup_stream_id(100, None, Some(3));
+    let partition3 = PartitionTester::get_partition_index(&stream_id3);
+    assert!(
+      partition3 < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds"
+    );
+  }
+
+  #[test]
+  fn test_get_partition_index_subgroup_streams_large_values() {
+    // Test with large values to ensure no overflow
+    let stream_id_large = create_subgroup_stream_id(u64::MAX, Some(u64::MAX), Some(u64::MAX));
+    let partition_large = PartitionTester::get_partition_index(&stream_id_large);
+    assert!(
+      partition_large < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds for large values"
+    );
+
+    // Test with values that might cause overflow in naive implementations
+    let stream_id_overflow =
+      create_subgroup_stream_id(u64::MAX / 2, Some(u64::MAX / 3), Some(u64::MAX / 5));
+    let partition_overflow = PartitionTester::get_partition_index(&stream_id_overflow);
+    assert!(
+      partition_overflow < SEND_STREAM_PARTITION_COUNT,
+      "Partition index should be within bounds for overflow-prone values"
+    );
+  }
+
+  #[test]
+  fn test_get_partition_index_distribution_quality() {
+    let mut distribution = [0; SEND_STREAM_PARTITION_COUNT];
+    let test_count = 1000usize;
+
+    // Test distribution quality for fetch streams
+    for i in 0..test_count {
+      let stream_id = create_fetch_stream_id((i % 10) as u64, i as u64);
+      let partition = PartitionTester::get_partition_index(&stream_id);
+      distribution[partition] += 1;
+    }
+
+    // Check that distribution is reasonably even (no partition should be empty or overly full)
+    let expected_per_partition = test_count / SEND_STREAM_PARTITION_COUNT;
+    let tolerance = expected_per_partition / 2; // Allow 50% deviation
+
+    for (i, &count) in distribution.iter().enumerate() {
+      assert!(
+        count > 0,
+        "Partition {} should have at least one entry for good distribution",
+        i
+      );
+      assert!(
+        count < expected_per_partition + tolerance,
+        "Partition {} has too many entries ({}), expected around {}",
+        i,
+        count,
+        expected_per_partition
+      );
+      // print the distribution
+      println!("Partition {}: {}", i, count);
+    }
+  }
+
+  #[test]
+  fn test_get_partition_index_subgroup_distribution_quality() {
+    let mut distribution = [0; SEND_STREAM_PARTITION_COUNT];
+    let test_count = 1000usize;
+
+    // Test distribution quality for subgroup streams
+    for i in 0..test_count {
+      let stream_id = create_subgroup_stream_id(
+        (i % 10) as u64,       // track_alias
+        Some((i / 10) as u64), // group_id
+        Some((i % 5) as u64),  // subgroup_id
+      );
+      let partition = PartitionTester::get_partition_index(&stream_id);
+      distribution[partition] += 1;
+    }
+
+    // Check that distribution is reasonably even
+    let expected_per_partition = test_count / SEND_STREAM_PARTITION_COUNT;
+    let tolerance = expected_per_partition / 2; // Allow 50% deviation
+
+    for (i, &count) in distribution.iter().enumerate() {
+      assert!(
+        count > 0,
+        "Partition {} should have at least one entry for good distribution",
+        i
+      );
+      assert!(
+        count < expected_per_partition + tolerance,
+        "Partition {} has too many entries ({}), expected around {}",
+        i,
+        count,
+        expected_per_partition
+      );
+      // print out the distribution
+      println!("Partition {}: {}", i, count);
+    }
+  }
+
+  #[test]
+  fn test_get_partition_index_different_stream_types() {
+    // Test that fetch and subgroup streams with similar parameters can have different partitions
+    let fetch_stream = create_fetch_stream_id(100, 50);
+    let subgroup_stream = create_subgroup_stream_id(100, Some(50), Some(0));
+
+    let fetch_partition = PartitionTester::get_partition_index(&fetch_stream);
+    let subgroup_partition = PartitionTester::get_partition_index(&subgroup_stream);
+
+    // Both should be within bounds
+    assert!(fetch_partition < SEND_STREAM_PARTITION_COUNT);
+    assert!(subgroup_partition < SEND_STREAM_PARTITION_COUNT);
+
+    // They should potentially be different (though not guaranteed due to hashing)
+    // This test mainly ensures both algorithms work correctly
+  }
+
+  #[test]
+  fn test_get_partition_index_deterministic() {
+    let test_cases = vec![
+      create_fetch_stream_id(42, 123),
+      create_subgroup_stream_id(42, Some(123), Some(456)),
+      create_subgroup_stream_id(0, None, None),
+      create_fetch_stream_id(u64::MAX, 0),
+    ];
+
+    for stream_id in test_cases {
+      let partition1 = PartitionTester::get_partition_index(&stream_id);
+      let partition2 = PartitionTester::get_partition_index(&stream_id);
+      assert_eq!(
+        partition1, partition2,
+        "Multiple calls should produce same partition for same stream_id"
+      );
+    }
+  }
+}

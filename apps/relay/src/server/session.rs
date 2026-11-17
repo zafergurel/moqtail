@@ -12,8 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) mod client;
+pub(crate) mod client_manager;
+pub(crate) mod request_stream;
+pub(crate) mod session_context;
+
+use crate::server::cluster;
+use crate::server::config::AppConfig;
 use anyhow::Result;
 use moqtail::model::common::location::Location;
+use moqtail::model::common::pair::KeyValuePair;
+use moqtail::model::control::control_message::ControlMessageTrait;
 use moqtail::model::data::full_track_name::FullTrackName;
 use moqtail::model::parameter::setup_option::SetupOption;
 use moqtail::model::{
@@ -33,24 +42,16 @@ use moqtail::transport::{
   control_stream_handler::ControlStreamHandler,
   data_stream_handler::{DataStreamItem, HeaderInfo, RecvDataStream},
 };
-use std::{
-  collections::HashMap,
-  sync::{Arc, atomic::AtomicU64},
-};
-use tokio::sync::RwLock;
+use std::{collections::HashMap, sync::Arc};
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use wtransport::endpoint::SessionRequest;
 use wtransport::quinn;
 
 use crate::server::{Server, stream_id::StreamId};
 
-use super::{
-  client::MOQTClient,
-  message_handlers, request_stream,
-  session_context::{RequestMaps, SessionContext, UpstreamFetchEvent},
-  track::Track,
-  utils,
-};
+use super::{message_handlers, track::Track, utils};
+use client::MOQTClient;
+use session_context::{SessionContext, UpstreamFetchEvent};
 
 pub struct Session {}
 
@@ -112,7 +113,7 @@ impl Session {
         .accept_with_headers(response_headers)
         .await?,
     );
-    Self::start(connection, server).await
+    Self::start(connection, server, None).await
   }
 
   /// Accepts a connection that the relay's ALPN demux (see `Server::accept_incoming`)
@@ -120,34 +121,45 @@ impl Session {
   /// Raw QUIC has no headers/path/origin and the version was already pinned by ALPN
   /// during the demux, so there's nothing WebTransport-specific to do here.
   pub async fn accept_quic(connection: quinn::Connection, server: Server) -> Result<Session> {
-    Self::start(TransportConnection::Quic(connection), server).await
+    Self::start(TransportConnection::Quic(connection), server, None).await
+  }
+
+  /// Runs a session the relay dialed itself (a cluster peer), as the client side.
+  /// Raw QUIC has no CONNECT request, so the `authority` and `path` dialed go in SETUP.
+  pub async fn connect_quic(
+    connection: quinn::Connection,
+    server: Server,
+    authority: String,
+    path: String,
+  ) -> Result<Session> {
+    let dialed = Some((authority, path));
+    Self::start(TransportConnection::Quic(connection), server, dialed).await
   }
 
   /// Shared session bootstrap once a connection has been accepted by either transport:
   /// build the `SessionContext` and spawn the long-lived control-stream/close-watcher tasks.
-  async fn start(connection: TransportConnection, server: Server) -> Result<Session> {
+  async fn start(
+    connection: TransportConnection,
+    server: Server,
+    dialed: Option<(String, String)>,
+  ) -> Result<Session> {
     let client_manager = server.client_manager.clone();
     let track_manager = server.track_manager.clone();
     let server_config = server.app_config;
-    let relay_pending_requests = server.relay_pending_requests.clone();
-    let upstream_fetch_senders = server.upstream_fetch_senders.clone();
+    let upstream_requests = server.upstream_requests.clone();
     let relay_next_request_id = server.relay_next_request_id.clone();
     let draining = server.draining.clone();
-
-    let request_maps = RequestMaps {
-      relay_pending_requests,
-      upstream_fetch_senders,
-    };
 
     let context = Arc::new(SessionContext::new(
       server_config,
       client_manager,
       track_manager,
-      request_maps,
+      upstream_requests,
       connection,
       relay_next_request_id,
       server.active_request_streams.clone(),
       draining,
+      server.cluster.clone(),
     ));
 
     info!(
@@ -158,41 +170,57 @@ impl Session {
     );
 
     tokio::spawn(Self::handle_connection_close(context.clone()));
-    tokio::spawn(Self::accept_control_stream(context.clone()));
+    tokio::spawn(Self::accept_control_stream(context.clone(), dialed));
 
     Ok(Session {})
   }
 
-  async fn accept_control_stream(context: Arc<SessionContext>) -> Result<()> {
-    // The control plane is a pair of unidirectional streams. Accept the peer's
-    // control stream (recv half) and open our own (send half), each beginning
-    // with SETUP.
-    let recv_stream = match context.connection.accept_uni().await {
-      Ok(recv_stream) => recv_stream,
-      Err(e) => {
-        error!("Failed to accept control stream: {:?}", e);
-        Self::close_session(
-          context.clone(),
-          TerminationCode::InternalError,
-          "Error in control stream handler",
-        );
-        return Err(e.into());
+  async fn accept_control_stream(
+    context: Arc<SessionContext>,
+    dialed: Option<(String, String)>,
+  ) -> Result<()> {
+    let outbound = dialed.is_some();
+    // The control plane is a pair of unidirectional streams, each beginning with
+    // SETUP. The dialing side writes its SETUP before waiting for the peer's
+    // stream, since the accepting side opens its own only after reading it.
+    let streams = async {
+      if let Some((authority, path)) = dialed {
+        let mut send_stream = context.connection.open_uni().await?;
+        let mut setup = Self::relay_setup(context.server_config);
+        setup.setup_options.extend([
+          SetupOption::new_authority(authority).try_into().unwrap(),
+          SetupOption::new_path(path).try_into().unwrap(),
+        ]);
+        let setup = setup.serialize().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        send_stream
+          .write_all(&setup)
+          .await
+          .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        Ok::<_, anyhow::Error>((send_stream, context.connection.accept_uni().await?))
+      } else {
+        let recv_stream = context.connection.accept_uni().await?;
+        Ok((context.connection.open_uni().await?, recv_stream))
       }
-    };
-    match context.connection.open_uni().await {
-      Ok(send_stream) => {
+    }
+    .await;
+    match streams {
+      Ok((send_stream, recv_stream)) => {
         let session_context = context.clone();
         let connection_id = session_context.connection_id;
         let transport = session_context.transport_kind;
         tokio::spawn(async move {
-          if let Err(e) =
-            Self::handle_control_messages(session_context.clone(), send_stream, recv_stream)
-              .instrument(info_span!(
-                "handle_control_messages",
-                connection_id,
-                %transport
-              ))
-              .await
+          if let Err(e) = Self::handle_control_messages(
+            session_context.clone(),
+            send_stream,
+            recv_stream,
+            outbound,
+          )
+          .instrument(info_span!(
+            "handle_control_messages",
+            connection_id,
+            %transport
+          ))
+          .await
           {
             match e {
               TerminationCode::NoError => {
@@ -215,13 +243,13 @@ impl Session {
         Ok(())
       }
       Err(e) => {
-        error!("Failed to open control send stream: {:?}", e);
+        error!("Failed to set up control streams: {:?}", e);
         Self::close_session(
           context.clone(),
           TerminationCode::InternalError,
           "Error in control stream handler",
         );
-        Err(e.into())
+        Err(e)
       }
     }
   }
@@ -230,13 +258,14 @@ impl Session {
     context: Arc<SessionContext>,
     send_stream: TransportSendStream,
     recv_stream: TransportRecvStream,
+    outbound: bool,
   ) -> core::result::Result<(), TerminationCode> {
     info!("new control message stream");
     let mut control_stream_handler =
       ControlStreamHandler::new(send_stream, recv_stream).with_peer_id(context.connection_id);
 
     // Client-server negotiation
-    let client = match Self::negotiate(context.clone(), &mut control_stream_handler)
+    let client = match Self::negotiate(context.clone(), &mut control_stream_handler, outbound)
       .instrument(info_span!(
         "negotiate",
         context.connection_id,
@@ -253,6 +282,13 @@ impl Session {
 
     // Set the client in the context
     context.set_client(client.clone()).await;
+
+    // A cluster peer gets every namespace this relay can route, over this link
+    // whichever side dialed it.
+    if client.peer_hop_id.is_some() {
+      tokio::spawn(cluster::refresh_all(context.clone()));
+      tokio::spawn(cluster::sync_tracks(context.clone()));
+    }
 
     // start waiting for unistreams
     let session_context = context.clone();
@@ -431,7 +467,6 @@ impl Session {
                        datagram_obj.track_alias, datagram_obj.group_id, datagram_obj.object_id);
 
                 if let Some(track) = context_clone.track_manager.get_track_by_alias(context_clone.connection_id, datagram_obj.track_alias).await {
-                  let track = track.read().await;
                   if let Err(e) = track.new_datagram(&datagram_obj).await {
                     error!("Failed to process datagram: {:?}", e);
                   }
@@ -470,24 +505,19 @@ impl Session {
       context.connection_id
     );
 
-    // Remove the disconnecting publisher from all tracks they were publishing.
+    // The tracks this client subscribed to or published; a client that never got
+    // through SETUP has none.
+    let cleanup_tracks = match context.get_client().await {
+      Some(client) => client.cleanup_tracks().await,
+      None => Vec::new(),
+    };
+
+    // Remove the disconnecting publisher from the tracks it was publishing.
     // remove_publisher() internally notifies subscribers when the last publisher leaves.
     // Collect full track names for tracks that have no publishers left.
-    let mut tracks_with_no_publishers: Vec<FullTrackName> = Vec::new();
-    {
-      let tracks = track_manager_cleanup.tracks.read().await;
-      for (full_track_name, track_lock) in tracks.iter() {
-        let track = track_lock.read().await;
-        if let Some(removal) = track.remove_publisher(context.connection_id).await {
-          track_manager_cleanup
-            .remove_publisher_alias(context.connection_id, removal.alias)
-            .await;
-          if !removal.still_served {
-            tracks_with_no_publishers.push(full_track_name.clone());
-          }
-        }
-      }
-    }
+    let tracks_with_no_publishers = track_manager_cleanup
+      .remove_publisher(context.connection_id, &cleanup_tracks)
+      .await;
 
     // Tracks no publisher serves any more stay only if they hold cached Objects.
     for full_track_name in &tracks_with_no_publishers {
@@ -528,11 +558,13 @@ impl Session {
       context.connection_id
     );
 
-    // Remove client from all remaining tracks (as a subscriber)
-    for track_lock in track_manager_cleanup.tracks.read().await.values() {
-      let track = track_lock.read().await;
-      track.remove_subscriptions(context.connection_id).await;
-    }
+    // Remove client from the tracks it may still subscribe to
+    track_manager_cleanup
+      .remove_subscriber(context.connection_id, &cleanup_tracks)
+      .await;
+
+    // Routes through this session, and copies it kept warm, are gone.
+    cluster::refresh_after_close(&context, &cleanup_tracks).await;
 
     info!(
       "handle_connection_close | cleanup done ({})",
@@ -562,7 +594,7 @@ impl Session {
     // that FETCH any more: its Objects are still worth caching.
     let mut fetch_track_name: Option<FullTrackName> = None;
     let mut stream_id: Option<StreamId> = None;
-    let mut current_track: Option<Arc<RwLock<Track>>> = None;
+    let mut current_track: Option<Arc<Track>> = None;
     // Only subgroup streams count toward the Stream Count a publisher reports in
     // PUBLISH_DONE; a fetch stream answers a request of the relay's own.
     let mut is_subgroup_stream = false;
@@ -663,7 +695,7 @@ impl Session {
             };
 
             let relay_track_id = match current_track.as_ref() {
-              Some(t) => t.read().await.relay_track_id,
+              Some(t) => t.relay_track_id,
               None => {
                 warn!(
                   "Abandoning data stream for unresolved track alias {} after {:?}",
@@ -678,7 +710,7 @@ impl Session {
             None
           };
 
-          let track = current_track.as_ref().unwrap().read().await;
+          let track = &current_track.as_ref().unwrap();
 
           // What a fetch brings in is history, for the cache alone: subscribers get the
           // live feed.
@@ -751,7 +783,7 @@ impl Session {
 
           // Close the stream for all subscribers
           if let Some(track_lock) = &current_track {
-            let track = track_lock.read().await;
+            let track = &track_lock;
             if is_subgroup_stream {
               track
                 .publisher_stream_progress
@@ -788,16 +820,7 @@ impl Session {
     let Some(HeaderInfo::Fetch { header, .. }) = handler.get_header_info().await else {
       return None;
     };
-    context
-      .upstream_fetch_senders
-      .read()
-      .await
-      .get(&header.request_id)
-      .cloned()
-  }
-
-  pub(crate) async fn get_next_relay_request_id(relay_next_request_id: Arc<AtomicU64>) -> u64 {
-    relay_next_request_id.fetch_add(2, std::sync::atomic::Ordering::Relaxed)
+    context.upstream_requests.get_fetch(header.request_id).await
   }
 
   fn parse_available_protocols(headers: &HashMap<String, String>) -> Vec<String> {
@@ -816,9 +839,54 @@ impl Session {
     })
   }
 
+  /// The SETUP this relay sends, as server or, toward a dialed peer, as client.
+  fn relay_setup(config: &AppConfig) -> Setup {
+    let moqt_implementation_param =
+      SetupOption::new_moqt_implementation(env!("MOQTAIL_VERSION").to_string())
+        .try_into()
+        .unwrap();
+
+    let max_filter_ranges = SetupOption::new_max_filter_ranges(config.max_filter_ranges)
+      .try_into()
+      .unwrap();
+    let max_request_updates_param = SetupOption::new_max_request_updates(0u64)
+      .try_into()
+      .unwrap();
+
+    let mut setup_options = vec![
+      max_filter_ranges,
+      moqt_implementation_param,
+      max_request_updates_param,
+    ];
+    if config.ssts_enable {
+      setup_options.push(
+        moqtail::model::parameter::setup_option::SetupOption::new_ssts_algorithms(
+          config.ssts_algorithms.clone(),
+        )
+        .try_into()
+        .unwrap(),
+      );
+    }
+
+    if let Some(hop_id) = config.hop_id {
+      setup_options.push(KeyValuePair::VarInt {
+        type_value: cluster::HOP_ID,
+        value: hop_id,
+      });
+      if let Some(cost) = config.relay_cost {
+        setup_options.push(KeyValuePair::VarInt {
+          type_value: cluster::RELAY_COST,
+          value: cost,
+        });
+      }
+    }
+    Setup::new(setup_options)
+  }
+
   async fn negotiate(
     context: Arc<SessionContext>,
     control_stream_handler: &mut ControlStreamHandler,
+    outbound: bool,
   ) -> Result<Arc<MOQTClient>, TerminationCode> {
     trace!("Negotiating with client...");
     // The client's control stream MUST begin with SETUP.
@@ -836,39 +904,16 @@ impl Session {
 
     // AUTHORITY and PATH are for native QUIC only; over WebTransport the transport
     // carries them.
-    client_setup.validate_incoming(SetupSender::Client, context.transport_kind)?;
+    let sender = if outbound {
+      SetupSender::Server
+    } else {
+      SetupSender::Client
+    };
+    client_setup.validate_incoming(sender, context.transport_kind)?;
 
     utils::print_msg_bytes(&client_setup);
 
-    let moqt_implementation_param =
-      SetupOption::new_moqt_implementation(env!("MOQTAIL_VERSION").to_string())
-        .try_into()
-        .unwrap();
-
-    let max_filter_ranges =
-      SetupOption::new_max_filter_ranges(context.server_config.max_filter_ranges)
-        .try_into()
-        .unwrap();
-    let max_request_updates_param = SetupOption::new_max_request_updates(0u64)
-      .try_into()
-      .unwrap();
-
-    let mut setup_options = vec![
-      max_filter_ranges,
-      moqt_implementation_param,
-      max_request_updates_param,
-    ];
-    if context.server_config.ssts_enable {
-      setup_options.push(
-        moqtail::model::parameter::setup_option::SetupOption::new_ssts_algorithms(
-          context.server_config.ssts_algorithms.clone(),
-        )
-        .try_into()
-        .unwrap(),
-      );
-    }
-
-    let server_setup = Setup::new(setup_options);
+    let server_setup = Self::relay_setup(context.server_config);
 
     trace!("client setup: {:?}", client_setup);
     trace!("server setup: {:?}", server_setup);
@@ -897,7 +942,7 @@ impl Session {
 
             // Log the token information
             if let Some(token_value) = token.token_value {
-              super::token_logger::log_token_registration(
+              crate::server::logging::token_logger::log_token_registration(
                 &token_value,
                 context.connection_id,
                 client_port,
@@ -914,6 +959,7 @@ impl Session {
       Arc::new(context.connection.clone()),
       Arc::new(client_setup),
       context.server_config,
+      outbound,
     );
     let client = Arc::new(client);
     if client.ssts_enabled() {
@@ -921,6 +967,10 @@ impl Session {
     }
     context.client_manager.add(client.clone()).await;
 
+    // A dialed session already sent its SETUP before the peer's arrived.
+    if outbound {
+      return Ok(client);
+    }
     match control_stream_handler.send_impl(&server_setup).await {
       Ok(_) => {
         trace!("Sent server setup to client");

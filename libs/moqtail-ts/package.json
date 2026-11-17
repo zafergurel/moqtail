@@ -1,8 +1,9 @@
 {
   "name": "moqtail",
-  "version": "0.14.0",
+  "version": "0.16.0",
   "description": "Media Over QUIC Transport client implementation",
   "type": "module",
+  "sideEffects": false,
   "license": "Apache-2.0",
   "keywords": [
     "moqtail",
@@ -63,6 +64,26 @@
         "default": "./dist/model.cjs"
       }
     },
+    "./player": {
+      "import": {
+        "types": "./dist/player.d.mts",
+        "default": "./dist/player.mjs"
+      },
+      "require": {
+        "types": "./dist/player.d.cts",
+        "default": "./dist/player.cjs"
+      }
+    },
+    "./player/component": {
+      "import": {
+        "types": "./dist/player/component.d.mts",
+        "default": "./dist/player/component.mjs"
+      },
+      "require": {
+        "types": "./dist/player/component.d.cts",
+        "default": "./dist/player/component.cjs"
+      }
+    },
     "./util": {
       "import": {
         "types": "./dist/util.d.mts",
@@ -81,15 +102,35 @@
     "test": "vitest",
     "format": "prettier --check .",
     "test:run": "vitest run",
+    "test:browser": "vitest run --config vitest.browser.config.ts",
     "docs": "typedoc"
   },
   "devDependencies": {
-    "@microsoft/api-extractor": "^7.58.9",
+    "@microsoft/api-extractor": "^7.60.1",
     "@tsconfig/strictest": "^2.0.8",
-    "tslib": "^2.8.1",
-    "tsdown": "^0.22.3",
+    "@vitest/browser-playwright": "5.1.0",
+    "custom-media-element": "^1.4.7",
+    "media-tracks": "^0.3.5",
+    "playwright": "^1.65.0",
+    "tsdown": "^0.23.7",
+    "tslib": "^2.9.1",
     "typedoc": "^0.28.20",
     "typescript": "^6.0.3",
-    "vitest": "^5.0.3"
+    "vitest": "^5.1.0"
+  },
+  "peerDependencies": {
+    "custom-media-element": "^1.4.7",
+    "media-tracks": "^0.3.5"
+  },
+  "peerDependenciesMeta": {
+    "custom-media-element": {
+      "optional": true
+    },
+    "media-tracks": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "valibot": "^1.5.0"
   }
 }

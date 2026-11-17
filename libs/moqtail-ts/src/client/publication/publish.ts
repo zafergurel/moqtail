@@ -15,17 +15,17 @@
  */
 
 import { Publish, RequestUpdate } from '@/model/control'
-import { MOQtailClient } from '../client'
-import { Track } from '../track/track'
+import { MOQtailClient } from '@/client/client'
+import { Track } from '@/client/track/track'
 import { InternalError, Location, MessageParameter, applyMessageParameterUpdate } from '@/model'
 import { CombinedFilter } from '@/model/parameter/message/combined_filter'
-import { SendStream } from '../data_stream'
+import { SendStream } from '@/client/data_stream'
 import { MoqtObject } from '@/model/data/object'
 import { SubgroupIds, subgroupHeaderFor } from './subgroup'
-import { assertWithinFilterRangeLimit } from '../util/validators'
-import { SimpleLock } from '../../util/simple_lock'
-import { getTransportPriority } from '../util/priority'
-import { logger } from '../../util/logger'
+import { assertWithinFilterRangeLimit } from '@/client/util/validators'
+import { SimpleLock } from '@/util/simple_lock'
+import { getTransportPriority } from '@/client/util/priority'
+import { logger } from '@/util/logger'
 
 /**
  * @public
@@ -149,14 +149,14 @@ export class PublishPublication {
 
   /**
    * Moves the Forward State: false parks the publication, true resumes it. The
-   * application hears about the move through {@link MOQtailClient.onForwardStateChange},
+   * application hears about the move through the client's `forwardstatechange` event,
    * which is where a publisher starts or stops the work behind the track -- a camera
    * and an encoder cost the same whether or not anything is listening.
    */
   setForwardState(forward: boolean): void {
     if (this.#forward === forward) return
     this.#forward = forward
-    this.client.onForwardStateChange?.(this.publishMsg.requestId, forward)
+    this.client.emit('forwardstatechange', this.publishMsg.requestId, forward)
   }
 
   /**
@@ -274,9 +274,9 @@ export class PublishPublication {
             const sendStream = await SendStream.new(
               writeStream,
               header,
-              this.client.onDataSent,
+              this.client,
               undefined,
-              this.client.dataStreamObserver(() => this.track.fullTrackName),
+              () => this.track.fullTrackName,
             )
             this.#streams.set(obj.location.group, sendStream)
             this.#streamsOpened++
@@ -287,8 +287,21 @@ export class PublishPublication {
 
         const sendStream = this.#streams.get(obj.location.group)!
         await this.#lock.acquire()
-        await sendStream.write(obj.tryIntoSubgroupObject())
-        await this.#lock.release()
+        try {
+          await sendStream.write(obj.tryIntoSubgroupObject())
+        } catch (err) {
+          // The peer stopped this one subgroup stream (STOP_SENDING). That ends this subgroup,
+          // not the track: the stream stays mapped so the rest of the group is skipped, and
+          // later groups still go out on new streams.
+          logger.warn(
+            'publication/publish',
+            'subgroup stream write failed, skipping rest of group',
+            obj.location.group,
+            err,
+          )
+        } finally {
+          await this.#lock.release()
+        }
 
         // Close previous group's stream if the group ID has incremented
         if (this.latestLocation && this.latestLocation.group !== obj.location.group) {
@@ -331,7 +344,7 @@ if (import.meta.vitest) {
   const { describe, test, expect, vi } = import.meta.vitest
   const { FullTrackName, Forward, ObjectForwardingPreference, SubgroupHeaderType } = await import('@/model')
   const { RequestUpdate } = await import('@/model/control')
-  const { LiveTrackSource } = await import('../track/content_source')
+  const { LiveTrackSource } = await import('@/client/track/content_source')
   const { SubgroupHeader: Header } = await import('@/model/data/subgroup_header')
   const { FrozenByteBuffer } = await import('@/model/common/byte_buffer')
 
@@ -365,7 +378,7 @@ if (import.meta.vitest) {
       const client = {
         webTransport,
         publications: new Map(),
-        dataStreamObserver: () => undefined,
+        emit: () => {},
       } as unknown as MOQtailClient
       new PublishPublication(client, track, { requestId: 0n, parameters: [] } as unknown as Publish)
 
@@ -437,7 +450,7 @@ if (import.meta.vitest) {
       const client = {
         webTransport,
         publications: new Map(),
-        dataStreamObserver: () => undefined,
+        emit: () => {},
       } as unknown as MOQtailClient
       new PublishPublication(
         client,
@@ -452,6 +465,57 @@ if (import.meta.vitest) {
       source.enqueue(object(4, 0))
       await vi.waitFor(() => expect(headerTypes).toHaveLength(2))
       expect(headerTypes.map(SubgroupHeaderType.isFirstObject)).toEqual([false, true])
+    })
+  })
+
+  describe('PublishPublication stopped subgroup', () => {
+    test('keeps publishing later groups after the peer stops one subgroup stream', async () => {
+      const ftn = FullTrackName.tryNew('room/alice', 'pos')
+      let opened = 0
+      const delivered: number[] = []
+      const webTransport = {
+        createUnidirectionalStream: async () => {
+          const index = opened++
+          let headerWritten = false
+          return new WritableStream<Uint8Array>({
+            write: () => {
+              // The first stream is stopped by the peer right after its header.
+              if (index === 0 && headerWritten) throw new Error('Received STOP_SENDING')
+              if (headerWritten) delivered.push(index)
+              headerWritten = true
+            },
+          })
+        },
+      }
+      let source!: ReadableStreamDefaultController<MoqtObject>
+      const live = new LiveTrackSource(new ReadableStream<MoqtObject>({ start: (controller) => (source = controller) }))
+      const client = {
+        webTransport,
+        publications: new Map(),
+        emit: () => {},
+      } as unknown as MOQtailClient
+      new PublishPublication(
+        client,
+        { fullTrackName: ftn, trackSource: { live }, publisherPriority: 0, trackAlias: 1n },
+        { requestId: 0n, parameters: [] } as unknown as Publish,
+      )
+      const push = (group: number) =>
+        source.enqueue(
+          MoqtObject.newWithPayload(
+            ftn,
+            new Location(BigInt(group), 0n),
+            0,
+            ObjectForwardingPreference.Subgroup,
+            0n,
+            null,
+            new Uint8Array([1]),
+          ),
+        )
+
+      push(0)
+      push(1)
+      push(2)
+      await vi.waitFor(() => expect(delivered).toEqual([1, 2]))
     })
   })
 
@@ -482,8 +546,9 @@ if (import.meta.vitest) {
       const client = {
         webTransport,
         publications: new Map(),
-        dataStreamObserver: () => undefined,
-        onForwardStateChange: (requestId: bigint, forward: boolean) => moves.push({ requestId, forward }),
+        emit: (event: string, requestId: bigint, forward: boolean) => {
+          if (event === 'forwardstatechange') moves.push({ requestId, forward })
+        },
       } as unknown as MOQtailClient
       const publication = new PublishPublication(client, track, {
         requestId: 7n,

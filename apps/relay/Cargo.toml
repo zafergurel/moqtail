@@ -1,6 +1,6 @@
 [package]
 name = "relay"
-version = "0.16.0"
+version = "0.18.0"
 edition = "2024"
 build="build.rs"
 
@@ -8,7 +8,7 @@ build="build.rs"
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-wtransport.workspace = true
+wtransport = { workspace = true, features = ["dangerous-configuration"] }
 tokio.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
@@ -21,3 +21,8 @@ moka.workspace = true
 fnv.workspace = true
 hex.workspace = true
 socket2.workspace = true
+figment.workspace = true
+serde.workspace = true
+smart-default.workspace = true
+validator.workspace = true
+humantime-serde.workspace = true

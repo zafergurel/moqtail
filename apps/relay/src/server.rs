@@ -12,46 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod client;
-mod client_manager;
+mod cluster;
 mod config;
-mod errors;
-mod fill;
-mod filter_constructor;
+mod logging;
 mod message_handlers;
-mod object_logger;
-mod prefix_subscription;
-mod request_stream;
-mod seen_objects;
+mod requests;
 mod session;
-mod session_context;
 mod ssts;
 mod stream_id;
 mod subscription;
-mod subscription_manager;
-mod token_logger;
 mod track;
-mod track_cache;
-mod track_manager;
 mod utils;
 
-use crate::server::client::MOQTClient;
-use crate::server::session_context::{PendingRequest, UpstreamFetchEvent};
+use crate::server::requests::UpstreamRequests;
+use crate::server::session::client::MOQTClient;
 use crate::server::{config::AppConfig, session::Session};
 use anyhow::Result;
-use client_manager::ClientManager;
 use moqtail::model::control::control_message::ControlMessage;
 use moqtail::model::control::goaway::GoAway;
-use std::collections::BTreeMap;
+use session::client_manager::ClientManager;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{RwLock, watch};
 use tracing::{error, info, trace, warn};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter};
-use track_manager::TrackManager;
+use track::track_manager::TrackManager;
 use wtransport::endpoint::IncomingSessionFuture;
 use wtransport::quinn;
 
@@ -61,14 +49,14 @@ const CACHE_ONLY_TRACK_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) struct Server {
   pub client_manager: ClientManager,
   pub track_manager: TrackManager,
-  pub relay_pending_requests: Arc<RwLock<BTreeMap<u64, PendingRequest>>>,
+  pub upstream_requests: UpstreamRequests,
   pub app_config: &'static AppConfig,
   pub relay_next_request_id: Arc<AtomicU64>,
-  pub upstream_fetch_senders: Arc<RwLock<BTreeMap<u64, mpsc::Sender<UpstreamFetchEvent>>>>,
   /// Request streams currently being served across the relay (for load shedding).
   pub active_request_streams: Arc<AtomicU64>,
   /// Set once the relay is draining (GOAWAY broadcast); new requests are rejected.
   pub draining: Arc<AtomicBool>,
+  pub cluster: Arc<cluster::ClusterState>,
   /// GOAWAY redirect URI clients should migrate to. Seeded from config; a future
   /// admin API mutates this at runtime.
   pub redirect_uri: Arc<RwLock<Option<String>>>,
@@ -85,12 +73,12 @@ impl Server {
     Server {
       client_manager: ClientManager::new(),
       track_manager: TrackManager::new(),
-      relay_pending_requests: Arc::new(RwLock::new(BTreeMap::new())),
+      upstream_requests: UpstreamRequests::default(),
       app_config: config,
-      relay_next_request_id: Arc::new(AtomicU64::new(1u64)), // relay's request id starts at 1 and are odd
-      upstream_fetch_senders: Arc::new(RwLock::new(BTreeMap::new())),
+      relay_next_request_id: Arc::new(AtomicU64::new(0)), // see MOQTClient::next_request_id
       active_request_streams: Arc::new(AtomicU64::new(0)),
       draining: Arc::new(AtomicBool::new(false)),
+      cluster: Arc::default(),
       redirect_uri: Arc::new(RwLock::new(config.redirect_uri.clone())),
     }
   }
@@ -104,14 +92,17 @@ impl Server {
   pub async fn start(&mut self) -> Result<()> {
     let endpoints = self.app_config.build_quic_endpoints().await?;
 
+    let bind = self.app_config.bind;
+    // A wildcard address is not something a client can dial.
+    let addr = if bind.ip().is_unspecified() {
+      format!("localhost:{}", bind.port())
+    } else {
+      bind.to_string()
+    };
     info!(
-      "{} is running on {} UDP socket(s) -- WebTransport clients: https://{}:{}  Raw QUIC clients: moqt://{}:{}",
+      "{} is running on {} UDP socket(s) -- WebTransport clients: https://{addr}  Raw QUIC clients: moqt://{addr}",
       env!("MOQTAIL_VERSION"),
       endpoints.len(),
-      self.app_config.host,
-      self.app_config.port,
-      self.app_config.host,
-      self.app_config.port
     );
 
     // Level-triggered, so an accept loop between two iterations when shutdown is
@@ -138,6 +129,10 @@ impl Server {
         }
       }
     });
+
+    for url in &self.app_config.peers {
+      tokio::spawn(cluster::run_peer(self.clone(), url.clone()));
+    }
 
     let mut accept_loops = Vec::with_capacity(endpoints.len());
     for (socket_index, endpoint) in endpoints.into_iter().enumerate() {

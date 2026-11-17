@@ -1,5 +1,43 @@
 # moqtail-ts
 
+## 0.16.0
+
+### Minor Changes
+
+- [#463](https://github.com/moqtail/moqtail/pull/463) [`b14f129`](https://github.com/moqtail/moqtail/commit/b14f1298ac6d55578421af83b02e09eb4dfced49) Thanks [@DenizUgur](https://github.com/DenizUgur)! - Breaking: `MOQtailClient` events take any number of listeners through `client.on(event, listener)` and `client.off()`. `new MOQtailClient(options)` does no I/O and `await client.init()` connects; `MOQtailClient.new()`, the `callbacks` option and the `on*` properties are removed. `client.subscribe` returns `{ requestId, subscribeOk, stream, done }` and `client.fetch` returns `{ requestId, fetchOk, stream }`.
+
+  - An `ordering` option on the client, `subscribe` and `fetch` releases objects in location order across streams and datagrams, reporting what it stopped waiting for with `orderinggap`.
+  - `client.switch` returns the new `SubscribeResult` and no longer sends FORWARD; `subscribeUpdate` only sends priority and forward when given.
+  - `client.trackNameOf(headerEvent)` names the track a data stream carries.
+  - `client.clientSetup` holds the SETUP the client sent, next to `client.serverSetup`.
+  - `LiveTrackSource` no longer loses the last object before PUBLISH_DONE, and a closing session leaves no unhandled rejections.
+  - `moqt://` is matched case-insensitively.
+
+- [#463](https://github.com/moqtail/moqtail/pull/463) [`812e732`](https://github.com/moqtail/moqtail/commit/812e7324b4e3c110ad2f545956fe85efeeeaa35a) Thanks [@DenizUgur](https://github.com/DenizUgur)! - Add `moqtail/player`, an MSF/CMSF player built from elements, and the `<moqtail-video>` custom element in `moqtail/player/component`.
+
+  Breaking: the old catalog model (`CMSFCatalog`, `CMSF`, …) is removed. Read catalogs through the player's `catalog` event and type published ones as `CatalogJson`.
+
+  - `MOQtailPlayer` builds a source → transform → sink chain, shares one reconnecting client across players on a page, and reports `statechange`, `error` and `warning`.
+  - An element runtime (`defineElement`, source/transform/sink base classes, pads with backpressure) for custom elements.
+  - Built-in catalog source with delta updates, a CMAF source with seeking, URL ranges and rendition switching, and an MSE sink.
+  - Media and event timelines and per-request object ordering.
+  - Plugins (`definePlugin`, `opts.plugins`) that add setup parameters, check the peer's SETUP, and offer elements, switching set sources, buffer controllers and ABR controllers. Built in: `ssts()`, whose sources provide `ABR`, `liveBuffer()` and `abr()`. A `selectionchange` event follows `selectRenditions()`, and `player.isAbrAvailable()` says whether a source switches automatically.
+  - `parseMsfUrl` and `formatMsfUrl` for `moqt://...#msf:` URLs.
+
+### Patch Changes
+
+- [#465](https://github.com/moqtail/moqtail/pull/465) [`a116ca7`](https://github.com/moqtail/moqtail/commit/a116ca785c9daaa4ce3ba68612df82f69a6c365d) Thanks [@zafergurel](https://github.com/zafergurel)! - Datagrams work on Safari: when the transport has no `datagrams.writable` (Safari implements only `datagrams.createWritable()`), the client sends through `createWritable()` instead of failing to connect.
+
+- [#464](https://github.com/moqtail/moqtail/pull/464) [`9e59347`](https://github.com/moqtail/moqtail/commit/9e59347a544ab3b7cac703ec5d72aa55f6ab43d6) Thanks [@zafergurel](https://github.com/zafergurel)! - A publication no longer ends when the peer stops one of its subgroup streams (STOP_SENDING). The rest of that group is skipped and later groups are still sent.
+
+## 0.15.0
+
+### Minor Changes
+
+- [#444](https://github.com/moqtail/moqtail/pull/444) [`8c71f44`](https://github.com/moqtail/moqtail/commit/8c71f447385902e7e9d35f15cddb0f276fbc7f75) Thanks [@zafergurel](https://github.com/zafergurel)! - Serve FETCH from the relay's cache whenever the cache accounts for every Object of a group, and fetch upstream only what it does not. The relay now creates a track for a FETCH of a track it does not have yet, keeps a track for its cached Objects after its upstream goes away, records which Objects are known not to exist (from End of Group and End of Track statuses, gap properties, a group's last datagram or subgroup stream, and what an upstream FETCH response passes over), and lets concurrent FETCHes of the same range share one upstream FETCH. A PUBLISH_DONE now waits for a track's datagrams to go quiet. Both libraries parse End of Timed-Out Range markers and hand End of Range markers to the application (`RecvDataStream::next_item` in moqtail-rs, an `onEndOfRange` handler in moqtail). The test client can publish groups that already exist at startup, reset streams, drop datagrams, send End of Group and End of Track objects, and cut or mark its FETCH responses.
+
+- [#459](https://github.com/moqtail/moqtail/pull/459) [`561588a`](https://github.com/moqtail/moqtail/commit/561588ae232fe7660bc69ee2812a98231d6481d0) Thanks [@zafergurel](https://github.com/zafergurel)! - Fix the LOC property ids: TIMESTAMP is 0x10 and VIDEO_FRAME_MARKING is 0x09, and AUDIO_CONFIG (0x0F) is added. Video frame marking now carries the RFC 9626 flag byte instead of a varint, so `addVideoFrameMarking` takes `isKey: boolean` and receivers check `independent` (`is_independent_frame()` in moqtail-rs). Timestamps are microseconds; meet and client-js publish them that way.
+
 ## 0.14.0
 
 ### Minor Changes

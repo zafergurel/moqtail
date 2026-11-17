@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::server::client::MOQTClient;
-use crate::server::session::Session;
-use crate::server::session_context::SessionContext;
+use crate::server::cluster;
+use crate::server::session::client::MOQTClient;
+use crate::server::session::session_context::SessionContext;
 use crate::server::track::TrackOrigin;
 use core::result::Result;
 use moqtail::model::error::{RequestErrorCode, TerminationCode};
@@ -47,21 +47,19 @@ pub async fn handle(
       // and may be behind the publisher's Largest Object, so it does not answer: the
       // publisher is asked instead.
       let local_track = match context.track_manager.get_track(&full_track_name).await {
-        Some(track_arc) if track_arc.read().await.origin() != TrackOrigin::CacheOnly => {
-          Some(track_arc)
-        }
+        Some(track_arc) if track_arc.origin() != TrackOrigin::CacheOnly => Some(track_arc),
         _ => None,
       };
       if let Some(track_arc) = local_track {
         info!("track found: {:?}", full_track_name);
-        let track = track_arc.read().await;
+        let track = &track_arc;
         let largest_location = track.largest_location.read().await;
 
         let params = vec![MessageParameter::new_largest_object(
           largest_location.clone(),
         )];
         let track_properties = if include_properties(&status_req.subscribe_parameters) {
-          track.track_properties.read().await.clone()
+          track.track_properties().await
         } else {
           Vec::new()
         };
@@ -78,12 +76,18 @@ pub async fn handle(
       // any publisher serving it can answer, where a SUBSCRIBE must reach all of them.
       let publisher = {
         trace!("Finding publisher for TrackStatus...");
-        context
+        let publishers = context
           .client_manager
           .get_publishers_for_track(&full_track_name)
-          .await
-          .into_iter()
-          .next()
+          .await;
+        match context.get_client().await {
+          Some(requester) => {
+            cluster::select(&context, &requester, &full_track_name, publishers).await
+          }
+          None => publishers,
+        }
+        .into_iter()
+        .next()
       };
 
       let publisher = if let Some(p) = publisher {
@@ -102,8 +106,7 @@ pub async fn handle(
       // D. Forward to the publisher on its own bidi stream and read the response
       // there, then deliver it to the downstream requester's request stream.
       let mut new_req = status_req.clone();
-      new_req.request_id =
-        Session::get_next_relay_request_id(context.relay_next_request_id.clone()).await;
+      new_req.request_id = publisher.next_request_id(&context.relay_next_request_id);
 
       let downstream = context.get_client().await;
       tokio::spawn(async move {
