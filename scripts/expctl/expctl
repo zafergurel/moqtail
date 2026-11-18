@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+# Copyright 2026 The MOQtail Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Command-line client for the expctl service (same API as the web page).
+
+  expctl list
+  expctl start [--name NAME] -- <experiment.sh args>
+  expctl show ID | stop ID | resume ID | report ID
+  expctl log ID [-n LINES]
+
+EXPCTL_URL (default http://hp.home.gurel:8080) and EXPCTL_TOKEN, or the token
+in ~/.config/expctl/token.
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+URL = os.environ.get("EXPCTL_URL", "http://hp.home.gurel:8080").rstrip("/")
+
+
+def token():
+    t = os.environ.get("EXPCTL_TOKEN")
+    if t:
+        return t
+    f = Path.home() / ".config/expctl/token"
+    if f.is_file():
+        return f.read_text().strip()
+    sys.exit("set EXPCTL_TOKEN or write the token to ~/.config/expctl/token")
+
+
+def call(method, path, body=None):
+    req = urllib.request.Request(
+        f"{URL}/api{path}",
+        method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {token()}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=150) as r:
+            data = r.read().decode()
+            return json.loads(data) if r.headers.get_content_type() == "application/json" else data
+    except urllib.error.HTTPError as e:
+        sys.exit(f"{e.code}: {e.read().decode()}")
+
+
+def row(r):
+    p = r["progress"]
+    done = f"{p['results']}/{p['total']}" if p["total"] else str(p["results"])
+    return f"{r['id']:<40} {r['status']:<11} {done:>9}  {r.get('commit') or '':<8} {p['current'] or ''}"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    s = sub.add_parser("start")
+    s.add_argument("--name", default="")
+    s.add_argument("args", nargs=argparse.REMAINDER)
+    for c in ("show", "stop", "resume", "report"):
+        sub.add_parser(c).add_argument("id")
+    lg = sub.add_parser("log")
+    lg.add_argument("id")
+    lg.add_argument("-n", type=int, default=50)
+    a = ap.parse_args()
+
+    if a.cmd == "list":
+        print(f"{'ID':<40} {'STATUS':<11} {'RESULTS':>9}  {'COMMIT':<8} CURRENT")
+        for r in call("GET", "/runs"):
+            print(row(r))
+    elif a.cmd == "start":
+        args = a.args[1:] if a.args[:1] == ["--"] else a.args
+        print(row(call("POST", "/runs", {"name": a.name, "args": args})))
+    elif a.cmd in ("stop", "resume"):
+        print(row(call("POST", f"/runs/{a.id}/{a.cmd}")))
+    elif a.cmd == "show":
+        print(json.dumps(call("GET", f"/runs/{a.id}"), indent=2))
+    elif a.cmd == "log":
+        print(call("GET", f"/runs/{a.id}/log?tail={a.n}"), end="")
+    elif a.cmd == "report":
+        print(call("GET", f"/runs/{a.id}/report"), end="")
+
+
+if __name__ == "__main__":
+    main()

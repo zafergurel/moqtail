@@ -27,6 +27,7 @@
 #   --interval <ms>            Inter-object interval in ms (default: 40, i.e. 25fps)
 #   --group-count <n>          Total groups to publish (default: 5000 ≈ ~83 minutes)
 #   --output <dir>             Results directory (default: results/YYYYMMDD_HHMMSS)
+#   --resume                   Continue an incomplete --output dir without prompting
 #   --help
 #
 # Scenario matrix (generated from --delays; default 0,1000,2000):
@@ -123,6 +124,7 @@ SKIP_START=false
 RESTART_SERVICES=true
 SELECTED_METHODS=()
 OUTPUT_DIR=""
+RESUME=false
 
 usage() {
   grep '^#' "$0" | sed 's/^# \{0,1\}//' | tail -n +2
@@ -145,6 +147,7 @@ while [[ $# -gt 0 ]]; do
     --interval)          PUB_INTERVAL_MS="$2";                shift 2 ;;
     --group-count)       PUB_GROUP_COUNT="$2";                shift 2 ;;
     --output)            OUTPUT_DIR="$2";                     shift 2 ;;
+    --resume)            RESUME=true;                         shift ;;
     --help|-h)           usage ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -192,8 +195,9 @@ unset _g _p
 
 total=$(( TOTAL_SCENARIOS * ${#METHODS[@]} * REPS ))
 
-if [ -d "$OUTPUT_DIR" ]; then
-  existing=$(find "$OUTPUT_DIR" -maxdepth 1 -name '*.json' | wc -l)
+# --resume: keep OUTPUT_DIR as given; finished reps are skipped in run_one.
+if [ -d "$OUTPUT_DIR" ] && ! "$RESUME"; then
+  existing=$(find "$OUTPUT_DIR" -maxdepth 1 -name '*.json' ! -name experiment-metadata.json | wc -l)
   if [ "$existing" -gt 0 ] && [ "$existing" -lt "$total" ]; then
     echo ""
     echo "  Incomplete run: $existing / $total results in $OUTPUT_DIR"

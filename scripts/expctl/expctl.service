@@ -1,0 +1,17 @@
+# systemd user unit for the expctl experiment controller.
+# Install: see scripts/expctl/README.md.
+[Unit]
+Description=expctl experiment controller
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/projects/moqtail
+EnvironmentFile=%h/.config/expctl/env
+ExecStart=/usr/bin/python3 %h/projects/moqtail/scripts/expctl/server.py
+Restart=on-failure
+# Restarting the service must not kill a running experiment; the new service
+# instance picks it up again from results/<id>/.expctl/.
+KillMode=process
+
+[Install]
+WantedBy=default.target

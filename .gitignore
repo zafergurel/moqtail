@@ -242,3 +242,6 @@ relay.log.*
 # Local settings for scripts/perf-test.sh
 scripts/perf-test.env
 .perf-test.env
+
+# Experiment run folders (raw results; summarize.py stays tracked)
+/results/*/
